@@ -1,0 +1,19 @@
+{
+  "name": "starknetdeg",
+  "version": "0.1.0",
+  "private": true,
+  "description": "StarknetDeg indexer foundation and decoder engine.",
+  "main": "bin/start-indexer.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start:indexer": "node bin/start-indexer.js",
+    "check:syntax": "node --check bin/start-indexer.js && node --check core/abi-registry.js && node --check core/block-processor.js && node --check core/bridge.js && node --check core/checkpoint.js && node --check core/event-router.js && node --check core/event-sequencer.js && node --check core/finality.js && node --check core/normalize.js && node --check core/protocols/ekubo.js && node --check core/protocols/erc20.js && node --check core/protocols/jediswap.js && node --check core/protocols/shared.js && node --check lib/db.js && node --check lib/starknet-rpc.js && node --check lib/cairo/bigint.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "pg": "^8.13.1",
+    "starknet": "6.24.1"
+  }
+}
