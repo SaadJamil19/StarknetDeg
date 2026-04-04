@@ -265,14 +265,13 @@ function deriveTradePrice(action, { decimals0, decimals1 }) {
   let priceSource;
 
   if (
-    action.protocol === 'ekubo' &&
     action.metadata &&
     action.metadata.price_ratio_numerator !== undefined &&
     action.metadata.price_ratio_denominator !== undefined
   ) {
-    rawNumerator = toBigIntStrict(action.metadata.price_ratio_numerator, 'ekubo price ratio numerator');
-    rawDenominator = toBigIntStrict(action.metadata.price_ratio_denominator, 'ekubo price ratio denominator');
-    priceSource = 'ekubo_sqrt_ratio_after';
+    rawNumerator = toBigIntStrict(action.metadata.price_ratio_numerator, `${action.protocol} price ratio numerator`);
+    rawDenominator = toBigIntStrict(action.metadata.price_ratio_denominator, `${action.protocol} price ratio denominator`);
+    priceSource = action.metadata?.pool_model === 'clmm' ? 'clmm_sqrt_price' : `${action.protocol}_reported_ratio`;
   } else {
     rawNumerator = absBigInt(action.amount1Delta);
     rawDenominator = absBigInt(action.amount0Delta);
@@ -723,6 +722,7 @@ async function loadSwapActions(client, { blockNumber, lane }) {
       WHERE lane = $1
         AND block_number = $2
         AND action_type = 'swap'
+        AND COALESCE((metadata->>'is_route_leg')::boolean, FALSE) = FALSE
       ORDER BY transaction_index ASC, source_event_index ASC, action_key ASC`,
     [lane, toNumericString(blockNumber, 'block number')],
   );

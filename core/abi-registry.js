@@ -1,95 +1,27 @@
 'use strict';
 
-const fs = require('node:fs');
-const path = require('node:path');
-const { selector } = require('starknet');
-const { normalizeAddress, normalizeHex, normalizeSelector } = require('./normalize');
 const { toBigIntStrict } = require('../lib/cairo/bigint');
+const {
+  SELECTORS,
+  getCandidateProtocolsForSelector,
+  getFactoryMetadataByAddress,
+  getSelectorName,
+  getStaticMatchesByAddress,
+  getStaticMatchesByClassHash,
+  getSyncableEntries,
+  isStandardDexSelector,
+} = require('../lib/registry/dex-registry');
+const { normalizeAddress, normalizeHex, normalizeSelector } = require('./normalize');
 
-const REGISTRY_PATH = path.resolve(__dirname, '..', 'data', 'registry', 'contracts.json');
-const SELECTORS = Object.freeze({
-  ERC20_TRANSFER: normalizeSelector(selector.getSelectorFromName('Transfer')),
-  EKUBO_FEES_ACCUMULATED: normalizeSelector(selector.getSelectorFromName('FeesAccumulated')),
-  EKUBO_LOADED_BALANCE: normalizeSelector(selector.getSelectorFromName('LoadedBalance')),
-  EKUBO_POOL_INITIALIZED: normalizeSelector(selector.getSelectorFromName('PoolInitialized')),
-  EKUBO_POSITION_FEES_COLLECTED: normalizeSelector(selector.getSelectorFromName('PositionFeesCollected')),
-  EKUBO_POSITION_UPDATED: normalizeSelector(selector.getSelectorFromName('PositionUpdated')),
-  EKUBO_SAVED_BALANCE: normalizeSelector(selector.getSelectorFromName('SavedBalance')),
-  EKUBO_SWAPPED: normalizeSelector(selector.getSelectorFromName('Swapped')),
-  JEDISWAP_BURN: normalizeSelector(selector.getSelectorFromName('Burn')),
-  JEDISWAP_MINT: normalizeSelector(selector.getSelectorFromName('Mint')),
-  JEDISWAP_SWAP: normalizeSelector(selector.getSelectorFromName('Swap')),
-  JEDISWAP_SYNC: normalizeSelector(selector.getSelectorFromName('Sync')),
-});
-
-const SELECTOR_NAMES_BY_VALUE = new Map(Object.entries(SELECTORS).map(([name, value]) => [value, name]));
-const EKUBO_SELECTOR_SET = new Set([
-  SELECTORS.EKUBO_SWAPPED,
-  SELECTORS.EKUBO_POSITION_UPDATED,
-  SELECTORS.EKUBO_POOL_INITIALIZED,
-  SELECTORS.EKUBO_FEES_ACCUMULATED,
-  SELECTORS.EKUBO_POSITION_FEES_COLLECTED,
-  SELECTORS.EKUBO_SAVED_BALANCE,
-  SELECTORS.EKUBO_LOADED_BALANCE,
-]);
-const JEDISWAP_SELECTOR_SET = new Set([
-  SELECTORS.JEDISWAP_SWAP,
-  SELECTORS.JEDISWAP_MINT,
-  SELECTORS.JEDISWAP_BURN,
-  SELECTORS.JEDISWAP_SYNC,
-]);
 const CLASS_HASH_CACHE = new Map();
-
-const registry = loadRegistry();
-
-function loadRegistry() {
-  const payload = JSON.parse(fs.readFileSync(REGISTRY_PATH, 'utf8'));
-  const entries = [];
-  const byAddress = new Map();
-  const byClassHash = new Map();
-
-  for (const contract of payload.contracts ?? []) {
-    const contractAddress = normalizeAddress(contract.address, 'registry.address');
-    const classHashes = Array.isArray(contract.class_hashes) && contract.class_hashes.length > 0
-      ? contract.class_hashes
-      : [{ class_hash: null, abi_version: contract.abi_version ?? null, valid_from_block: null, valid_to_block: null }];
-
-    for (const item of classHashes) {
-      const entry = {
-        abiVersion: item.abi_version ?? contract.abi_version ?? null,
-        classHash: item.class_hash ? normalizeHex(item.class_hash, { label: 'registry.class_hash', padToBytes: 32 }) : null,
-        contractAddress,
-        decoder: contract.decoder,
-        metadata: contract.metadata ?? {},
-        protocol: contract.protocol,
-        role: contract.role,
-        validFromBlock: item.valid_from_block === null || item.valid_from_block === undefined ? null : toBigIntStrict(item.valid_from_block, 'valid_from_block'),
-        validToBlock: item.valid_to_block === null || item.valid_to_block === undefined ? null : toBigIntStrict(item.valid_to_block, 'valid_to_block'),
-      };
-
-      entries.push(entry);
-
-      if (!byAddress.has(entry.contractAddress)) {
-        byAddress.set(entry.contractAddress, []);
-      }
-      byAddress.get(entry.contractAddress).push(entry);
-
-      if (entry.classHash) {
-        if (!byClassHash.has(entry.classHash)) {
-          byClassHash.set(entry.classHash, []);
-        }
-        byClassHash.get(entry.classHash).push(entry);
-      }
-    }
-  }
-
-  return { byAddress, byClassHash, entries };
-}
+const PROBE_CACHE = new Map();
+const EMPTY_CLASS_HASH = normalizeHex(0, { label: 'empty class hash', padToBytes: 32 });
 
 async function resolveRoute({ event, tx, rpcClient }) {
   const contractMetadata = await resolveContractMetadata({
     blockNumber: tx.blockNumber,
     emitterAddress: event.fromAddress,
+    eventSelector: event.selector,
     resolvedClassHash: event.resolvedClassHash,
     rpcClient,
   });
@@ -102,55 +34,33 @@ async function resolveRoute({ event, tx, rpcClient }) {
     return {
       contractMetadata,
       decoder: 'erc20',
+      handler: 'transfer',
       protocol: 'erc20',
+      protocolKey: 'erc20',
       selectorName: 'ERC20_TRANSFER',
     };
   }
 
-  if (contractMetadata?.decoder === 'ekubo' && EKUBO_SELECTOR_SET.has(event.selector)) {
-    return {
-      contractMetadata,
-      decoder: 'ekubo',
-      protocol: 'ekubo',
-      selectorName: getSelectorName(event.selector),
-    };
+  if (!contractMetadata) {
+    return null;
   }
 
-  if (EKUBO_SELECTOR_SET.has(event.selector) && contractMetadata?.protocol === 'ekubo') {
-    return {
-      contractMetadata,
-      decoder: 'ekubo',
-      protocol: 'ekubo',
-      selectorName: getSelectorName(event.selector),
-    };
+  if (contractMetadata.selectorSet.size > 0 && !contractMetadata.selectorSet.has(event.selector)) {
+    return null;
   }
 
-  if (contractMetadata?.decoder === 'jediswap' && JEDISWAP_SELECTOR_SET.has(event.selector)) {
-    return {
-      contractMetadata,
-      decoder: 'jediswap',
-      protocol: 'jediswap',
-      selectorName: getSelectorName(event.selector),
-    };
-  }
-
-  if (JEDISWAP_SELECTOR_SET.has(event.selector)) {
-    if (!contractMetadata?.decoder && !looksLikeJediswapEvent(event)) {
-      return null;
-    }
-
-    return {
-      contractMetadata,
-      decoder: 'jediswap',
-      protocol: 'jediswap',
-      selectorName: getSelectorName(event.selector),
-    };
-  }
-
-  return null;
+  return {
+    contractMetadata,
+    decoder: contractMetadata.decoder,
+    family: contractMetadata.family,
+    handler: contractMetadata.metadata?.selector_handlers?.[event.selector] ?? null,
+    protocol: contractMetadata.protocol,
+    protocolKey: contractMetadata.protocolKey,
+    selectorName: getSelectorName(event.selector),
+  };
 }
 
-async function resolveContractMetadata({ blockNumber, emitterAddress, resolvedClassHash, rpcClient }) {
+async function resolveContractMetadata({ blockNumber, emitterAddress, eventSelector, resolvedClassHash, rpcClient }) {
   const normalizedAddress = normalizeAddress(emitterAddress, 'event emitter');
   const normalizedBlockNumber = toBigIntStrict(blockNumber, 'block number');
   const classHash = resolvedClassHash
@@ -161,48 +71,170 @@ async function resolveContractMetadata({ blockNumber, emitterAddress, resolvedCl
       rpcClient,
     });
 
-  const candidates = [];
-
-  if (classHash && registry.byClassHash.has(classHash)) {
-    candidates.push(...registry.byClassHash.get(classHash));
+  const staticMatch = pickStaticMatch({
+    blockNumber: normalizedBlockNumber,
+    classHash,
+    emitterAddress: normalizedAddress,
+    eventSelector,
+  });
+  if (staticMatch) {
+    return staticMatch;
   }
 
-  if (registry.byAddress.has(normalizedAddress)) {
-    candidates.push(...registry.byAddress.get(normalizedAddress));
+  if (!isStandardDexSelector(eventSelector)) {
+    return null;
   }
 
-  for (const candidate of candidates) {
-    if (candidate.contractAddress !== normalizedAddress) {
-      continue;
-    }
+  return probeDynamicDexEmitter({
+    blockNumber: normalizedBlockNumber,
+    classHash,
+    emitterAddress: normalizedAddress,
+    eventSelector,
+    rpcClient,
+  });
+}
 
-    if (candidate.classHash && classHash && candidate.classHash !== classHash) {
-      continue;
-    }
+function pickStaticMatch({ blockNumber, classHash, emitterAddress, eventSelector }) {
+  const exactAddressMatches = getStaticMatchesByAddress(emitterAddress)
+    .filter((entry) => isActiveAtBlock(entry, blockNumber))
+    .filter((entry) => !entry.classHash || !classHash || entry.classHash === classHash)
+    .filter((entry) => entry.selectorSet.size === 0 || entry.selectorSet.has(eventSelector));
 
-    if (!isActiveAtBlock(candidate, normalizedBlockNumber)) {
-      continue;
-    }
-
-    return {
-      ...candidate,
-      resolvedClassHash: classHash,
-    };
+  if (exactAddressMatches.length > 0) {
+    return finalizeMatch(exactAddressMatches[0], { classHash, contractAddress: emitterAddress });
   }
 
   if (!classHash) {
     return null;
   }
 
+  const classMatches = getStaticMatchesByClassHash(classHash)
+    .filter((entry) => isActiveAtBlock(entry, blockNumber))
+    .filter((entry) => !entry.contractAddress || entry.contractAddress === emitterAddress)
+    .filter((entry) => entry.selectorSet.size === 0 || entry.selectorSet.has(eventSelector));
+
+  if (classMatches.length > 0) {
+    return finalizeMatch(classMatches[0], { classHash, contractAddress: emitterAddress });
+  }
+
+  return null;
+}
+
+async function probeDynamicDexEmitter({ blockNumber, classHash, emitterAddress, eventSelector, rpcClient }) {
+  if (!rpcClient || typeof rpcClient.callContract !== 'function') {
+    return null;
+  }
+
+  const cacheKey = `${blockNumber.toString(10)}:${emitterAddress}:${classHash ?? 'none'}`;
+  if (PROBE_CACHE.has(cacheKey)) {
+    return PROBE_CACHE.get(cacheKey);
+  }
+
+  let result = null;
+
+  try {
+    const token0Result = await safeCallFirstSuccessful(rpcClient, {
+      blockNumber,
+      contractAddress: emitterAddress,
+      entrypoints: ['token0'],
+    });
+    const token1Result = await safeCallFirstSuccessful(rpcClient, {
+      blockNumber,
+      contractAddress: emitterAddress,
+      entrypoints: ['token1'],
+    });
+
+    if (!token0Result || !token1Result || token0Result.length === 0 || token1Result.length === 0) {
+      PROBE_CACHE.set(cacheKey, null);
+      return null;
+    }
+
+    const token0Address = normalizeAddress(token0Result[0], 'probed token0');
+    const token1Address = normalizeAddress(token1Result[0], 'probed token1');
+    const factoryResult = await safeCallFirstSuccessful(rpcClient, {
+      blockNumber,
+      contractAddress: emitterAddress,
+      entrypoints: ['factory'],
+    });
+    const factoryAddress = Array.isArray(factoryResult) && factoryResult.length > 0
+      ? normalizeAddress(factoryResult[0], 'probed factory')
+      : null;
+    const stableResult = await safeCallFirstSuccessful(rpcClient, {
+      blockNumber,
+      contractAddress: emitterAddress,
+      entrypoints: ['stable'],
+    });
+    const stable = Array.isArray(stableResult) && stableResult.length > 0
+      ? toBigIntStrict(stableResult[0], 'stable result') !== 0n
+      : false;
+
+    const factoryMetadata = factoryAddress ? getFactoryMetadataByAddress(factoryAddress) : null;
+    const classMatches = classHash ? getStaticMatchesByClassHash(classHash) : [];
+    const classMatch = classMatches.find((entry) =>
+      (entry.selectorSet.size === 0 || entry.selectorSet.has(eventSelector)) &&
+      (entry.role === 'pair' || entry.role === 'pool'));
+    const matchSource = factoryMetadata ?? classMatch;
+
+    if (matchSource) {
+      result = {
+        abiVersion: null,
+        classHash,
+        contractAddress: emitterAddress,
+        decoder: matchSource.decoder,
+        displayName: matchSource.displayName ?? null,
+        family: matchSource.family,
+        metadata: {
+          ...(matchSource.metadata ?? {}),
+          factory_address: factoryAddress,
+          pool_model: resolvePoolModel(matchSource, stable),
+          stable,
+          token0_address: token0Address,
+          token1_address: token1Address,
+        },
+        protocol: matchSource.protocol,
+        protocolKey: matchSource.protocolKey,
+        role: classMatch?.role ?? 'pair',
+        selectorSet: matchSource.selectorSet ?? new Set(),
+        sourceUrls: matchSource.sourceUrls ?? [],
+      };
+    }
+  } catch (error) {
+    result = null;
+  }
+
+  PROBE_CACHE.set(cacheKey, result);
+  return result;
+}
+
+function resolvePoolModel(matchSource, stable) {
+  const variant = matchSource.metadata?.ammVariant ?? null;
+  if (variant === 'solidly') {
+    return stable ? 'solidly_stable' : 'solidly_volatile';
+  }
+
+  if (variant === 'clmm') {
+    return 'clmm';
+  }
+
+  return 'xyk';
+}
+
+function finalizeMatch(entry, { classHash, contractAddress }) {
   return {
-    abiVersion: null,
-    classHash,
-    contractAddress: normalizedAddress,
-    decoder: null,
-    metadata: {},
-    protocol: null,
-    resolvedClassHash: classHash,
-    role: null,
+    abiVersion: entry.abiVersion,
+    classHash: classHash ?? entry.classHash ?? null,
+    contractAddress,
+    decoder: entry.decoder,
+    displayName: entry.displayName,
+    family: entry.family,
+    metadata: {
+      ...(entry.metadata ?? {}),
+    },
+    protocol: entry.protocol,
+    protocolKey: entry.protocolKey,
+    role: entry.role,
+    selectorSet: entry.selectorSet ?? new Set(),
+    sourceUrls: entry.sourceUrls ?? [],
   };
 }
 
@@ -227,16 +259,35 @@ async function resolveClassHashAt({ blockNumber, emitterAddress, rpcClient }) {
   }
 }
 
-function getSelectorName(value) {
-  return SELECTOR_NAMES_BY_VALUE.get(normalizeSelector(value)) ?? null;
+async function safeCallFirstSuccessful(rpcClient, { blockNumber, contractAddress, entrypoints }) {
+  for (const entrypoint of entrypoints ?? []) {
+    try {
+      const result = await rpcClient.callContract({
+        blockId: blockNumber,
+        calldata: [],
+        contractAddress,
+        entrypoint,
+      });
+      if (Array.isArray(result) && result.length > 0) {
+        return result.map((value) => normalizeSelector(value, `${entrypoint} result`));
+      }
+    } catch (error) {
+      continue;
+    }
+  }
+
+  return null;
 }
 
 function isActiveAtBlock(entry, blockNumber) {
-  if (entry.validFromBlock !== null && blockNumber < entry.validFromBlock) {
+  const validFromBlock = entry.validFromBlock ?? null;
+  const validToBlock = entry.validToBlock ?? null;
+
+  if (validFromBlock !== null && blockNumber < validFromBlock) {
     return false;
   }
 
-  if (entry.validToBlock !== null && blockNumber > entry.validToBlock) {
+  if (validToBlock !== null && blockNumber > validToBlock) {
     return false;
   }
 
@@ -247,27 +298,8 @@ function looksLikeStandardErc20Transfer(event) {
   return Array.isArray(event.keys) && event.keys.length === 3 && Array.isArray(event.data) && event.data.length === 2;
 }
 
-function looksLikeJediswapEvent(event) {
-  if (!Array.isArray(event.keys) || event.keys.length !== 1 || !Array.isArray(event.data)) {
-    return false;
-  }
-
-  switch (event.selector) {
-    case SELECTORS.JEDISWAP_MINT:
-      return event.data.length === 5;
-    case SELECTORS.JEDISWAP_BURN:
-      return event.data.length === 6;
-    case SELECTORS.JEDISWAP_SWAP:
-      return event.data.length === 10;
-    case SELECTORS.JEDISWAP_SYNC:
-      return event.data.length === 4;
-    default:
-      return false;
-  }
-}
-
 async function syncRegistryToDatabase(client) {
-  for (const entry of registry.entries) {
+  for (const entry of getSyncableEntries()) {
     await client.query(
       `INSERT INTO stark_contract_registry (
            contract_address,
@@ -283,7 +315,7 @@ async function syncRegistryToDatabase(client) {
            created_at,
            updated_at
        ) VALUES (
-           $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, TRUE, NOW(), NOW()
+           $1, $2, $3, $4, $5, $6, NULL, NULL, $7::jsonb, TRUE, NOW(), NOW()
        )
        ON CONFLICT (contract_address, class_hash)
        DO UPDATE SET
@@ -291,20 +323,16 @@ async function syncRegistryToDatabase(client) {
            role = EXCLUDED.role,
            decoder = EXCLUDED.decoder,
            abi_version = EXCLUDED.abi_version,
-           valid_from_block = EXCLUDED.valid_from_block,
-           valid_to_block = EXCLUDED.valid_to_block,
            metadata = EXCLUDED.metadata,
            is_active = TRUE,
            updated_at = NOW()`,
       [
         entry.contractAddress,
-        entry.classHash,
+        entry.classHash ?? EMPTY_CLASS_HASH,
         entry.protocol,
         entry.role,
         entry.decoder,
         entry.abiVersion,
-        entry.validFromBlock === null ? null : entry.validFromBlock.toString(10),
-        entry.validToBlock === null ? null : entry.validToBlock.toString(10),
         JSON.stringify(entry.metadata ?? {}),
       ],
     );
@@ -313,7 +341,9 @@ async function syncRegistryToDatabase(client) {
 
 module.exports = {
   SELECTORS,
+  getCandidateProtocolsForSelector,
   getSelectorName,
+  isStandardDexSelector,
   resolveContractMetadata,
   resolveRoute,
   syncRegistryToDatabase,

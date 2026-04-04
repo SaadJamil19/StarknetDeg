@@ -1,21 +1,289 @@
 {
-  "contracts": [
+  "version": "phase4-registry-driven",
+  "generated_from": "lib/registry/dex-registry.js",
+  "verified_contracts": [
     {
       "protocol": "ekubo",
-      "role": "core",
+      "display_name": "Ekubo",
       "decoder": "ekubo",
-      "address": "0x00000005dd3d2f4429af886cd1a3b08289dbcea99a294197e9eb43b0e0325b4b",
-      "class_hashes": [
+      "family": "singleton_clmm",
+      "selector_handlers": {
+        "0x25ccf80ee62b2ca9b97c76ccea317c7f450fd6efb6ed6ea56da21d7bb9da5f1": "pool_initialized",
+        "0x48796a25e5ceac9caf95a4618ebfd1516b51e5d994a49d28e22f09c64ad2ee": "saved_balance",
+        "0x237e5e0677822acfc9117ed0f7ba4810b2c6b539a2359e8d73f9025d56957aa": "fees_accumulated",
+        "0x96982abd597114bdaa4a60612f87fabfcc7206aa12d61c50e7ba1e6c291100": "position_fees_collected",
+        "0x305c746d1cf87085ae1abfe05967daa50048146e50e03fa41f7e41a91ee323d": "loaded_balance",
+        "0x3a7adca3546c213ce791fabf3b04090c163e419c808c9830fb343a4a395946e": "position_update",
+        "0x157717768aca88da4ac4279765f09f4d0151823d573537fbbeb950cdbd9a870": "swap"
+      },
+      "roles": [
         {
+          "role": "core",
+          "contract_address": "0x00000005dd3d2f4429af886cd1a3b08289dbcea99a294197e9eb43b0e0325b4b",
           "class_hash": "0x0577604a2611c851e9cfc4da2ba7f7fc1d44a9327cc734d68b2b271340a6551c",
-          "abi_version": "core-mainnet-current",
-          "valid_from_block": null,
-          "valid_to_block": null
+          "abi_version": "core-mainnet-current"
+        },
+        {
+          "role": "router",
+          "contract_address": "0x0199741822c2dc722f6f605204f35e56dbc23bceed54818168c4c49e4fb8737e",
+          "class_hash": null,
+          "abi_version": null
+        },
+        {
+          "role": "router",
+          "contract_address": "0x04505a9f06f2bd639b6601f37a4dc0908bb70e8e0e0c34b1220827d64f4fc066",
+          "class_hash": null,
+          "abi_version": null
+        },
+        {
+          "role": "router",
+          "contract_address": "0x03266fe47923e1500aec0fa973df8093b5850bbce8dcd0666d3f47298b4b806e",
+          "class_hash": null,
+          "abi_version": null
+        },
+        {
+          "role": "router",
+          "contract_address": "0x010c7eb57cbfeb18bde525912c1b6e9a7ebb4f692e0576af1ba7be8b3b9a70f6",
+          "class_hash": null,
+          "abi_version": null
+        },
+        {
+          "role": "router_legacy",
+          "contract_address": "0x01b6f560def289b32e2a7b0920909615531a4d9d5636ca509045843559dc23d5",
+          "class_hash": null,
+          "abi_version": null
         }
-      ],
-      "metadata": {
-        "source": "https://docs.ekubo.org/integration-guides/reference/starknet-contracts"
-      }
+      ]
+    },
+    {
+      "protocol": "avnu",
+      "display_name": "AVNU",
+      "decoder": "avnu",
+      "family": "aggregator",
+      "selector_handlers": {
+        "0x00e316f0d9d2a3affa97de1d99bb2aac0538e2666d0d8545545ead241ef0ccab": "swap",
+        "0x02495e87dbfae534a775dc432ffb2b4c64cd5b8e42a9dd1984ee7f424e46feb9": "sponsored_transaction",
+        "0x24a364c44626f5fcce5ae88aedb1aed805fbeef8f58df09a56e1ecb8322cd31": "route_optimization"
+      },
+      "roles": [
+        {
+          "role": "exchange",
+          "contract_address": "0x04270219d365d6b017231b52e92b3fb5d7c8378b05e9abc97724537a80e93b0f",
+          "class_hash": null,
+          "abi_version": null
+        },
+        {
+          "role": "forwarder",
+          "contract_address": "0x0127021a1b5a52d3174c2ab077c2b043c80369250d29428cee956d76ee51584f",
+          "class_hash": null,
+          "abi_version": null
+        }
+      ]
+    },
+    {
+      "protocol": "jediswap_v2",
+      "display_name": "JediSwap V2",
+      "decoder": "base-amm",
+      "family": "clmm",
+      "selector_handlers": {
+        "0x019437bf1c5c394fc8509a2e38c9c72c152df0bac8be777d4fc8f959ac817189": "pool_created",
+        "0x00e316f0d9d2a3affa97de1d99bb2aac0538e2666d0d8545545ead241ef0ccab": "swap",
+        "0x0243e1de00e8a6bc1dfa3e950e6ade24c52e4a25de4dee7fb5affe918ad1e744": "burn",
+        "0x034e55c1cd55f1338241b50d352f0e91c7e4ffad0e4271d64eb347589ebdfd16": "mint"
+      },
+      "roles": [
+        {
+          "role": "factory",
+          "contract_address": "0x01aa950c9b974294787de8df8880ecf668840a6ab8fa8290bf2952212b375148",
+          "class_hash": null,
+          "abi_version": null
+        },
+        {
+          "role": "router",
+          "contract_address": "0x0359550b990167afd6635fa574f3bdadd83cb51850e1d00061fe693158c23f80",
+          "class_hash": null,
+          "abi_version": null
+        },
+        {
+          "role": "pool",
+          "contract_address": null,
+          "class_hash": "0x2cd3c16a0112b22ded4903707f268125fcf46fd7733761e62c13fc0157afd8d",
+          "abi_version": null
+        }
+      ]
+    },
+    {
+      "protocol": "jediswap_v1",
+      "display_name": "JediSwap V1",
+      "decoder": "base-amm",
+      "family": "xyk",
+      "selector_handlers": {
+        "0x019437bf1c5c394fc8509a2e38c9c72c152df0bac8be777d4fc8f959ac817189": "pair_created",
+        "0x00e14a408baf7f453312eec68e9b7d728ec5337fbdf671f917ee8c80f3255232": "sync",
+        "0x00e316f0d9d2a3affa97de1d99bb2aac0538e2666d0d8545545ead241ef0ccab": "swap",
+        "0x0243e1de00e8a6bc1dfa3e950e6ade24c52e4a25de4dee7fb5affe918ad1e744": "burn",
+        "0x034e55c1cd55f1338241b50d352f0e91c7e4ffad0e4271d64eb347589ebdfd16": "mint"
+      },
+      "roles": [
+        {
+          "role": "factory",
+          "contract_address": "0x00dad44c139a476c7a17fc8141e6db680e9abc9f56fe249a105094c44382c2fd",
+          "class_hash": null,
+          "abi_version": null
+        },
+        {
+          "role": "router",
+          "contract_address": "0x041fd22b238fa21cfcf5dd45a8548974d8263b3a531a60388411c5e230f97023",
+          "class_hash": null,
+          "abi_version": null
+        }
+      ]
+    },
+    {
+      "protocol": "10kswap",
+      "display_name": "10KSwap",
+      "decoder": "base-amm",
+      "family": "xyk",
+      "selector_handlers": {
+        "0x019437bf1c5c394fc8509a2e38c9c72c152df0bac8be777d4fc8f959ac817189": "pair_created",
+        "0x00e14a408baf7f453312eec68e9b7d728ec5337fbdf671f917ee8c80f3255232": "sync",
+        "0x00e316f0d9d2a3affa97de1d99bb2aac0538e2666d0d8545545ead241ef0ccab": "swap",
+        "0x0243e1de00e8a6bc1dfa3e950e6ade24c52e4a25de4dee7fb5affe918ad1e744": "burn",
+        "0x034e55c1cd55f1338241b50d352f0e91c7e4ffad0e4271d64eb347589ebdfd16": "mint"
+      },
+      "roles": [
+        {
+          "role": "factory",
+          "contract_address": "0x01c0a36e26a8f822e0d81f20a5a562b16a8f8a3dfd99801367dd2aea8f1a87a2",
+          "class_hash": null,
+          "abi_version": null
+        },
+        {
+          "role": "router",
+          "contract_address": "0x07a6f98c03379b9513ca84cca1373ff452a7462a3b61598f0af5bb27ad7f76d1",
+          "class_hash": null,
+          "abi_version": null
+        },
+        {
+          "role": "pair",
+          "contract_address": null,
+          "class_hash": "0x231adde42526bad434ca2eb983efdd64472638702f87f97e6e3c084f264e06f",
+          "abi_version": null
+        }
+      ]
+    },
+    {
+      "protocol": "myswap_v1",
+      "display_name": "mySwap V1",
+      "decoder": "myswap",
+      "family": "fixed_pool",
+      "selector_handlers": {
+        "0x00e316f0d9d2a3affa97de1d99bb2aac0538e2666d0d8545545ead241ef0ccab": "swap"
+      },
+      "roles": [
+        {
+          "role": "amm",
+          "contract_address": "0x010884171baf1914edc28d7afb619b40a4051cfae78a094a55d230f19e944a28",
+          "class_hash": null,
+          "abi_version": null
+        }
+      ]
+    },
+    {
+      "protocol": "sithswap",
+      "display_name": "SithSwap",
+      "decoder": "base-amm",
+      "family": "solidly",
+      "selector_handlers": {
+        "0x019437bf1c5c394fc8509a2e38c9c72c152df0bac8be777d4fc8f959ac817189": "pair_created",
+        "0x00e14a408baf7f453312eec68e9b7d728ec5337fbdf671f917ee8c80f3255232": "sync",
+        "0x00e316f0d9d2a3affa97de1d99bb2aac0538e2666d0d8545545ead241ef0ccab": "swap",
+        "0x0243e1de00e8a6bc1dfa3e950e6ade24c52e4a25de4dee7fb5affe918ad1e744": "burn",
+        "0x034e55c1cd55f1338241b50d352f0e91c7e4ffad0e4271d64eb347589ebdfd16": "mint"
+      },
+      "roles": [
+        {
+          "role": "factory",
+          "contract_address": "0x041ccddcd56c5a5e1fd9fd8c0bee0c4f1afbe2438d5d29ddeb7a2c39be27c6c3",
+          "class_hash": null,
+          "abi_version": null
+        },
+        {
+          "role": "router",
+          "contract_address": "0x0684df1609dd0b82e28a4b1588de93c0e0a73e6af2c33e7f8bfcb3a6b56a768",
+          "class_hash": null,
+          "abi_version": null
+        }
+      ]
+    },
+    {
+      "protocol": "haiko",
+      "display_name": "Haiko",
+      "decoder": "haiko",
+      "family": "market_manager",
+      "selector_handlers": {
+        "0x14320d2ce9122f76b5773ef2a92835e9fe3d011cd611ad9bebed1a7a1936417": "market_create",
+        "0x3dfe6670b0f4e60f951b8a326e7467613b2470d81881ba2deb540262824f1e": "position_update",
+        "0x15ac4f6e0bb2a94d08f77f71ab4b23bc953ceed54625cd77c25f38079079d19": "order_create",
+        "0x38cd70bf17098de580e622264fb0dde5a27087dc6b2e7302cd160dfdb2a615a": "order_collect",
+        "0x19992f9b85d52e25e7c6f23906be17bb7627381400fea81b77eca8e50814448": "multiswap",
+        "0x00e316f0d9d2a3affa97de1d99bb2aac0538e2666d0d8545545ead241ef0ccab": "swap"
+      },
+      "roles": [
+        {
+          "role": "market_manager",
+          "contract_address": "0x038925b0bcf4dce081042ca26a96300d9e181b910328db54a6c89e5451503f5",
+          "class_hash": null,
+          "abi_version": null
+        }
+      ]
+    }
+  ],
+  "catalog_only_protocols": [
+    {
+      "protocol": "ammos",
+      "display_name": "Ammos",
+      "verification_status": "catalog_only",
+      "selector_handlers": {
+        "0x00e14a408baf7f453312eec68e9b7d728ec5337fbdf671f917ee8c80f3255232": "sync",
+        "0x00e316f0d9d2a3affa97de1d99bb2aac0538e2666d0d8545545ead241ef0ccab": "swap",
+        "0x0243e1de00e8a6bc1dfa3e950e6ade24c52e4a25de4dee7fb5affe918ad1e744": "burn",
+        "0x034e55c1cd55f1338241b50d352f0e91c7e4ffad0e4271d64eb347589ebdfd16": "mint"
+      },
+      "notes": "No verified Starknet mainnet program IDs were present in the provided reference material."
+    },
+    {
+      "protocol": "myswap_v2",
+      "display_name": "mySwap V2",
+      "verification_status": "catalog_only",
+      "selector_handlers": {
+        "0x00e14a408baf7f453312eec68e9b7d728ec5337fbdf671f917ee8c80f3255232": "sync",
+        "0x00e316f0d9d2a3affa97de1d99bb2aac0538e2666d0d8545545ead241ef0ccab": "swap",
+        "0x0243e1de00e8a6bc1dfa3e950e6ade24c52e4a25de4dee7fb5affe918ad1e744": "burn",
+        "0x034e55c1cd55f1338241b50d352f0e91c7e4ffad0e4271d64eb347589ebdfd16": "mint"
+      },
+      "notes": "The reference doc verified mySwap V1 only."
+    },
+    {
+      "protocol": "nostra",
+      "display_name": "Nostra",
+      "verification_status": "catalog_only",
+      "selector_handlers": {
+        "0x00e316f0d9d2a3affa97de1d99bb2aac0538e2666d0d8545545ead241ef0ccab": "swap"
+      },
+      "notes": "Current public materials do not expose a separately verified mainnet swap-emitting contract for this indexer pass."
+    },
+    {
+      "protocol": "starkdefi",
+      "display_name": "StarkDeFi",
+      "verification_status": "catalog_only",
+      "selector_handlers": {
+        "0x00e14a408baf7f453312eec68e9b7d728ec5337fbdf671f917ee8c80f3255232": "sync",
+        "0x00e316f0d9d2a3affa97de1d99bb2aac0538e2666d0d8545545ead241ef0ccab": "swap",
+        "0x0243e1de00e8a6bc1dfa3e950e6ade24c52e4a25de4dee7fb5affe918ad1e744": "burn",
+        "0x034e55c1cd55f1338241b50d352f0e91c7e4ffad0e4271d64eb347589ebdfd16": "mint"
+      },
+      "notes": "Official docs do not currently publish verified Starknet mainnet program IDs."
     }
   ]
 }

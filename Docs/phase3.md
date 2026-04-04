@@ -19,6 +19,12 @@ In plain words:
 
 That is the main job of this phase.
 
+One more thing changed after the registry-driven Phase 2 upgrade:
+
+- Phase 3 no longer assumes swaps only come from Ekubo or one Jedi-style path
+- it now consumes a normalized multi-DEX swap stream
+- that stream can include Ekubo, AVNU, JediSwap V1, JediSwap V2, 10KSwap, mySwap V1, SithSwap, and Haiko when Phase 2 classifies them
+
 ## 2. What Was Wrong In The Older Phase 3
 
 The earlier Phase 3 worked, but it still had some weak spots:
@@ -60,6 +66,15 @@ The refined flow is:
 8. `core/prices.js` writes price ticks and latest prices, including stale flags
 9. `core/ohlcv.js` updates candles incrementally unless reconciliation is active
 10. after commit, realtime trade and candle payloads are published
+
+One important refinement in that flow:
+
+- if a transaction contains an AVNU aggregator event and underlying venue swaps
+- Phase 2 marks the underlying venue swaps as `is_route_leg = true`
+- Phase 3 skips those route-leg swaps in `stark_trades`
+- but pool state can still use the underlying venue evidence
+
+That prevents volume double counting without throwing away execution truth.
 
 ## 5. Very Important Rules In The New Phase 3
 
@@ -117,6 +132,12 @@ That means:
 gets its own row.
 
 `stark_pool_latest` is only the fast access table.
+
+This matters even more now because pool-state truth may come from multiple venue families:
+
+- XYK / pair-based protocols through `sync`
+- Ekubo through swap-derived price state
+- Haiko through market-manager swap state
 
 That means:
 
@@ -750,5 +771,7 @@ The most important outcomes are:
 - bridge pricing is liquidity-aware
 - CMC is available as a bounded fallback
 - candles are incremental by default and rebuild only when necessary
+- route-leg swaps do not double count AVNU volume
+- Phase 3 can consume a wider Starknet DEX universe without changing its trade schema
 
 That gives StarknetDeg a better foundation for Phase 4 enrichment and later analytics.

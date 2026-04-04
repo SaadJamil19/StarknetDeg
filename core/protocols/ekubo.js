@@ -1,6 +1,6 @@
 'use strict';
 
-const { SELECTORS } = require('../abi-registry');
+const { SELECTORS } = require('../../lib/registry/dex-registry');
 const {
   buildPoolKeyId,
   normalizeAddress,
@@ -221,7 +221,7 @@ function buildSwapAction(tx, item, state, sequence) {
       sequence,
     }),
     actionType: 'swap',
-    accountAddress: payload.locker,
+    accountAddress: tx.senderAddress ?? payload.locker,
     amount0: payload.delta.amount0,
     amount1: payload.delta.amount1,
     emitterAddress: payload.emitterAddress,
@@ -234,6 +234,7 @@ function buildSwapAction(tx, item, state, sequence) {
       lock_events_saved_balance_count: state.savedBalances.length,
       price_ratio_denominator: priceRatio.denominator,
       price_ratio_numerator: priceRatio.numerator,
+      raw_locker: payload.locker,
       receipt_context_id: tx.transactionHash,
       receipt_sequence: sequence,
       skip_ahead: payload.params.skipAhead,
@@ -262,7 +263,7 @@ function buildPositionUpdateAction(tx, item, state, sequence) {
       sequence,
     }),
     actionType: 'position_update',
-    accountAddress: payload.locker,
+    accountAddress: tx.senderAddress ?? payload.locker,
     amount0: payload.delta.amount0,
     amount1: payload.delta.amount1,
     emitterAddress: payload.emitterAddress,
@@ -272,6 +273,7 @@ function buildPositionUpdateAction(tx, item, state, sequence) {
       delta: payload.delta,
       liquidity_delta: payload.params.liquidityDelta,
       position_fees_collected_seen: state.positionFeesCollected.length,
+      raw_locker: payload.locker,
       receipt_context_id: tx.transactionHash,
       receipt_sequence: sequence,
       salt: payload.params.salt,

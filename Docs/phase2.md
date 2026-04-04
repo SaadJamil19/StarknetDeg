@@ -1,468 +1,433 @@
 # StarknetDeg Phase 2
 
-Date: April 3, 2026  
-Scope: Simple English explanation of what Phase 2 does, why it exists, which files were added, and which tables were created.
+Date: April 4, 2026  
+Scope: Plain-English explanation of the current Phase 2 decoder engine after the registry-centric upgrade.
 
-## 1. What Phase 2 Is
+## 1. What Phase 2 Does
 
-Phase 1 was about one thing:
+Phase 1 stored raw chain truth.
 
-- fetch blocks safely
-- store block-level truth
-- move the checkpoint only after commit
-
-Phase 2 is the next step.
-
-Phase 2 takes raw Starknet transaction receipts and turns them into usable business facts.
+Phase 2 turns that raw truth into business meaning.
 
 In simple words:
 
-- Phase 1 tells us "this block exists"
-- Phase 2 tells us "this receipt contains a transfer, a swap, a bridge action, or something we do not understand yet"
+- Phase 1 says: "this Starknet block and receipt exist"
+- Phase 2 says: "this receipt contains a swap, a transfer, a pool update, a bridge activity, or an event we still do not classify"
 
-That is why Phase 2 is called the decoder engine.
+That is the job of the decoder engine.
 
-## 2. The Main Problem Phase 2 Solves
+## 2. What Changed In The New Phase 2
 
-Starknet data is not immediately ready for analytics.
+The old Phase 2 was still too narrow.
 
-A block gives us raw transactions and raw events, but not clean business meaning.
+It mainly understood:
 
-For example:
+- Ekubo
+- one Jedi-style path
+- ERC-20 transfer
 
-- one receipt can contain many events
-- the order of those events matters
-- some selectors like `Transfer` or `Swap` are common and can appear in many contracts
-- Ekubo is not a simple pair model, so one event alone is often not enough
+That was safe, but it produced too many `UNKNOWN` rows once we indexed real Starknet mainnet activity.
 
-So if we directly inserted "trade" or "transfer" rows from raw RPC responses without control, we would create wrong business data.
+So the decoder engine was refined to use a registry-centric design.
 
-Phase 2 fixes that by doing this:
+Now the system does not rely on small hardcoded `if/else` checks for only one or two DEXes.
 
-1. store raw transaction truth
-2. store raw event truth
-3. store raw message truth
-4. route events carefully
-5. decode only what we are confident about
-6. audit unsupported events instead of guessing
+It now has:
 
-## 3. High-Level Flow
+- one central DEX registry
+- one router that consults the registry
+- one generic AMM decoder for repeated pair/pool patterns
+- protocol-specific decoders only where the event model is truly different
 
-This is the Phase 2 flow in simple terms:
+## 3. The Big Design Decision
 
-1. a block is fetched
-2. raw transactions are written to `stark_tx_raw`
-3. raw events are written to `stark_event_raw`
-4. raw L2 to L1 messages are written to `stark_message_l2_to_l1`
-5. the router loads those raw rows back in receipt order
-6. each event is sent to the correct decoder
-7. decoders return:
-   - normalized actions
-   - canonical transfers
-   - bridge activities
-   - audits
-8. those outputs are stored in normalized tables
-9. raw rows are marked `PROCESSED`, `UNKNOWN`, `FAILED`, or `SKIPPED_REVERTED`
+### 3.1 Why A Registry Was Necessary
 
-This is important because raw truth and business truth are not the same thing.
+On Starknet, many DEXes do not emit from one universal router address.
 
-Phase 2 keeps both.
+Examples:
 
-## 4. Very Important Rules In Phase 2
+- Ekubo emits from one singleton core contract
+- AVNU emits from its exchange contract
+- JediSwap V1 / 10KSwap / SithSwap emit from many pair contracts
+- JediSwap V2 emits from many CLMM pool contracts
+- Haiko emits from one market-manager contract, but each event also carries a `market_id`
+- mySwap V1 emits from one central AMM contract, but each swap points to a `pool_id`
 
-### 4.1 Reverted Transactions Are Stored But Not Promoted
+So without a registry:
 
-If a Starknet transaction has `execution_status = REVERTED`:
+- we cannot know which contract belongs to which protocol
+- we cannot safely classify factory-created pools
+- we cannot add new DEXes without touching router logic every time
 
-- we still store its raw transaction row
-- we still store its raw events
-- but we do not create transfers, swaps, or other business facts from it
+That is why the registry is now the source of truth.
 
-Why?
+## 4. High-Level Flow Now
 
-Because reverted transactions are real chain history, but they are not successful business execution.
+The current Phase 2 flow is:
 
-If we ignored this rule:
+1. raw transactions are stored in `stark_tx_raw`
+2. raw events are stored in `stark_event_raw`
+3. raw L2-to-L1 messages are stored in `stark_message_l2_to_l1`
+4. the event router reloads one block in receipt order
+5. the router asks the registry:
+   - does this `from_address` belong to a known DEX?
+   - if not, does this `class_hash` belong to a known pool class?
+   - if not, can we probe `token0()`, `token1()`, `factory()`, `stable()` and classify it?
+6. if a route is found, the correct decoder runs
+7. if no route is found, the event is audited as `UNKNOWN`
+8. normalized actions go to `stark_action_norm`
+9. verified token transfers go to `stark_transfers`
+10. bridge activity goes to `stark_bridge_activities`
+11. unknown or suspicious cases go to `stark_unknown_event_audit`
 
-- fake swaps would appear
-- fake transfers would appear
-- holder balances would become wrong
+## 5. The New Core Files
 
-### 4.2 Unknown Is Better Than Wrong
+### 5.1 `lib/registry/dex-registry.js`
 
-If the router cannot justify a decoder route, it does not guess.
+This file is the main registry.
 
-Instead:
+It stores:
 
-- the event is written to `stark_unknown_event_audit`
-- the raw event is marked `UNKNOWN`
+- verified DEX addresses
+- verified class hashes
+- known selectors
+- protocol families
+- which decoder should handle which protocol
 
-This is the correct behavior.
+It currently contains verified mainnet coverage for:
 
-If we guessed too early:
+- Ekubo
+- AVNU
+- JediSwap V1
+- JediSwap V2
+- 10KSwap
+- mySwap V1
+- SithSwap
+- Haiko
 
-- unsupported contracts could look like real DEX activity
-- balances and analytics would become untrustworthy
+It also contains catalog-only placeholders for:
 
-### 4.3 Event Order Matters
+- Ammos
+- mySwap V2
+- Nostra
+- StarkDeFi
 
-On Starknet, receipt order matters.
+It also stores a selector-to-handler map for each protocol.
 
-This is especially true for Ekubo.
+That means the registry does not only say:
 
-Ekubo can emit several related events inside the same transaction, and those events only make sense in sequence.
+- "this address belongs to AVNU"
 
-That is why Phase 2 keeps `receipt_event_index` as a first-class field.
+It also says:
 
-Without this:
+- "this selector on AVNU means swap"
+- "this selector on Haiko means market creation"
+- "this selector on JediSwap V2 means CLMM mint"
 
-- Ekubo actions would be fragmented
-- multicall decoding would become ambiguous
+Why placeholders?
 
-### 4.4 Verified ERC-20 Only
+Because this pass was strict about verification.  
+If we do not have a verified mainnet address or class hash, we do not pretend to decode it.
 
-Phase 2 does not treat every standard-looking `Transfer` event as a confirmed token transfer.
+That is important.
 
-It now checks the emitting token contract against a verified cache.
+Fake certainty is worse than an honest placeholder.
 
-If the token is verified:
+### 5.2 `core/abi-registry.js`
 
-- the transfer is promoted into `stark_transfers`
-- a normalized `transfer` action is written into `stark_action_norm`
+This file is no longer just an ABI helper.
 
-If the token is not verified:
+Now it is the protocol matcher.
 
-- no transfer row is inserted
-- no normalized transfer action is inserted
-- the event is audited as `TRANSFER_UNVERIFIED`
+It does three levels of matching:
 
-Why?
+1. exact `from_address`
+2. `class_hash`
+3. dynamic probing of unknown pair contracts
 
-Because later holder balance logic will depend on `stark_transfers`.
+It also carries the registry handler name forward with the route, so the rest of the pipeline can tell which registry template matched the event.
 
-That table must stay clean.
+That third part is important.
 
-### 4.5 Protocol Context Must Not Leak
+For factory-based DEXes, many pools are deployed dynamically.  
+If we only matched one hardcoded address list, we would still miss real trades.
 
-Some protocols need receipt context.
-Some do not.
+So this file now tries:
 
-Ekubo is the main example that needs context.
+- `token0()`
+- `token1()`
+- `factory()`
+- `stable()`
 
-So the router now keeps context isolated per protocol.
+If those calls succeed and the factory belongs to a known protocol, the router can classify the pool even if the pool address was not manually listed before.
 
-That means:
+### 5.3 `core/event-router.js`
 
-- Ekubo context is collected only for Ekubo events
-- when the receipt moves from Ekubo to another protocol, the Ekubo context is flushed
-- after flush, the old context is cleared
-
-Why?
-
-Because one Starknet transaction can contain mixed protocol activity.
-
-If one shared context were used for the whole transaction:
-
-- Ekubo state could leak into unrelated events
-- normalized outputs could become wrong
-
-## 5. Files Added Or Updated In Phase 2
-
-These are the important Phase 2 files:
-
-1. `sql/002_registry_and_raw.sql`
-2. `data/registry/contracts.json`
-3. `data/registry/known-erc20.json`
-4. `core/normalize.js`
-5. `core/known-erc20-cache.js`
-6. `core/abi-registry.js`
-7. `core/event-sequencer.js`
-8. `core/event-router.js`
-9. `core/bridge.js`
-10. `core/protocols/shared.js`
-11. `core/protocols/erc20.js`
-12. `core/protocols/jediswap.js`
-13. `core/protocols/ekubo.js`
-14. `core/block-processor.js`
-
-## 6. File-By-File Explanation
-
-### 6.1 `sql/002_registry_and_raw.sql`
-
-This file creates the Phase 2 database tables.
-
-It gives us places to store:
-
-- contract registry data
-- raw transactions
-- raw events
-- raw L2 to L1 messages
-- unknown audits
-- normalized actions
-- canonical transfers
-- bridge activities
-
-Without this file, Phase 2 would have no storage model.
-
-### 6.2 `data/registry/contracts.json`
-
-This file stores known protocol contract metadata.
-
-Right now it is especially important for Ekubo.
-
-The router uses it to understand:
-
-- which protocol a contract belongs to
-- which decoder should handle it
-- which class hash / ABI version is expected
-
-Why this matters:
-
-On Starknet, address alone is not always enough because contracts can be upgradeable.
-
-### 6.3 `data/registry/known-erc20.json`
-
-This file is the verified token list.
-
-It is used for two things:
-
-1. ERC-20 verification before promoting transfers
-2. StarkGate token resolution for bridge-ins
-
-It contains:
-
-- verified L2 token addresses
-- token metadata like symbol and decimals
-- official StarkGate bridge mappings
-
-Without this file, the ERC-20 decoder would be too permissive.
-
-### 6.4 `core/normalize.js`
-
-This file is the low-level Starknet data parser.
-
-It handles things like:
-
-- address normalization
-- felt normalization
-- `u128`
-- `u256`
-- signed `i129`
-- Ekubo pool key building
-- price ratio derivation from `sqrt_ratio`
-
-Every decoder depends on this file.
-
-Why it exists:
-
-We do not want each decoder to invent its own way of parsing Starknet values.
-
-If every decoder parsed values differently:
-
-- addresses could have inconsistent formats
-- large numbers could be handled incorrectly
-- later joins and analytics would break
-
-### 6.5 `core/known-erc20-cache.js`
-
-This file loads `known-erc20.json` into memory and gives the rest of the system a clean lookup API.
-
-It answers questions like:
-
-- is this token verified?
-- what metadata belongs to this token?
-- is this bridge pair an official StarkGate pair?
-- if this is a StarkGate deposit, which L2 token does it map to?
-
-This keeps ERC-20 logic and bridge logic clean.
-
-### 6.6 `core/abi-registry.js`
-
-This file is the routing brain.
-
-Its job is to decide which decoder should handle an event.
-
-It looks at:
-
-- the event selector
-- the emitting address
-- the resolved class hash
-- registry metadata
-
-Why this matters:
-
-Just because two events share a name does not mean they mean the same thing.
-
-For example:
-
-- many contracts can emit `Transfer`
-- many contracts can emit `Swap`
-
-So this file keeps routing conservative.
-
-### 6.7 `core/event-sequencer.js`
-
-This file rebuilds a clean per-transaction view from raw SQL rows.
+This file is the controller of Phase 2.
 
 It:
 
-- loads raw tx rows
-- loads raw event rows
-- loads raw message rows
-- groups them by transaction hash
-- sorts events by `receipt_event_index`
+- loads one block back from raw storage
+- walks through each receipt in order
+- finds the correct route
+- calls the right decoder
+- writes normalized outputs
+- writes audits for unsupported cases
 
-The router then works on that clean, ordered structure.
+It also now applies transaction-level routing context.
 
-Why this exists:
+That means it understands things like:
 
-Decoders should not need to know SQL details.
+- AVNU top-level swap present in this transaction
+- underlying pool swaps inside the same transaction are route legs
 
-### 6.8 `core/event-router.js`
+This is how we stop double counting AVNU.
 
-This file is the Phase 2 controller.
+### 5.4 `core/protocols/base-amm.js`
 
-It takes one block of raw rows and runs the decoding pipeline.
+This is the generic AMM decoder.
 
-Its job is to:
+It handles repeated patterns instead of duplicating the same logic for every XYK-like DEX.
 
-- skip reverted transactions
-- extract bridge facts
-- send each event to the correct decoder
-- persist decoder outputs
-- update raw row statuses
-
-This file does not itself understand every protocol.
-
-Instead, it coordinates the protocol decoders.
-
-It also now does two important safety jobs:
-
-1. keeps receipt context isolated per protocol
-2. serializes BigInt safely before JSONB writes
-
-Without this router:
-
-- Phase 2 would have no orchestration layer
-- decoders would be disconnected from storage
-
-### 6.9 `core/bridge.js`
-
-This file handles bridge-related activity.
-
-It looks at:
-
-- `L1_HANDLER` transactions for bridge-ins
-- `messages_sent` for bridge-outs
-
-It can now do deeper parsing for official StarkGate bridge-ins.
-
-For official StarkGate deposits it can extract:
-
-- token address
-- amount
-- L2 wallet address
-
-If the bridge is not an official supported StarkGate mapping, it falls back to generic bridge classification.
-
-### 6.10 `core/protocols/shared.js`
-
-This file contains shared helper functions used by decoders.
-
-It handles:
-
-- deterministic keys for actions, transfers, and bridges
-- metadata normalization
-- BigInt-safe JSON serialization
-
-Why this matters:
-
-All decoders need consistent IDs and consistent metadata handling.
-
-### 6.11 `core/protocols/erc20.js`
-
-This file decodes standard Starknet ERC-20 `Transfer` events.
-
-In simple terms, it does this:
-
-1. read `from` from `keys[1]`
-2. read `to` from `keys[2]`
-3. read `amount` from `data[0..1]` as `u256`
-4. read `token_address` from `event.fromAddress`
-5. verify that token against the known ERC-20 cache
-
-If the token is verified:
-
-- it creates one normalized `transfer` action
-- it creates one canonical row in `stark_transfers`
-
-If the token is not verified:
-
-- it creates no transfer row
-- it creates no action row
-- it writes an audit record with reason `TRANSFER_UNVERIFIED`
-
-So this file is the main bridge between raw `Transfer` events and later holder balance logic.
-
-### 6.12 `core/protocols/jediswap.js`
-
-This file handles JediSwap pair events.
-
-Right now it decodes:
+It covers:
 
 - `Swap`
 - `Mint`
 - `Burn`
 - `Sync`
+- `PairCreated`
+- `PoolCreated`
 
-It converts those into normalized actions in `stark_action_norm`.
+It also understands two different families:
 
-This file is more direct than Ekubo because JediSwap is an XYK-style pair model.
+- V2/XYK style pools
+- CLMM style pools
 
-### 6.13 `core/protocols/ekubo.js`
+This matters because JediSwap V2 is not the same as 10KSwap or JediSwap V1.
 
-This file is the most complex decoder in Phase 2.
+### 5.5 `core/protocols/avnu.js`
 
-Ekubo is not a simple pair-per-pool design.
+This decoder handles:
 
-Because of that, this decoder cannot always turn one event into one final business action immediately.
+- AVNU `Swap`
+- AVNU `OptimizedSwap`
+- AVNU forwarder `SponsoredTransaction`
 
-So this file does two separate jobs:
+Why this matters:
 
-1. it parses raw Ekubo events
-2. it stores receipt-local state in a protocol context
+AVNU is an aggregator.
 
-It understands events like:
+If we ignored its own event and only counted underlying pool swaps:
 
-- `Swapped`
-- `PositionUpdated`
-- `PoolInitialized`
-- `FeesAccumulated`
-- `PositionFeesCollected`
-- `SavedBalance`
-- `LoadedBalance`
+- user-facing aggregator flow would disappear
+- route intent would be lost
+- transaction-level analytics would be incomplete
 
-How it works:
+If we counted both AVNU and every underlying pool as separate trades without route-leg logic:
 
-- when a `Swapped` event arrives, it parses it and stores it in ordered context
-- when a `PositionUpdated` event arrives, it also stores it in context
-- other Ekubo events add supporting context
-- when the router reaches the end of the Ekubo segment, `flushReceiptContext()` turns that buffered context into final normalized actions
+- volume would be double counted
 
-So this file is not just a parser.
-It is a receipt-aware semantic decoder.
+So this decoder plus router context solves both problems together.
 
-Why this design was needed:
+### 5.6 `core/protocols/myswap.js`
 
-If we emitted Ekubo actions immediately from every single event:
+mySwap V1 is simpler than pair-based AMMs.
 
-- lock/callback flows would lose meaning
-- related events would not stay connected
-- later analytics would be weaker
+Its swap event already tells us:
 
-## 7. Tables Created In Phase 2
+- `pool_id`
+- token sold
+- token bought
+- amount sold
+- amount bought
 
-Phase 2 creates these tables:
+So this decoder directly builds one normalized swap action.
+
+### 5.7 `core/protocols/haiko.js`
+
+Haiko is different again.
+
+It is not a normal pair-address model.
+
+It emits from a market-manager contract and uses `market_id`.
+
+This decoder handles:
+
+- `Swap`
+- `MultiSwap`
+- `ModifyPosition`
+- `CreateOrder`
+- `CollectOrder`
+- `CreateMarket`
+
+It also does on-chain market lookup using:
+
+- `base_token(market_id)`
+- `quote_token(market_id)`
+
+Why this lookup is necessary:
+
+The event alone gives the market id, but we still need the actual token addresses to normalize the action correctly.
+
+### 5.8 `core/protocols/ekubo.js`
+
+Ekubo stayed specialized.
+
+That was the correct choice.
+
+Ekubo is receipt-order-sensitive because:
+
+- one transaction can contain multiple related events
+- lock/callback behavior matters
+- event order inside one receipt matters
+
+So Ekubo still keeps receipt-local context.
+
+The important refinement here is:
+
+- trader attribution now prefers `transaction.sender_address`
+- the raw `locker` is still stored in metadata
+
+That fixes one of the biggest Starknet mistakes people make:
+
+using the router or executor address as the trader.
+
+### 5.10 `data/registry/contracts.json`
+
+This file is now a JSON mirror of the runtime registry.
+
+Important detail:
+
+- runtime routing uses `lib/registry/dex-registry.js`
+- `contracts.json` is the human-readable synchronized mirror
+
+Why keep both?
+
+Because:
+
+- JavaScript is the real runtime source of truth
+- JSON is easier for manual review, audits, and future tooling
+
+The JSON mirror now includes:
+
+- verified contracts
+- class hashes where available
+- selector-to-handler mappings
+- catalog-only unresolved protocols
+
+### 5.9 `core/protocols/erc20.js`
+
+This file still handles standard `Transfer` events.
+
+But it does not blindly trust any contract that emits `Transfer`.
+
+It only promotes a transfer when the token exists in the verified ERC-20 cache.
+
+If not, it goes to audit as `TRANSFER_UNVERIFIED`.
+
+That protects holder data from polluted transfer events.
+
+## 6. How Matching Works Now
+
+The matching order is:
+
+1. address match
+2. class-hash match
+3. probe the contract
+
+That is the right order.
+
+Why?
+
+- address match is cheapest and strongest
+- class-hash match is useful for factory-created pools
+- probing is slower, so it should be the fallback
+
+If we skipped class hashes and probing:
+
+- many real pool contracts would stay unknown forever
+
+If we probed first for everything:
+
+- routing would become slower and noisier than necessary
+
+## 7. Standardized Buy/Sell Output
+
+Different DEXes describe swaps differently.
+
+Examples:
+
+- Ekubo gives deltas
+- XYK AMMs give `amount0In / amount1Out`
+- AVNU gives `sell_address / buy_address`
+- mySwap gives `token_from / token_to`
+- Haiko gives `is_buy`, `amount_in`, `amount_out`
+
+The decoder engine now normalizes all of them into the same business shape:
+
+- `token0_address`
+- `token1_address`
+- `amount0`
+- `amount1`
+- `pool_id`
+- `account_address`
+- protocol-specific metadata
+
+The rule is:
+
+- positive amount means token entered the pool side / debit side of the canonical pair model
+- negative amount means token left that side
+
+This standardization is what lets Phase 3 build trades from many protocols with the same downstream logic.
+
+## 8. AVNU Dedup Logic
+
+This is one of the most important refinements.
+
+If an AVNU transaction is present:
+
+- the AVNU swap is treated as the user-facing aggregated trade
+- the underlying DEX swaps are marked as route legs
+
+That means:
+
+- Phase 2 still records the real venue activity
+- Phase 3 can skip route legs in `stark_trades`
+- pool state can still update from the underlying venue events
+
+This gives us the best of both worlds:
+
+- no volume double count
+- no loss of venue-level state changes
+
+## 9. What Still Goes To `UNKNOWN`
+
+The new DEX coverage reduces `UNKNOWN`, but it does not make `UNKNOWN` disappear completely.
+
+That is expected.
+
+There are still events on Starknet that are not DEX swaps, for example:
+
+- game / Dojo world events
+- perps-specific events
+- NFT transfers
+- miscellaneous admin events
+
+That is okay.
+
+The goal is not `UNKNOWN = 0`.
+
+The real goal is:
+
+- high-value DEX activity should not stay unknown
+- low-value non-DEX noise can stay audited until we decide it matters
+
+## 10. Database Tables Used By Phase 2
+
+The registry-centric expansion did **not** add a new SQL migration.
+
+Phase 2 still uses the same core Phase 2 tables:
 
 1. `stark_contract_registry`
 2. `stark_tx_raw`
@@ -473,245 +438,45 @@ Phase 2 creates these tables:
 7. `stark_transfers`
 8. `stark_bridge_activities`
 
-## 8. Table Explanation In Simple English
+What changed is the **quality** of what enters those tables.
 
-### 8.1 `stark_contract_registry`
+Now:
 
-This table stores known contract metadata.
+- more verified DEX events land in `stark_action_norm`
+- fewer supported DEX events should fall into `stark_unknown_event_audit`
+- transfer promotion is still strict
+- AVNU route legs are marked in metadata
 
-It tells the router:
+## 11. What This Unlocks For Phase 3
 
-- which contract belongs to which protocol
-- which decoder should be used
-- which class hash / ABI version is expected
+This Phase 2 upgrade matters directly for Phase 3.
 
-Important columns:
+Without it:
 
-- `contract_address`
-- `class_hash`
-- `protocol`
-- `role`
-- `decoder`
-- `abi_version`
-- `valid_from_block`
-- `valid_to_block`
-- `metadata`
+- `stark_trades` would miss major Starknet DEX flow
+- `stark_price_ticks` would remain sparse
+- pool-state updates would be incomplete
+- candles would be based on partial venue coverage
 
-### 8.2 `stark_tx_raw`
+With it:
 
-This is the raw transaction table.
+- more real Starknet DEX flow can materialize into `stark_trades`
+- AVNU is counted once, not twice
+- factory-deployed pools are easier to recognize
+- new DEX support mostly becomes a registry task instead of a router rewrite
 
-It stores:
+## 12. The Most Important Takeaway
 
-- transaction hash
-- tx type
-- execution status
-- finality status
-- sender / contract / L1 sender info
-- calldata
-- full raw transaction JSON
-- full raw receipt JSON
+The biggest architectural change in the current Phase 2 is this:
 
-Important columns:
+**the router is no longer the source of protocol knowledge**
 
-- `lane`
-- `block_number`
-- `block_hash`
-- `transaction_index`
-- `transaction_hash`
-- `tx_type`
-- `execution_status`
-- `finality_status`
-- `sender_address`
-- `contract_address`
-- `l1_sender_address`
-- `actual_fee_amount`
-- `calldata`
-- `raw_transaction`
-- `raw_receipt`
-- `normalized_status`
-
-### 8.3 `stark_event_raw`
-
-This is the raw event table.
-
-It stores every receipt event exactly as seen, plus event order.
-
-Important columns:
-
-- `transaction_hash`
-- `receipt_event_index`
-- `from_address`
-- `selector`
-- `resolved_class_hash`
-- `keys`
-- `data`
-- `raw_event`
-- `normalized_status`
-
-This table is very important because Phase 2 decoding is built on it.
-
-### 8.4 `stark_message_l2_to_l1`
-
-This stores raw L2 to L1 messages.
-
-It is mainly used for bridge-out tracking.
-
-Important columns:
-
-- `transaction_hash`
-- `message_index`
-- `from_address`
-- `to_address`
-- `payload`
-- `raw_message`
-
-### 8.5 `stark_unknown_event_audit`
-
-This table stores events we did not promote into business truth.
-
-This includes cases like:
-
-- `NO_DECODER_ROUTE`
-- `TRANSFER_UNVERIFIED`
-- shape mismatch audits
-
-Important columns:
-
-- `transaction_hash`
-- `source_event_index`
-- `emitter_address`
-- `selector`
-- `reason`
-- `metadata`
-
-This table is the backlog for future decoder expansion.
-
-### 8.6 `stark_action_norm`
-
-This is the general normalized business-action table.
-
-It stores actions like:
-
-- transfers
-- swaps
-- mints
-- burns
-- bridge_in
-- bridge_out
-- position updates
-
-Important columns:
-
-- `action_key`
-- `protocol`
-- `action_type`
-- `account_address`
-- `pool_id`
-- `token0_address`
-- `token1_address`
-- `token_address`
-- `amount0`
-- `amount1`
-- `amount`
-- `router_protocol`
-- `execution_protocol`
-- `metadata`
-
-This is a generic action layer.
-It is not yet the final trade table.
-
-### 8.7 `stark_transfers`
-
-This is the canonical token transfer table.
-
-It stores only verified token transfers.
-
-Important columns:
-
-- `transfer_key`
-- `token_address`
-- `from_address`
-- `to_address`
-- `amount`
-- `protocol`
-- `metadata`
-
-Later holder balance logic will be built from this table.
-
-### 8.8 `stark_bridge_activities`
-
-This stores bridge-related actions.
-
-Important columns:
-
-- `bridge_key`
-- `direction`
-- `l1_sender`
-- `l1_recipient`
-- `l2_contract_address`
-- `l2_wallet_address`
-- `token_address`
-- `amount`
-- `message_to_address`
-- `payload`
-- `classification`
-- `metadata`
-
-This is where official StarkGate bridge-in enrichment now lands.
-
-## 9. What Phase 2 Does Not Create Yet
-
-This is the important answer to your question:
-
-Phase 2 does **not** create a trades table yet.
-
-There is currently:
-
-- `stark_action_norm`
-- `stark_transfers`
-- `stark_bridge_activities`
-
-There is **no** `stark_trades` table in `sql/002_registry_and_raw.sql`.
+The registry is.
 
 That means:
 
-- swaps are currently stored as normalized actions
-- trades are not yet materialized into a dedicated trade table
-- OHLCV is also not built yet
+- adding a new verified DEX should mostly mean updating one registry file
+- the decoder engine becomes easier to extend
+- the core indexer stops getting messier every time Starknet adds another venue
 
-That work belongs to the next phase.
-
-## 10. What Phase 2 Gives Us Before Phase 3
-
-Before Phase 3 starts, Phase 2 already gives us:
-
-1. a safe raw data layer
-2. event order preservation
-3. conservative routing
-4. ERC-20 verification gating
-5. Ekubo receipt-aware decoding
-6. JediSwap action decoding
-7. bridge activity extraction
-8. unknown-event auditing
-
-So Phase 3 does not need to fight raw RPC complexity.
-
-It can build on clean normalized inputs.
-
-## 11. Final Summary
-
-Phase 2 turns StarknetDeg from a raw block ingester into a real decoder engine.
-
-The most important idea is this:
-
-Do not guess business truth from raw chain data too early.
-
-That is why Phase 2:
-
-- stores raw truth first
-- routes carefully
-- decodes only what it can justify
-- audits what it does not understand
-
-And yes, at this stage there is still no dedicated trades table yet.
+That is the correct long-term direction.

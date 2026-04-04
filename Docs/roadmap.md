@@ -278,9 +278,11 @@ StarknetDeg/
 |   |-- holders.js
 |   |-- realtime.js
 |   `-- protocols/
+|       |-- base-amm.js
 |       |-- ekubo.js
-|       |-- jediswap.js
 |       |-- avnu.js
+|       |-- haiko.js
+|       |-- myswap.js
 |       |-- erc20.js
 |       `-- shared.js
 |-- lib/
@@ -290,6 +292,8 @@ StarknetDeg/
 |   |-- cache.js
 |   |-- batch.js
 |   |-- starknet-rpc.js
+|   |-- registry/
+|   |   `-- dex-registry.js
 |   `-- cairo/
 |       |-- bigint.js
 |       |-- felt.js
@@ -349,6 +353,7 @@ Why these additions matter:
 2. `core/reconciliation.js` exists because `ACCEPTED_ON_L2` data must be rewindable until anchored on L1.
 3. `core/bridge.js`, `jobs/bridge-accounting.js`, and `sql/007_bridge_messaging.sql` exist because L1-L2 activity is part of wallet truth.
 4. `lib/cairo/bigint.js` exists to ban accidental precision loss at the utility layer.
+5. `lib/registry/dex-registry.js` exists so DEX coverage grows by registry updates instead of router rewrites.
 
 ### 4.2 ABI Versioning and Upgradeable Contracts
 
@@ -615,26 +620,34 @@ This is the StarknetDeg equivalent of Apibara invalidation plus DipDup rollback 
 1. Decode ordered Starknet events into protocol-normalized actions.
 2. Support:
    - Ekubo singleton receipts
-   - JediSwap XYK pair events
+   - AVNU aggregator events
+   - JediSwap V1 XYK pairs
+   - JediSwap V2 CLMM pools
+   - 10KSwap XYK pairs
+   - mySwap V1 fixed-pool swaps
+   - SithSwap volatile/stable pairs
+   - Haiko market-manager events
    - ERC-20 `Transfer`
-   - AVNU router summaries
 3. Recognize `L1HandlerTransaction` in `core/event-router.js` and classify eligible flows as `bridge_in`.
 4. Resolve router-vs-execution attribution where AVNU routes into downstream venues.
+5. Keep unresolved protocols such as Ammos, mySwap V2, Nostra, and StarkDeFi in a catalog-only registry state until verified mainnet program IDs exist.
 
 ### Key files
 
 1. `core/event-router.js`
 2. `core/bridge.js`
+3. `lib/registry/dex-registry.js`
 3. `core/protocols/ekubo.js`
-4. `core/protocols/jediswap.js`
+4. `core/protocols/base-amm.js`
 5. `core/protocols/avnu.js`
-6. `core/protocols/erc20.js`
-7. `core/protocols/shared.js`
-8. `data/registry/contracts.json`
-9. `data/abi/ekubo/*`
-10. `data/abi/jediswap/*`
-11. `data/abi/avnu/*`
-12. `data/abi/erc20/*`
+6. `core/protocols/haiko.js`
+7. `core/protocols/myswap.js`
+8. `core/protocols/erc20.js`
+9. `core/protocols/shared.js`
+10. `data/registry/contracts.json`
+11. `data/abi/ekubo/*`
+12. `data/abi/avnu/*`
+13. `data/abi/erc20/*`
 
 ### Security and integrity guardrails
 
@@ -646,6 +659,7 @@ This is the StarknetDeg equivalent of Apibara invalidation plus DipDup rollback 
    - `unknown_l1_handler`
 4. Unknown selectors or ABI mismatches are stored for audit, not silently dropped.
 5. AVNU is never treated as pool-state truth if downstream venue evidence exists.
+6. The router first matches by `from_address`, then `class_hash`, then dynamic pair probing before classifying an event as unknown.
 
 ## Phase 3: Persistence Layer
 
@@ -682,6 +696,7 @@ This is the StarknetDeg equivalent of Apibara invalidation plus DipDup rollback 
 3. Primary keys are idempotent and replay-safe.
 4. Pool state updates are upserts scoped by pool identity and block lineage.
 5. Holder balances are derived from deltas, not written ad hoc by side jobs.
+6. Aggregator route legs are excluded from `stark_trades` while still being available for pool-state truth.
 
 ## Phase 4: Enrichment and Metadata
 

@@ -95,6 +95,50 @@ function parseI129FromArray(values, offset = 0, label = 'i129') {
   return parseI129(values[offset], values[offset + 1], label);
 }
 
+function parseSignedMagnitude(magnitude, sign, label = 'signed magnitude') {
+  const mag = toBigIntStrict(magnitude, `${label}.mag`);
+  if (mag < 0n) {
+    throw new RangeError(`${label}.mag cannot be negative.`);
+  }
+
+  const negative = normalizeBoolFromFelt(sign, `${label}.sign`);
+  if (negative && mag !== 0n) {
+    return -mag;
+  }
+
+  return mag;
+}
+
+function parseSignedU256(low, high, sign, label = 'signed u256') {
+  const value = parseU256(low, high, `${label}.value`);
+  return parseSignedMagnitude(value, sign, label);
+}
+
+function parseSignedU256FromArray(values, offset = 0, label = 'signed u256') {
+  if (!Array.isArray(values) || values.length < offset + 3) {
+    throw new RangeError(`${label} requires three felts starting at offset ${offset}.`);
+  }
+
+  return parseSignedU256(values[offset], values[offset + 1], values[offset + 2], label);
+}
+
+function parseSignedU32(magnitude, sign, label = 'signed u32') {
+  const mag = toBigIntStrict(magnitude, `${label}.mag`);
+  if (mag < 0n || mag >= (1n << 32n)) {
+    throw new RangeError(`${label}.mag must fit inside u32.`);
+  }
+
+  return parseSignedMagnitude(mag, sign, label);
+}
+
+function parseSignedU32FromArray(values, offset = 0, label = 'signed u32') {
+  if (!Array.isArray(values) || values.length < offset + 2) {
+    throw new RangeError(`${label} requires two felts starting at offset ${offset}.`);
+  }
+
+  return parseSignedU32(values[offset], values[offset + 1], label);
+}
+
 function buildPoolKeyId(poolKey) {
   if (!poolKey || typeof poolKey !== 'object') {
     throw new TypeError('poolKey is required.');
@@ -121,6 +165,29 @@ function sqrtRatioToPriceRatio(value, label = 'sqrt ratio') {
   };
 }
 
+function sqrtPriceX96ToPriceRatio(value, label = 'sqrt price x96') {
+  const sqrtPrice = toBigIntStrict(value, label);
+  if (sqrtPrice < 0n) {
+    throw new RangeError(`${label} cannot be negative.`);
+  }
+
+  return {
+    numerator: sqrtPrice * sqrtPrice,
+    denominator: 1n << 192n,
+  };
+}
+
+function sortTokenPair(left, right, label = 'token pair') {
+  const tokenLeft = normalizeAddress(left, `${label}.left`);
+  const tokenRight = normalizeAddress(right, `${label}.right`);
+
+  if (tokenLeft <= tokenRight) {
+    return [tokenLeft, tokenRight];
+  }
+
+  return [tokenRight, tokenLeft];
+}
+
 function isZeroAddress(value) {
   return normalizeAddress(value) === ZERO_ADDRESS;
 }
@@ -140,8 +207,15 @@ module.exports = {
   normalizeSelector,
   parseI129,
   parseI129FromArray,
+  parseSignedMagnitude,
+  parseSignedU32,
+  parseSignedU32FromArray,
+  parseSignedU256,
+  parseSignedU256FromArray,
   parseU128,
   parseU256,
   parseU256FromArray,
+  sortTokenPair,
+  sqrtPriceX96ToPriceRatio,
   sqrtRatioToPriceRatio,
 };

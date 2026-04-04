@@ -2,17 +2,24 @@
 
 const { extractBridgeActivities } = require('./bridge');
 const { loadSequencedTransactions } = require('./event-sequencer');
-const { resolveRoute } = require('./abi-registry');
-const erc20 = require('./protocols/erc20');
-const jediswap = require('./protocols/jediswap');
+const { getCandidateProtocolsForSelector, isStandardDexSelector, resolveRoute } = require('./abi-registry');
+const { SELECTORS, isAggregatorSwapEvent } = require('../lib/registry/dex-registry');
+const avnu = require('./protocols/avnu');
+const baseAmm = require('./protocols/base-amm');
 const ekubo = require('./protocols/ekubo');
+const erc20 = require('./protocols/erc20');
+const haiko = require('./protocols/haiko');
+const myswap = require('./protocols/myswap');
 const { normalizeActionMetadata, toJsonbString } = require('./protocols/shared');
 const { toNumericString } = require('../lib/cairo/bigint');
 
 const DECODERS = Object.freeze({
-  erc20,
+  avnu,
+  'base-amm': baseAmm,
   ekubo,
-  jediswap,
+  erc20,
+  haiko,
+  myswap,
 });
 
 async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcClient }) {
@@ -29,6 +36,7 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
 
   for (const tx of transactions) {
     const receiptContexts = createReceiptContextController();
+    const txContext = buildTransactionContext(tx);
 
     if (tx.executionStatus !== 'SUCCEEDED') {
       await markTransactionStatus(client, tx, 'SKIPPED_REVERTED', tx.revertReason ?? 'Transaction execution_status != SUCCEEDED');
@@ -53,22 +61,9 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
       summary.transfers += protocolTransitionResult.transfers.length;
 
       if (!route) {
-        await insertAudit(client, {
-          blockHash: tx.blockHash,
-          blockNumber: tx.blockNumber,
-          emitterAddress: event.fromAddress,
-          lane: tx.lane,
-          metadata: normalizeActionMetadata({
-            keys_length: event.keys.length,
-            resolved_class_hash: event.resolvedClassHash,
-          }),
-          reason: 'NO_DECODER_ROUTE',
-          selector: event.selector,
-          sourceEventIndex: event.receiptEventIndex,
-          transactionHash: tx.transactionHash,
-          transactionIndex: tx.transactionIndex,
-        });
-        await markEventStatus(client, tx, event, 'UNKNOWN', null);
+        const audit = buildNoRouteAudit({ event, tx });
+        await insertAudit(client, audit);
+        await markEventStatus(client, tx, event, 'UNKNOWN', audit.reason);
         summary.unknownEvents += 1;
         continue;
       }
@@ -78,13 +73,15 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
         throw new Error(`Decoder ${route.decoder} is not available.`);
       }
 
-      const result = decoder.decodeEvent({
+      const decoded = await Promise.resolve(decoder.decodeEvent({
         contractMetadata: route.contractMetadata,
         event,
         receiptContext: receiptContexts.get(route.decoder),
         route,
+        rpcClient,
         tx,
-      });
+      }));
+      const result = applyTransactionRoutingContext(decoded, { route, tx, txContext });
 
       await persistResultBundle(client, tx, result);
 
@@ -106,7 +103,11 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
       summary.transfers += result.transfers.length;
     }
 
-    const finalFlush = receiptContexts.flushAll(tx);
+    const finalFlush = applyTransactionRoutingContext(receiptContexts.flushAll(tx), {
+      route: null,
+      tx,
+      txContext,
+    });
     await persistResultBundle(client, tx, finalFlush);
     summary.actions += finalFlush.actions.length;
     summary.bridgeActivities += finalFlush.bridges.length;
@@ -121,6 +122,95 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
   }
 
   return summary;
+}
+
+function buildTransactionContext(tx) {
+  const hasAvnuSwap = tx.events.some((event) => isAggregatorSwapEvent(event));
+  const swapSignalCount = tx.events.filter((event) => isSwapSignal(event.selector)).length;
+
+  return {
+    hasAvnuSwap,
+    swapSignalCount,
+  };
+}
+
+function isSwapSignal(selectorValue) {
+  return [
+    SELECTORS.SWAP,
+    SELECTORS.MULTI_SWAP,
+    SELECTORS.EKUBO_SWAPPED,
+  ].includes(selectorValue);
+}
+
+function applyTransactionRoutingContext(bundle, { route, tx, txContext }) {
+  const normalized = normalizeResultBundle(bundle);
+  const actions = normalized.actions.map((action) => {
+    const metadata = normalizeActionMetadata({
+      ...(action.metadata ?? {}),
+      transaction_sender_address: tx.senderAddress ?? null,
+    });
+    const nextAction = {
+      ...action,
+      accountAddress: action.accountAddress ?? tx.senderAddress ?? null,
+      metadata,
+    };
+
+    if (nextAction.actionType === 'swap' && txContext.swapSignalCount > 1) {
+      nextAction.metadata.is_multihop = true;
+      nextAction.metadata.hop_count = txContext.swapSignalCount;
+    }
+
+    if (nextAction.actionType === 'swap' && txContext.hasAvnuSwap) {
+      if (nextAction.protocol === 'avnu') {
+        nextAction.routerProtocol = nextAction.routerProtocol ?? 'avnu';
+        nextAction.metadata.is_user_facing_aggregated_trade = true;
+      } else {
+        nextAction.routerProtocol = nextAction.routerProtocol ?? 'avnu';
+        nextAction.metadata.is_route_leg = true;
+        nextAction.metadata.via_aggregator = 'avnu';
+      }
+    }
+
+    if (route?.protocolKey) {
+      nextAction.metadata.protocol_key = route.protocolKey;
+    }
+
+    if (route?.handler) {
+      nextAction.metadata.registry_handler = route.handler;
+    }
+
+    return nextAction;
+  });
+
+  return {
+    actions,
+    audits: normalized.audits,
+    bridges: normalized.bridges,
+    transfers: normalized.transfers,
+  };
+}
+
+function buildNoRouteAudit({ event, tx }) {
+  const isStandard = isStandardDexSelector(event.selector);
+  const candidateProtocols = isStandard ? getCandidateProtocolsForSelector(event.selector) : [];
+
+  return {
+    blockHash: tx.blockHash,
+    blockNumber: tx.blockNumber,
+    emitterAddress: event.fromAddress,
+    lane: tx.lane,
+    metadata: normalizeActionMetadata({
+      candidate_protocols: candidateProtocols,
+      keys_length: event.keys.length,
+      resolved_class_hash: event.resolvedClassHash,
+      selector_name: isStandard ? 'standard_dex_selector' : null,
+    }),
+    reason: isStandard ? 'STANDARD_DEX_SELECTOR_UNMATCHED' : 'NO_DECODER_ROUTE',
+    selector: event.selector,
+    sourceEventIndex: event.receiptEventIndex,
+    transactionHash: tx.transactionHash,
+    transactionIndex: tx.transactionIndex,
+  };
 }
 
 async function persistResultBundle(client, tx, bundle) {

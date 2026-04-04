@@ -167,12 +167,16 @@ function compareSnapshots(left, right) {
 }
 
 function derivePoolSnapshot(action, latestUsdByToken) {
-  if (action.protocol === 'jediswap' && action.actionType === 'sync') {
+  if (action.actionType === 'sync') {
     return deriveJediswapSyncSnapshot(action, latestUsdByToken);
   }
 
   if (action.protocol === 'ekubo' && action.actionType === 'swap') {
     return deriveEkuboSwapSnapshot(action);
+  }
+
+  if (action.protocol === 'haiko' && action.actionType === 'swap') {
+    return deriveHaikoSwapSnapshot(action);
   }
 
   return null;
@@ -270,6 +274,56 @@ function deriveEkuboSwapSnapshot(action) {
   };
 }
 
+function deriveHaikoSwapSnapshot(action) {
+  const numerator = action.metadata?.price_ratio_numerator;
+  const denominator = action.metadata?.price_ratio_denominator;
+
+  if (numerator === undefined || denominator === undefined) {
+    return null;
+  }
+
+  const ratioNumerator = toBigIntStrict(numerator, 'haiko price numerator');
+  const ratioDenominator = toBigIntStrict(denominator, 'haiko price denominator');
+  if (ratioNumerator === 0n || ratioDenominator === 0n) {
+    return null;
+  }
+
+  const token0 = knownErc20Cache.getToken(action.token0Address);
+  const token1 = knownErc20Cache.getToken(action.token1Address);
+  const canNormalizePrice = token0?.decimals !== undefined && token0?.decimals !== null && token1?.decimals !== undefined && token1?.decimals !== null;
+  const exponent = canNormalizePrice ? token0.decimals - token1.decimals : 0;
+  const inverseExponent = canNormalizePrice ? token1.decimals - token0.decimals : 0;
+
+  return {
+    blockHash: action.blockHash,
+    blockNumber: action.blockNumber,
+    blockTimestampDate: action.blockTimestampDate,
+    lane: action.lane,
+    liquidity: action.metadata?.market_liquidity === undefined ? null : toBigIntStrict(action.metadata.market_liquidity, 'haiko market liquidity'),
+    metadata: {
+      market_id: action.metadata?.market_id ?? null,
+      protocol: 'haiko',
+      snapshot_kind: 'swap',
+    },
+    poolId: action.poolId,
+    poolStateKey: buildPoolStateKey(action),
+    priceIsDecimalsNormalized: canNormalizePrice,
+    priceToken0PerToken1Scaled: scaledRatio(ratioDenominator, ratioNumerator, inverseExponent, DEFAULT_SCALE),
+    priceToken1PerToken0Scaled: scaledRatio(ratioNumerator, ratioDenominator, exponent, DEFAULT_SCALE),
+    protocol: action.protocol,
+    reserve0: null,
+    reserve1: null,
+    snapshotKind: 'swap',
+    sourceEventIndex: action.sourceEventIndex,
+    sqrtRatio: action.metadata?.end_sqrt_price === undefined ? null : toBigIntStrict(action.metadata.end_sqrt_price, 'haiko end sqrt price'),
+    token0Address: action.token0Address,
+    token1Address: action.token1Address,
+    transactionHash: action.transactionHash,
+    transactionIndex: action.transactionIndex,
+    tvlUsdScaled: null,
+  };
+}
+
 function deriveTvlUsd({ latestUsdByToken, reserve0, reserve1, token0, token0Address, token1, token1Address }) {
   const price0 = latestUsdByToken.get(token0Address) ?? null;
   const price1 = latestUsdByToken.get(token1Address) ?? null;
@@ -308,8 +362,9 @@ async function loadPoolStateActions(client, { blockNumber, lane }) {
       WHERE lane = $1
         AND block_number = $2
         AND (
-             (protocol = 'jediswap' AND action_type = 'sync')
+             (action_type = 'sync')
           OR (protocol = 'ekubo' AND action_type = 'swap')
+          OR (protocol = 'haiko' AND action_type = 'swap')
         )
       ORDER BY transaction_index ASC, source_event_index ASC, action_key ASC`,
     [lane, toNumericString(blockNumber, 'pool state block number')],
