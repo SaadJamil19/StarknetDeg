@@ -46,7 +46,7 @@ function decodeEvent({ tx, event, receiptContext }) {
 }
 
 function flushReceiptContext({ tx, receiptContext }) {
-  const state = receiptContext?.protocols?.ekubo;
+  const state = receiptContext;
   if (!state || state.ordered.length === 0) {
     return emptyResult();
   }
@@ -285,22 +285,44 @@ function buildPositionUpdateAction(tx, item, state, sequence) {
 }
 
 function getEkuboState(receiptContext) {
-  if (!receiptContext.protocols) {
-    receiptContext.protocols = {};
+  if (!receiptContext.feesAccumulated) {
+    receiptContext.feesAccumulated = [];
   }
 
-  if (!receiptContext.protocols.ekubo) {
-    receiptContext.protocols.ekubo = {
-      feesAccumulated: [],
-      loadedBalances: [],
-      ordered: [],
-      poolInitializations: [],
-      positionFeesCollected: [],
-      savedBalances: [],
-    };
+  if (!receiptContext.loadedBalances) {
+    receiptContext.loadedBalances = [];
   }
 
-  return receiptContext.protocols.ekubo;
+  if (!receiptContext.ordered) {
+    receiptContext.ordered = [];
+  }
+
+  if (!receiptContext.poolInitializations) {
+    receiptContext.poolInitializations = [];
+  }
+
+  if (!receiptContext.positionFeesCollected) {
+    receiptContext.positionFeesCollected = [];
+  }
+
+  if (!receiptContext.savedBalances) {
+    receiptContext.savedBalances = [];
+  }
+
+  return receiptContext;
+}
+
+function clearReceiptContext({ receiptContext }) {
+  if (!receiptContext || typeof receiptContext !== 'object') {
+    return;
+  }
+
+  delete receiptContext.feesAccumulated;
+  delete receiptContext.loadedBalances;
+  delete receiptContext.ordered;
+  delete receiptContext.poolInitializations;
+  delete receiptContext.positionFeesCollected;
+  delete receiptContext.savedBalances;
 }
 
 function decodePoolKey(values, offset, label) {
@@ -386,6 +408,7 @@ function emptyResult() {
 }
 
 module.exports = {
+  clearReceiptContext,
   decodeEvent,
   flushReceiptContext,
 };

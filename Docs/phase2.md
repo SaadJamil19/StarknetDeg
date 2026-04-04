@@ -1,1277 +1,717 @@
-# StarknetDeg Phase 2 Explanation
+# StarknetDeg Phase 2
 
-Date: April 2, 2026  
-Scope: Deep conceptual explanation of everything implemented in Phase 2 of StarknetDeg.
+Date: April 3, 2026  
+Scope: Simple English explanation of what Phase 2 does, why it exists, which files were added, and which tables were created.
 
-## 1. What Phase 2 Is Trying To Solve
+## 1. What Phase 2 Is
 
-Phase 1 solved "safe block ingestion".  
-Phase 2 solves "turn raw Starknet events into reliable business actions".
+Phase 1 was about one thing:
 
-That sounds simple, but on Starknet it is not simple for four reasons:
+- fetch blocks safely
+- store block-level truth
+- move the checkpoint only after commit
 
-1. Receipts contain many events inside one transaction.
-2. Event order inside a receipt matters.
-3. Different protocols emit the same selector names with different shapes.
-4. Upgradeable contracts mean address alone is not enough to choose a decoder safely.
+Phase 2 is the next step.
 
-So Phase 2 is the point where StarknetDeg stops being only a block journal and becomes a decoder engine.
+Phase 2 takes raw Starknet transaction receipts and turns them into usable business facts.
 
-The core Phase 2 promise is:
+In simple words:
+
+- Phase 1 tells us "this block exists"
+- Phase 2 tells us "this receipt contains a transfer, a swap, a bridge action, or something we do not understand yet"
+
+That is why Phase 2 is called the decoder engine.
+
+## 2. The Main Problem Phase 2 Solves
+
+Starknet data is not immediately ready for analytics.
+
+A block gives us raw transactions and raw events, but not clean business meaning.
+
+For example:
+
+- one receipt can contain many events
+- the order of those events matters
+- some selectors like `Transfer` or `Swap` are common and can appear in many contracts
+- Ekubo is not a simple pair model, so one event alone is often not enough
+
+So if we directly inserted "trade" or "transfer" rows from raw RPC responses without control, we would create wrong business data.
+
+Phase 2 fixes that by doing this:
 
 1. store raw transaction truth
 2. store raw event truth
-3. store raw L2 to L1 messaging truth
-4. decode only what we can justify
-5. leave unknown activity auditable instead of guessing
+3. store raw message truth
+4. route events carefully
+5. decode only what we are confident about
+6. audit unsupported events instead of guessing
 
-If Phase 2 guessed aggressively, later phases would be built on fabricated facts.
+## 3. High-Level Flow
 
-Examples:
+This is the Phase 2 flow in simple terms:
 
-1. If we decoded any `Transfer` selector as ERC-20 without checking shape, fake holder deltas would be created.
-2. If we decoded any `Swap` selector as JediSwap, unrelated contracts would produce false trades.
-3. If we processed Ekubo events one-by-one without receipt context, a multicall lock flow could be misinterpreted.
-4. If we normalized actions from reverted transactions, wallet analytics and balances would become wrong.
+1. a block is fetched
+2. raw transactions are written to `stark_tx_raw`
+3. raw events are written to `stark_event_raw`
+4. raw L2 to L1 messages are written to `stark_message_l2_to_l1`
+5. the router loads those raw rows back in receipt order
+6. each event is sent to the correct decoder
+7. decoders return:
+   - normalized actions
+   - canonical transfers
+   - bridge activities
+   - audits
+8. those outputs are stored in normalized tables
+9. raw rows are marked `PROCESSED`, `UNKNOWN`, `FAILED`, or `SKIPPED_REVERTED`
 
-So Phase 2 is about controlled decoding, not maximum decoding.
+This is important because raw truth and business truth are not the same thing.
 
-## 2. Starknet-Specific Reality We Designed Around
+Phase 2 keeps both.
 
-Phase 2 was designed around Starknet event semantics, not around EVM log assumptions and not around Solana instruction assumptions.
+## 4. Very Important Rules In Phase 2
 
-Important protocol facts:
+### 4.1 Reverted Transactions Are Stored But Not Promoted
 
-1. Starknet events are emitted as:
-   - `from_address`
-   - `keys[]`
-   - `data[]`
-2. `keys[0]` is the event selector.
-3. Additional keys may contain indexed fields, but not all contracts use keys the same way.
-4. Cairo 0 and Cairo 1 event layouts differ.
-5. A transaction may succeed while containing many protocol-level sub-actions.
-6. Ekubo especially uses a singleton core and can emit multiple interdependent events inside one receipt.
-7. Upgradeable contracts can change `class_hash` over time, so decoder choice must be block-aware.
+If a Starknet transaction has `execution_status = REVERTED`:
 
-This creates three decoding layers:
+- we still store its raw transaction row
+- we still store its raw events
+- but we do not create transfers, swaps, or other business facts from it
 
-1. raw storage layer
-2. routing layer
-3. protocol semantic layer
+Why?
 
-Without separating these layers, debugging becomes impossible.
+Because reverted transactions are real chain history, but they are not successful business execution.
 
-## 3. The High-Level Phase 2 Pipeline
+If we ignored this rule:
 
-The implemented Phase 2 flow is:
+- fake swaps would appear
+- fake transfers would appear
+- holder balances would become wrong
 
-1. fetch block with receipts and state update
-2. validate lineage exactly like Phase 1
-3. delete previously derived rows for that `(lane, block_number)` so replay is clean
-4. write raw transaction rows into `stark_tx_raw`
-5. write raw event rows into `stark_event_raw`
-6. write raw L2 to L1 messages into `stark_message_l2_to_l1`
-7. sequence events by:
-   - block
-   - transaction index
-   - receipt event index
-8. for each transaction:
-   - if reverted, mark raw rows as skipped
-   - if succeeded, attempt bridge extraction
-   - route each event to a decoder if justified
-   - decode into normalized actions or transfers
-   - write unknowns into audit instead of forcing a decode
-9. only after all of that succeeds, advance the checkpoint
+### 4.2 Unknown Is Better Than Wrong
 
-This preserves the Phase 1 hard rule:
+If the router cannot justify a decoder route, it does not guess.
 
-Checkpoint still moves after all writes succeed, never before.
+Instead:
 
-## 4. The Core Design Principles Of Phase 2
+- the event is written to `stark_unknown_event_audit`
+- the raw event is marked `UNKNOWN`
 
-### 4.1 Raw First, Business Later
+This is the correct behavior.
 
-We do not directly decode from live RPC payload into business tables.
+If we guessed too early:
 
-We first persist:
+- unsupported contracts could look like real DEX activity
+- balances and analytics would become untrustworthy
 
-1. raw tx
-2. raw events
-3. raw messages
+### 4.3 Event Order Matters
 
-Then we decode from our own raw tables.
+On Starknet, receipt order matters.
 
-Why this is correct:
+This is especially true for Ekubo.
 
-1. replay becomes deterministic
-2. decoder bugs can be fixed and blocks re-run
-3. audits have a source of truth
-4. protocol development no longer depends on re-fetching old RPC data
+Ekubo can emit several related events inside the same transaction, and those events only make sense in sequence.
 
-If we skipped the raw layer:
+That is why Phase 2 keeps `receipt_event_index` as a first-class field.
 
-1. a decoder bug would force live refetch to recover
-2. some old data might not be available the same way later
-3. debugging would require going back to provider payloads every time
+Without this:
 
-### 4.2 Decode Conservatively
+- Ekubo actions would be fragmented
+- multicall decoding would become ambiguous
 
-Phase 2 does not try to decode everything.
+### 4.4 Verified ERC-20 Only
 
-It decodes only when:
+Phase 2 does not treat every standard-looking `Transfer` event as a confirmed token transfer.
 
-1. selector is recognized
-2. protocol route is justified
-3. event shape matches expectations
+It now checks the emitting token contract against a verified cache.
 
-Otherwise, the event becomes audit data.
+If the token is verified:
 
-Why this is correct:
+- the transfer is promoted into `stark_transfers`
+- a normalized `transfer` action is written into `stark_action_norm`
 
-1. unknown is safer than wrong
-2. you can expand coverage later
-3. false positives are much more dangerous than false negatives
+If the token is not verified:
 
-### 4.3 Reverted Transactions Are Stored But Not Promoted
+- no transfer row is inserted
+- no normalized transfer action is inserted
+- the event is audited as `TRANSFER_UNVERIFIED`
 
-This is one of the most important Phase 2 rules.
+Why?
 
-If `execution_status != SUCCEEDED`:
+Because later holder balance logic will depend on `stark_transfers`.
 
-1. transaction raw row is kept
-2. event raw rows are kept
-3. normalized actions are not created
-4. transfers are not created
-5. bridge activities are not created
+That table must stay clean.
 
-Why:
+### 4.5 Protocol Context Must Not Leak
 
-1. reverted transactions are real chain history
-2. but they are not successful business execution
+Some protocols need receipt context.
+Some do not.
 
-If we ignored this:
+Ekubo is the main example that needs context.
 
-1. fake transfer rows would appear
-2. holder balances would drift
-3. fake swaps would pollute trading analytics
+So the router now keeps context isolated per protocol.
 
-### 4.4 Receipt Order Matters
+That means:
 
-Starknet event order inside a transaction receipt is part of the meaning.
+- Ekubo context is collected only for Ekubo events
+- when the receipt moves from Ekubo to another protocol, the Ekubo context is flushed
+- after flush, the old context is cleared
 
-This is especially important for Ekubo because:
+Why?
 
-1. one receipt can contain several singleton-core actions
-2. swaps and liquidity actions can happen inside one lock flow
-3. later events may only make sense in the context of earlier events
+Because one Starknet transaction can contain mixed protocol activity.
 
-So Phase 2 uses `receipt_event_index` as a first-class ordering field.
+If one shared context were used for the whole transaction:
 
-If we ignored order:
+- Ekubo state could leak into unrelated events
+- normalized outputs could become wrong
 
-1. correlated actions would become ambiguous
-2. Ekubo multicalls would be decoded as unrelated fragments
-3. downstream pool and wallet analytics would be less trustworthy
+## 5. Files Added Or Updated In Phase 2
 
-### 4.5 Address Alone Is Not Enough
-
-Upgradeable Starknet contracts can change `class_hash`.
-
-So Phase 2 resolves decoder metadata using:
-
-1. emitting address
-2. resolved class hash at that block
-3. class-hash validity window from the registry
-
-Why:
-
-1. one address can have different ABI/class behavior over time
-2. block-time decoding must reflect what was active then, not what is active today
-
-If we used only address:
-
-1. older historical events could be decoded with the wrong ABI version
-2. protocol upgrades would silently corrupt historical interpretation
-
-## 5. Files Created Or Updated In Phase 2
-
-Phase 2 introduced or updated these files:
+These are the important Phase 2 files:
 
 1. `sql/002_registry_and_raw.sql`
 2. `data/registry/contracts.json`
-3. `core/normalize.js`
-4. `core/abi-registry.js`
-5. `core/event-sequencer.js`
-6. `core/event-router.js`
-7. `core/bridge.js`
-8. `core/protocols/shared.js`
-9. `core/protocols/erc20.js`
-10. `core/protocols/jediswap.js`
-11. `core/protocols/ekubo.js`
-12. `core/block-processor.js` updated
-13. `core/checkpoint.js` updated
-14. `lib/starknet-rpc.js` updated
-15. `bin/start-indexer.js` updated
-16. `package.json` updated
+3. `data/registry/known-erc20.json`
+4. `core/normalize.js`
+5. `core/known-erc20-cache.js`
+6. `core/abi-registry.js`
+7. `core/event-sequencer.js`
+8. `core/event-router.js`
+9. `core/bridge.js`
+10. `core/protocols/shared.js`
+11. `core/protocols/erc20.js`
+12. `core/protocols/jediswap.js`
+13. `core/protocols/ekubo.js`
+14. `core/block-processor.js`
 
-Phase 2 also still depends on Phase 1 foundation files:
-
-1. `lib/cairo/bigint.js`
-2. `lib/db.js`
-3. `core/finality.js`
-
-## 6. File-by-File Explanation
+## 6. File-By-File Explanation
 
 ### 6.1 `sql/002_registry_and_raw.sql`
 
-Purpose:
+This file creates the Phase 2 database tables.
 
-This file creates the Phase 2 schema.
+It gives us places to store:
 
-It adds:
+- contract registry data
+- raw transactions
+- raw events
+- raw L2 to L1 messages
+- unknown audits
+- normalized actions
+- canonical transfers
+- bridge activities
 
-1. contract registry storage
-2. raw transaction storage
-3. raw event storage
-4. raw L2 to L1 messaging storage
-5. unknown decode audit storage
-6. normalized action storage
-7. normalized transfer storage
-8. bridge activity storage
-
-Why it exists:
-
-1. Phase 1 had only block-level truth
-2. Phase 2 needs transaction-level and event-level truth
-3. decoders need both raw and normalized layers
-
-If this schema did not exist:
-
-1. we could not replay decoders safely
-2. we would have nowhere to store unknown decode evidence
-3. holder balances and trades would later have no reliable source layer
+Without this file, Phase 2 would have no storage model.
 
 ### 6.2 `data/registry/contracts.json`
 
-Purpose:
+This file stores known protocol contract metadata.
 
-This is the on-disk seed registry for known contracts and class hashes.
+Right now it is especially important for Ekubo.
 
-In Phase 2 it contains the Ekubo core registry seed.
+The router uses it to understand:
+
+- which protocol a contract belongs to
+- which decoder should handle it
+- which class hash / ABI version is expected
+
+Why this matters:
+
+On Starknet, address alone is not always enough because contracts can be upgradeable.
+
+### 6.3 `data/registry/known-erc20.json`
+
+This file is the verified token list.
+
+It is used for two things:
+
+1. ERC-20 verification before promoting transfers
+2. StarkGate token resolution for bridge-ins
+
+It contains:
+
+- verified L2 token addresses
+- token metadata like symbol and decimals
+- official StarkGate bridge mappings
+
+Without this file, the ERC-20 decoder would be too permissive.
+
+### 6.4 `core/normalize.js`
+
+This file is the low-level Starknet data parser.
+
+It handles things like:
+
+- address normalization
+- felt normalization
+- `u128`
+- `u256`
+- signed `i129`
+- Ekubo pool key building
+- price ratio derivation from `sqrt_ratio`
+
+Every decoder depends on this file.
 
 Why it exists:
 
-1. decoder routing should not depend only on hardcoded addresses in JS files
-2. ABI/class metadata should be data-driven where possible
-3. this file can grow as StarknetDeg supports more protocols
+We do not want each decoder to invent its own way of parsing Starknet values.
 
-Why it matters:
+If every decoder parsed values differently:
 
-1. Ekubo is a singleton model, so its address/class metadata is strategic
-2. registry-driven routing is much safer than scattering protocol ids across the codebase
+- addresses could have inconsistent formats
+- large numbers could be handled incorrectly
+- later joins and analytics would break
 
-If we skipped this:
+### 6.5 `core/known-erc20-cache.js`
 
-1. every new protocol would require code edits only
-2. class-hash versioning would be harder to manage
-3. ABI evolution would be less visible
+This file loads `known-erc20.json` into memory and gives the rest of the system a clean lookup API.
 
-### 6.3 `core/normalize.js`
+It answers questions like:
 
-Purpose:
+- is this token verified?
+- what metadata belongs to this token?
+- is this bridge pair an official StarkGate pair?
+- if this is a StarkGate deposit, which L2 token does it map to?
 
-This file centralizes Starknet normalization and low-level numeric decoding.
+This keeps ERC-20 logic and bridge logic clean.
 
-Main responsibilities:
-
-1. normalize addresses
-2. normalize selectors
-3. normalize felt arrays
-4. parse `u128`
-5. parse `u256`
-6. parse signed `i129`
-7. build Ekubo pool-key ids
-8. derive price-ratio metadata from `sqrt_ratio`
-
-Why it exists:
-
-Every Starknet protocol decoder depends on the same rules for:
-
-1. lowercase formatting
-2. `0x` prefixes
-3. 32-byte padding
-4. BigInt-safe numeric parsing
-
-If every decoder did its own formatting:
-
-1. one decoder might store short addresses
-2. another might store padded ones
-3. joins and analytics would break later
-
-Why `parseI129` matters:
-
-Ekubo uses signed deltas.
-
-If signed decoding is wrong:
-
-1. input and output token direction becomes wrong
-2. liquidity deltas become wrong
-3. wallet analytics become misleading
-
-Why `sqrtRatioToPriceRatio` exists:
-
-Ekubo price is tied to `sqrt_ratio`.
-
-Phase 2 does not fully finalize price analytics yet, but it preserves exact ratio metadata now so later phases do not need to reverse-engineer it from lossy values.
-
-### 6.4 `core/abi-registry.js`
-
-Purpose:
+### 6.6 `core/abi-registry.js`
 
 This file is the routing brain.
 
-Main responsibilities:
+Its job is to decide which decoder should handle an event.
 
-1. load the contract registry JSON
-2. define known event selectors
-3. map selector value to selector name
-4. resolve contract metadata by:
-   - address
-   - class hash
-   - block validity window
-5. choose which decoder should handle an event
-6. sync registry rows into `stark_contract_registry`
+It looks at:
 
-Why it exists:
-
-Decoding should not begin inside protocol files.
-First we need a safe answer to:
-
-1. what protocol is this event from
-2. which ABI/class version was live at that block
-3. is this event shape even plausible for that protocol
-
-Why selector-only routing is dangerous:
-
-1. `Transfer` is common across many contracts
-2. `Swap` is not unique to JediSwap
-3. event names can collide across protocols
-
-That is why Phase 2 tightened routing rules:
-
-1. ERC-20 transfer is decoded only when shape is standard or metadata justifies it
-2. JediSwap is decoded only when event shape exactly matches expected Cairo 0 layout or registry metadata justifies it
-3. Ekubo uses registry/class-hash based routing
-
-If we routed too loosely:
-
-1. false transfers would be created
-2. false swaps would be created
-3. unknown contracts would impersonate supported protocols accidentally
-
-### 6.5 `core/event-sequencer.js`
-
-Purpose:
-
-This file loads raw transaction, event, and message rows for one block and reassembles them into transaction-local ordered structures.
-
-Main responsibilities:
-
-1. load raw tx rows
-2. load raw event rows
-3. load raw message rows
-4. group by transaction hash
-5. sort events by `receipt_event_index`
-6. sort transactions by `transaction_index`
-
-Why it exists:
-
-Decoders should work on an ordered transaction view, not on unstructured SQL fragments.
-
-This layer gives the router a clean unit:
-
-1. one transaction
-2. its ordered events
-3. its ordered messages
-4. its raw status fields
-
-If this layer did not exist:
-
-1. event order logic would be duplicated inside the router
-2. each protocol decoder would need raw SQL knowledge
-3. code would become harder to maintain
-
-Why sequential query execution was chosen inside this file:
-
-We originally ran parallel queries on one `pg` client, which produced a deprecation warning.
-This was corrected.
-
-Why that correction matters:
-
-1. it removes noisy runtime warnings
-2. it avoids future incompatibility with `pg@9`
-3. it keeps one-client transaction behavior clean
-
-### 6.6 `core/event-router.js`
-
-Purpose:
-
-This file is the normalization orchestrator.
-
-It takes sequenced raw transactions and decides what to do with each event.
-
-Main responsibilities:
-
-1. load one block's sequenced transactions
-2. skip normalized fact generation for reverted transactions
-3. extract bridge activities
-4. route each event to the proper decoder
-5. persist normalized actions, transfers, bridges, and audits
-6. mark raw tx and raw event rows as:
-   - `PROCESSED`
-   - `SKIPPED_REVERTED`
-   - `FAILED`
-   - `UNKNOWN`
-
-Why it exists:
-
-The router is the boundary between raw truth and business truth.
-
-Why the status marking matters:
-
-Raw rows should not remain permanently "unexplained".
-We need to know whether an event was:
-
-1. successfully understood
-2. deliberately skipped because tx reverted
-3. unknown because we do not support it yet
-4. failed because a supported decoder found a real mismatch
-
-This distinction is very valuable operationally.
-
-Why `UNKNOWN` is separate from `FAILED`:
-
-1. `UNKNOWN` means unsupported or intentionally not decoded
-2. `FAILED` means we tried to decode a supposedly supported thing and it did not fit expectations
-
-This difference is important.
-
-If we merged them:
-
-1. ops could not tell coverage gaps from decoder bugs
-2. alerting and triage would be noisy
-
-### 6.7 `core/bridge.js`
-
-Purpose:
-
-This file handles bridge-related extraction from transaction and receipt structure.
-
-Main responsibilities:
-
-1. normalize L2 to L1 messages
-2. identify `L1_HANDLER` transactions
-3. treat L1 handler transactions as `bridge_in`
-4. treat `messages_sent` receipts as `bridge_out`
-
-Why it exists:
-
-Bridge activity is not just another DEX event.
-It is partly transaction-type based and partly receipt-message based.
-
-So it deserves a dedicated module.
-
-Why Phase 2 keeps bridge classification generic:
-
-At this phase, we are not fully solving token-level bridge attribution for every bridge protocol.
-We are first capturing:
-
-1. direction
-2. L1 sender or recipient
-3. L2 contract
-4. message payload
-
-This is the right order.
-
-If we tried to infer all bridge token semantics too early:
-
-1. unsupported bridges would be misclassified
-2. message payload assumptions could be wrong
-3. Phase 2 would become brittle
-
-### 6.8 `core/protocols/shared.js`
-
-Purpose:
-
-This file provides decoder-shared helpers.
-
-Main responsibilities:
-
-1. stringify BigInt values for JSON metadata
-2. build deterministic primary keys for:
-   - actions
-   - transfers
-   - bridges
-3. normalize metadata objects
-
-Why it exists:
-
-Every decoder emits structured results, and those results need:
-
-1. deterministic ids
-2. JSON-safe metadata
-3. consistent conventions
-
-If every decoder invented its own keys:
-
-1. idempotency would break
-2. upserts would be unreliable
-3. replay might create duplicates
-
-### 6.9 `core/protocols/erc20.js`
-
-Purpose:
-
-This is the universal ERC-20 transfer decoder.
-
-Main responsibilities:
-
-1. decode standard Starknet `Transfer` events
-2. read:
-   - `keys[1] = from`
-   - `keys[2] = to`
-   - `data[0..1] = u256 value`
-3. emit one normalized action
-4. emit one normalized transfer row
-
-Why it matters:
-
-ERC-20 transfer events are the main source of truth for holder balance deltas in later phases.
-
-This is a major architectural decision:
-
-1. balances should come from actual token transfer truth
-2. not from inferred DEX side effects only
-
-Why shape validation matters:
-
-Phase 2 only accepts the standard Starknet ERC-20 event shape.
-
-If we decoded any arbitrary `Transfer` selector:
-
-1. non-token contracts could pollute holder logic
-2. balances would become split-brain again
-
-### 6.10 `core/protocols/jediswap.js`
-
-Purpose:
-
-This decoder handles JediSwap pair events.
-
-Supported events:
-
-1. `Swap`
-2. `Mint`
-3. `Burn`
-4. `Sync`
-
-Why JediSwap needs a dedicated module:
-
-1. it is an XYK-style protocol
-2. its event shapes are Cairo 0 style
-3. it does not share Ekubo's singleton design
-
-Why Phase 2 only emits normalized actions here:
-
-At this stage we want robust semantic extraction first.
-Trade tables and pool analytics come later.
-
-This means:
-
-1. swap, mint, burn, sync are captured as normalized actions
-2. deeper pricing and OHLCV logic is deferred to later phases
-
-Why shape checks are strict:
-
-JediSwap routing is based on known selector names plus exact shape.
-
-If we were loose:
-
-1. unrelated contracts using a `Swap` selector could become fake JediSwap actions
-
-### 6.11 `core/protocols/ekubo.js`
-
-Purpose:
-
-This is the most conceptually important Phase 2 decoder.
-
-It handles Ekubo singleton-core receipt semantics.
-
-Supported receipt-context tracking:
-
-1. `Swapped`
-2. `PositionUpdated`
-3. `PoolInitialized`
-4. `FeesAccumulated`
-5. `PositionFeesCollected`
-6. `SavedBalance`
-7. `LoadedBalance`
-
-Why Ekubo needed a special design:
-
-Ekubo is not a simple pair contract model.
-
-Its design introduces:
-
-1. singleton core
-2. signed deltas
-3. lock/callback style flows
-4. receipt-local sequences where multiple events belong to one logical operation
-
-So decoding one event in isolation is often not enough.
-
-That is why Phase 2 introduced a `receiptContext`.
-
-What the receipt context does:
-
-1. buffer Ekubo events in receipt order
-2. preserve the order of swaps and position updates
-3. keep surrounding singleton context such as saved/loaded balances and fee-collection observations
-4. flush the buffered business actions only after the transaction's event stream is complete
+- the event selector
+- the emitting address
+- the resolved class hash
+- registry metadata
 
 Why this matters:
 
-If we emitted an Ekubo business action immediately for every raw event:
+Just because two events share a name does not mean they mean the same thing.
 
-1. multicall intent could be fragmented
-2. related events would lose sequence context
-3. future wallet and LP analytics would be harder to reason about
+For example:
 
-Why signed delta decoding matters:
+- many contracts can emit `Transfer`
+- many contracts can emit `Swap`
 
-Ekubo `Delta` values are from core perspective.
+So this file keeps routing conservative.
 
-If this is misunderstood:
+### 6.7 `core/event-sequencer.js`
 
-1. swap direction flips
-2. liquidity accounting flips
-3. price interpretation becomes misleading
+This file rebuilds a clean per-transaction view from raw SQL rows.
 
-Why `sqrt_ratio_after` is stored as metadata-derived price ratio:
+It:
 
-1. exact ratio preservation is better than approximate decimal conversion
-2. later pricing phases can consume exact values
-3. Phase 2 avoids premature lossy math
+- loads raw tx rows
+- loads raw event rows
+- loads raw message rows
+- groups them by transaction hash
+- sorts events by `receipt_event_index`
 
-### 6.12 `core/block-processor.js` Updated
+The router then works on that clean, ordered structure.
 
-Purpose:
+Why this exists:
 
-Phase 1 used this file only for block journaling and checkpoint advancement.
-Phase 2 upgraded it into a raw-persistence plus decode orchestration layer.
+Decoders should not need to know SQL details.
 
-New responsibilities added:
+### 6.8 `core/event-router.js`
 
-1. resolve event emitter class hashes for the block
-2. clear previously derived rows for that block before replay
-3. write raw tx rows
-4. write raw event rows
-5. write raw message rows
-6. invoke the Phase 2 router
-7. still preserve transactional checkpoint safety
+This file is the Phase 2 controller.
 
-Why replay-safe deletion was added:
+It takes one block of raw rows and runs the decoding pipeline.
 
-If we reprocess a block:
+Its job is to:
 
-1. raw rows may need replacement
-2. normalized rows may need regeneration
+- skip reverted transactions
+- extract bridge facts
+- send each event to the correct decoder
+- persist decoder outputs
+- update raw row statuses
 
-So the processor clears block-derived rows for that block before reinserting them.
+This file does not itself understand every protocol.
 
-Why this is correct:
+Instead, it coordinates the protocol decoders.
 
-1. it keeps replay deterministic
-2. it avoids duplicate normalized facts
-3. it allows decoder improvement without corrupting state
+It also now does two important safety jobs:
 
-Why class hashes are resolved at block processing time:
+1. keeps receipt context isolated per protocol
+2. serializes BigInt safely before JSONB writes
 
-This gives raw event rows protocol-routing context as early as possible.
+Without this router:
 
-If we deferred class hash resolution too late:
+- Phase 2 would have no orchestration layer
+- decoders would be disconnected from storage
 
-1. route decisions would depend more on live lookups
-2. repeated decoding would be slower
-3. historical ABI reasoning would be weaker
+### 6.9 `core/bridge.js`
 
-### 6.13 `core/checkpoint.js` Updated
+This file handles bridge-related activity.
 
-Purpose:
+It looks at:
 
-Phase 2 extended checkpoint support with table assertions for the new schema.
+- `L1_HANDLER` transactions for bridge-ins
+- `messages_sent` for bridge-outs
 
-New responsibilities:
+It can now do deeper parsing for official StarkGate bridge-ins.
 
-1. `assertPhase2Tables`
-2. reusable table existence assertion logic
+For official StarkGate deposits it can extract:
 
-Why this matters:
+- token address
+- amount
+- L2 wallet address
 
-Starting the indexer without Phase 2 tables would lead to:
+If the bridge is not an official supported StarkGate mapping, it falls back to generic bridge classification.
 
-1. successful startup
-2. runtime failure only when the first block is processed
+### 6.10 `core/protocols/shared.js`
 
-That is bad operator UX.
+This file contains shared helper functions used by decoders.
 
-It is better to fail immediately and explicitly.
+It handles:
 
-### 6.14 `lib/starknet-rpc.js` Updated
-
-Purpose:
-
-Phase 2 added `getClassHashAt`.
+- deterministic keys for actions, transfers, and bridges
+- metadata normalization
+- BigInt-safe JSON serialization
 
 Why this matters:
 
-The router needs block-aware class hash resolution.
+All decoders need consistent IDs and consistent metadata handling.
 
-Without this method:
+### 6.11 `core/protocols/erc20.js`
 
-1. upgradeable contract safety would be weaker
-2. protocol routing would depend too much on static address mapping
-3. historical ABI correctness would degrade
+This file decodes standard Starknet ERC-20 `Transfer` events.
 
-### 6.15 `bin/start-indexer.js` Updated
+In simple terms, it does this:
 
-Purpose:
+1. read `from` from `keys[1]`
+2. read `to` from `keys[2]`
+3. read `amount` from `data[0..1]` as `u256`
+4. read `token_address` from `event.fromAddress`
+5. verify that token against the known ERC-20 cache
 
-The executable loop now starts the Phase 2 stack, not just Phase 1.
+If the token is verified:
 
-New responsibilities:
+- it creates one normalized `transfer` action
+- it creates one canonical row in `stark_transfers`
 
-1. verify Phase 2 tables
-2. sync registry seed into DB
-3. log decode summary values in block commit output
+If the token is not verified:
 
-Why the richer logs matter:
+- it creates no transfer row
+- it creates no action row
+- it writes an audit record with reason `TRANSFER_UNVERIFIED`
 
-A block log now tells you not only:
+So this file is the main bridge between raw `Transfer` events and later holder balance logic.
 
-1. tx count
-2. reverted count
-3. L1 handler count
+### 6.12 `core/protocols/jediswap.js`
 
-but also:
+This file handles JediSwap pair events.
 
-1. normalized action count
-2. transfer count
-3. unknown event count
+Right now it decodes:
 
-This is important because decoder coverage is now an operational concern.
+- `Swap`
+- `Mint`
+- `Burn`
+- `Sync`
 
-### 6.16 `package.json` Updated
+It converts those into normalized actions in `stark_action_norm`.
 
-Purpose:
+This file is more direct than Ekubo because JediSwap is an XYK-style pair model.
 
-Phase 2 expanded syntax checks to include all new files.
+### 6.13 `core/protocols/ekubo.js`
 
-Why this matters:
+This file is the most complex decoder in Phase 2.
 
-1. the codebase is growing
-2. routing and decoder logic now spans many files
-3. a quick syntax gate prevents avoidable runtime failures
+Ekubo is not a simple pair-per-pool design.
 
-## 7. Phase 2 Database Tables And Column Explanations
+Because of that, this decoder cannot always turn one event into one final business action immediately.
 
-Phase 2 creates eight new tables.
+So this file does two separate jobs:
 
-## 7.1 `stark_contract_registry`
+1. it parses raw Ekubo events
+2. it stores receipt-local state in a protocol context
 
-Purpose:
+It understands events like:
 
-Stores contract-to-protocol metadata and class-hash versioning information.
+- `Swapped`
+- `PositionUpdated`
+- `PoolInitialized`
+- `FeesAccumulated`
+- `PositionFeesCollected`
+- `SavedBalance`
+- `LoadedBalance`
 
-Columns:
+How it works:
 
-| Column | Type | Meaning | Why It Exists |
-| --- | --- | --- | --- |
-| `contract_address` | `TEXT` | normalized Starknet contract address | primary identity of a routed contract |
-| `class_hash` | `TEXT` | class hash for that contract version | address alone is insufficient for upgradeable contracts |
-| `protocol` | `TEXT` | protocol family such as `ekubo` | high-level routing identity |
-| `role` | `TEXT` | contract role such as `core` | some protocols have multiple contract roles |
-| `decoder` | `TEXT` | decoder module name | tells router which decoder should handle it |
-| `abi_version` | `TEXT` | ABI/version label | supports future ABI evolution |
-| `valid_from_block` | `NUMERIC(78,0)` | block at which this metadata becomes active | historical correctness |
-| `valid_to_block` | `NUMERIC(78,0)` | block at which this metadata stops being active | historical correctness |
-| `metadata` | `JSONB` | extra structured data | future-proof extension field |
-| `is_active` | `BOOLEAN` | whether registry row is active | admin/ops visibility |
-| `created_at` | `TIMESTAMPTZ` | creation timestamp | auditability |
-| `updated_at` | `TIMESTAMPTZ` | update timestamp | auditability |
+- when a `Swapped` event arrives, it parses it and stores it in ordered context
+- when a `PositionUpdated` event arrives, it also stores it in context
+- other Ekubo events add supporting context
+- when the router reaches the end of the Ekubo segment, `flushReceiptContext()` turns that buffered context into final normalized actions
 
-Primary key:
+So this file is not just a parser.
+It is a receipt-aware semantic decoder.
 
-1. `(contract_address, class_hash)`
+Why this design was needed:
 
-Why this key:
+If we emitted Ekubo actions immediately from every single event:
 
-1. one address may map to multiple historical class hashes
-2. class-hash lineage must remain visible
+- lock/callback flows would lose meaning
+- related events would not stay connected
+- later analytics would be weaker
 
-## 7.2 `stark_tx_raw`
+## 7. Tables Created In Phase 2
 
-Purpose:
+Phase 2 creates these tables:
 
-Stores raw transaction and raw receipt truth at transaction granularity.
+1. `stark_contract_registry`
+2. `stark_tx_raw`
+3. `stark_event_raw`
+4. `stark_message_l2_to_l1`
+5. `stark_unknown_event_audit`
+6. `stark_action_norm`
+7. `stark_transfers`
+8. `stark_bridge_activities`
 
-Columns:
+## 8. Table Explanation In Simple English
 
-| Column | Type | Meaning | Why It Exists |
-| --- | --- | --- | --- |
-| `lane` | `TEXT` | finality lane | lane-aware replay and promotion |
-| `block_number` | `NUMERIC(78,0)` | containing block number | transaction ordering lineage |
-| `block_hash` | `TEXT` | containing block hash | exact lineage |
-| `transaction_index` | `NUMERIC(78,0)` | transaction order inside the block | sequencer order |
-| `transaction_hash` | `TEXT` | Starknet transaction hash | transaction identity |
-| `tx_type` | `TEXT` | `INVOKE`, `DECLARE`, `L1_HANDLER`, etc. | protocol semantics differ by type |
-| `finality_status` | `TEXT` | receipt finality status | lane-aware truth |
-| `execution_status` | `TEXT` | `SUCCEEDED` or `REVERTED` | business-safety gate |
-| `sender_address` | `TEXT` | tx sender if present | wallet attribution |
-| `contract_address` | `TEXT` | target contract for tx types that carry it | bridge and protocol context |
-| `l1_sender_address` | `TEXT` | first calldata felt for `L1_HANDLER` | bridge-in attribution |
-| `nonce` | `TEXT` | nonce value | raw tx observability |
-| `actual_fee_amount` | `NUMERIC(78,0)` | exact actual fee amount | fee analytics later |
-| `actual_fee_unit` | `TEXT` | fee unit such as `FRI` | exact fee semantics |
-| `events_count` | `NUMERIC(78,0)` | number of emitted events | ops visibility |
-| `messages_sent_count` | `NUMERIC(78,0)` | count of L2 to L1 messages | bridge visibility |
-| `revert_reason` | `TEXT` | receipt revert reason | auditability |
-| `normalized_status` | `TEXT` | raw tx decode lifecycle | `PENDING`, `PROCESSED`, `SKIPPED_REVERTED`, `FAILED` |
-| `decode_error` | `TEXT` | tx-level decode error summary | operational debugging |
-| `calldata` | `JSONB` | normalized calldata array | raw truth for later analysis |
-| `raw_transaction` | `JSONB` | full raw transaction payload | replay and forensic storage |
-| `raw_receipt` | `JSONB` | full raw receipt payload | replay and forensic storage |
-| `created_at` | `TIMESTAMPTZ` | creation time | auditability |
-| `updated_at` | `TIMESTAMPTZ` | update time | auditability |
-| `processed_at` | `TIMESTAMPTZ` | decode completion time | ops visibility |
-
-Primary key:
-
-1. `(lane, block_number, transaction_hash)`
-
-Why it matters:
-
-1. makes raw tx rows idempotent per lane and block
-2. supports replay without duplicate transaction rows
-
-## 7.3 `stark_event_raw`
-
-Purpose:
-
-Stores raw Starknet event truth with ordering metadata.
-
-Columns:
-
-| Column | Type | Meaning | Why It Exists |
-| --- | --- | --- | --- |
-| `lane` | `TEXT` | finality lane | lane-aware decoding |
-| `block_number` | `NUMERIC(78,0)` | containing block | lineage |
-| `block_hash` | `TEXT` | containing block hash | lineage |
-| `transaction_hash` | `TEXT` | parent transaction | transaction grouping |
-| `transaction_index` | `NUMERIC(78,0)` | transaction order | sequencing |
-| `receipt_event_index` | `NUMERIC(78,0)` | event order inside receipt | critical for Starknet semantics |
-| `finality_status` | `TEXT` | receipt finality | lane-aware truth |
-| `transaction_execution_status` | `TEXT` | execution status of parent tx | revert filtering |
-| `from_address` | `TEXT` | emitting contract | routing input |
-| `selector` | `TEXT` | `keys[0]` selector | routing input |
-| `resolved_class_hash` | `TEXT` | class hash at block time when available | ABI/version safety |
-| `normalized_status` | `TEXT` | decode lifecycle | `PENDING`, `PROCESSED`, `SKIPPED_REVERTED`, `FAILED`, `UNKNOWN` |
-| `decode_error` | `TEXT` | event-level decode issue | auditability |
-| `keys` | `JSONB` | normalized event keys | raw truth |
-| `data` | `JSONB` | normalized event data | raw truth |
-| `raw_event` | `JSONB` | original raw event object | replay and debugging |
-| `created_at` | `TIMESTAMPTZ` | creation time | auditability |
-| `updated_at` | `TIMESTAMPTZ` | update time | auditability |
-| `processed_at` | `TIMESTAMPTZ` | decode completion time | ops visibility |
-
-Primary key:
-
-1. `(lane, block_number, transaction_hash, receipt_event_index)`
-
-Why this key:
-
-1. event order in a Starknet receipt is part of identity
-2. duplicate-safe replay requires this exact grain
-
-## 7.4 `stark_message_l2_to_l1`
-
-Purpose:
-
-Stores raw messages emitted from L2 to L1.
-
-Columns:
-
-| Column | Type | Meaning | Why It Exists |
-| --- | --- | --- | --- |
-| `lane` | `TEXT` | finality lane | lane-aware truth |
-| `block_number` | `NUMERIC(78,0)` | containing block | lineage |
-| `block_hash` | `TEXT` | containing block hash | lineage |
-| `transaction_hash` | `TEXT` | parent transaction | transaction grouping |
-| `transaction_index` | `NUMERIC(78,0)` | transaction order | ordering |
-| `message_index` | `NUMERIC(78,0)` | message order inside receipt | receipt-local identity |
-| `from_address` | `TEXT` | L2 sender address | bridge context |
-| `to_address` | `TEXT` | L1 recipient address | bridge context |
-| `payload` | `JSONB` | normalized message payload | raw message truth |
-| `raw_message` | `JSONB` | original raw message payload | replay/debugging |
-| `created_at` | `TIMESTAMPTZ` | creation time | auditability |
-| `updated_at` | `TIMESTAMPTZ` | update time | auditability |
-
-Primary key:
-
-1. `(lane, block_number, transaction_hash, message_index)`
-
-Why it matters:
-
-1. bridge messages are distinct objects
-2. they need replay-safe identity independent of action tables
-
-## 7.5 `stark_unknown_event_audit`
-
-Purpose:
-
-Stores events or decode situations that were deliberately not promoted into business facts.
-
-Columns:
-
-| Column | Type | Meaning | Why It Exists |
-| --- | --- | --- | --- |
-| `audit_id` | `BIGSERIAL` | unique audit record id | simple incident identity |
-| `lane` | `TEXT` | finality lane | lane-aware audit trail |
-| `block_number` | `NUMERIC(78,0)` | block where event occurred | audit context |
-| `block_hash` | `TEXT` | block hash | audit context |
-| `transaction_hash` | `TEXT` | transaction hash | audit context |
-| `transaction_index` | `NUMERIC(78,0)` | tx order | audit context |
-| `source_event_index` | `NUMERIC(78,0)` | receipt event index if available | exact event reference |
-| `emitter_address` | `TEXT` | event emitter | helps coverage expansion |
-| `selector` | `TEXT` | event selector | helps coverage expansion |
-| `reason` | `TEXT` | why event was not normalized | key operational signal |
-| `metadata` | `JSONB` | structured debug context | decoder triage support |
-| `created_at` | `TIMESTAMPTZ` | insert time | auditability |
-
-Why this table matters:
-
-Without it:
-
-1. unknown coverage would disappear silently
-2. there would be no structured backlog for decoder expansion
-3. ops would not know whether the system is missing real protocol coverage
-
-## 7.6 `stark_action_norm`
-
-Purpose:
-
-This is the general normalized action table.
-
-It stores business facts that are broader than simple transfers.
-
-Examples:
-
-1. Ekubo swaps
-2. Ekubo position updates
-3. JediSwap swap/mint/burn/sync actions
-4. bridge in and bridge out actions
-5. ERC-20 transfer actions
-
-Columns:
-
-| Column | Type | Meaning | Why It Exists |
-| --- | --- | --- | --- |
-| `action_key` | `TEXT` | deterministic action id | idempotent replay |
-| `lane` | `TEXT` | finality lane | lane-aware analytics |
-| `block_number` | `NUMERIC(78,0)` | block number | ordering |
-| `block_hash` | `TEXT` | block hash | lineage |
-| `transaction_hash` | `TEXT` | tx hash | grouping |
-| `transaction_index` | `NUMERIC(78,0)` | tx order | ordering |
-| `source_event_index` | `NUMERIC(78,0)` | event order if tied to a specific event | precise provenance |
-| `protocol` | `TEXT` | protocol family | queryability |
-| `action_type` | `TEXT` | semantic action type | queryability |
-| `emitter_address` | `TEXT` | emitting contract | provenance |
-| `account_address` | `TEXT` | wallet/account involved | wallet analytics later |
-| `pool_id` | `TEXT` | logical pool id if applicable | DEX analytics later |
-| `token0_address` | `TEXT` | first token if applicable | pool context |
-| `token1_address` | `TEXT` | second token if applicable | pool context |
-| `token_address` | `TEXT` | single-token context if applicable | transfer-style actions |
-| `amount0` | `NUMERIC(78,0)` | first amount | exact arithmetic |
-| `amount1` | `NUMERIC(78,0)` | second amount | exact arithmetic |
-| `amount` | `NUMERIC(78,0)` | single amount field | exact arithmetic |
-| `router_protocol` | `TEXT` | router/aggregator if applicable | future aggregation analytics |
-| `execution_protocol` | `TEXT` | execution venue/protocol | future venue analytics |
-| `metadata` | `JSONB` | detailed structured context | future-proof semantic detail |
-| `created_at` | `TIMESTAMPTZ` | creation time | auditability |
-| `updated_at` | `TIMESTAMPTZ` | update time | auditability |
-
-Why this table is generic:
-
-1. Phase 2 is about semantic normalization, not yet protocol-specific analytics tables
-2. a wide generic action table is a good intermediate layer
-
-## 7.7 `stark_transfers`
-
-Purpose:
-
-Stores canonical token transfers.
-
-This table is the main Phase 2 source for later holder balance logic.
-
-Columns:
-
-| Column | Type | Meaning | Why It Exists |
-| --- | --- | --- | --- |
-| `transfer_key` | `TEXT` | deterministic transfer id | idempotent replay |
-| `lane` | `TEXT` | finality lane | lane-aware truth |
-| `block_number` | `NUMERIC(78,0)` | block number | ordering |
-| `block_hash` | `TEXT` | block hash | lineage |
-| `transaction_hash` | `TEXT` | transaction hash | grouping |
-| `transaction_index` | `NUMERIC(78,0)` | tx order | ordering |
-| `source_event_index` | `NUMERIC(78,0)` | exact event index | provenance |
-| `token_address` | `TEXT` | token contract | holder accounting |
-| `from_address` | `TEXT` | sender | holder accounting |
-| `to_address` | `TEXT` | recipient | holder accounting |
-| `amount` | `NUMERIC(78,0)` | exact transfer amount | exact arithmetic |
-| `protocol` | `TEXT` | source decoder family | provenance |
-| `metadata` | `JSONB` | structured context | future-proofing |
-| `created_at` | `TIMESTAMPTZ` | creation time | auditability |
-| `updated_at` | `TIMESTAMPTZ` | update time | auditability |
-
-Why this table is important:
-
-If later holder logic were computed only from DEX actions:
+### 8.1 `stark_contract_registry`
 
-1. balances would miss non-DEX transfers
-2. bridge flows would be incomplete
-3. wallet truth would become fragmented
+This table stores known contract metadata.
 
-So Phase 2 establishes transfer truth explicitly.
+It tells the router:
 
-## 7.8 `stark_bridge_activities`
+- which contract belongs to which protocol
+- which decoder should be used
+- which class hash / ABI version is expected
 
-Purpose:
+Important columns:
 
-Stores normalized bridge-related activity facts.
+- `contract_address`
+- `class_hash`
+- `protocol`
+- `role`
+- `decoder`
+- `abi_version`
+- `valid_from_block`
+- `valid_to_block`
+- `metadata`
 
-Columns:
+### 8.2 `stark_tx_raw`
 
-| Column | Type | Meaning | Why It Exists |
-| --- | --- | --- | --- |
-| `bridge_key` | `TEXT` | deterministic bridge activity id | idempotent replay |
-| `lane` | `TEXT` | finality lane | lane-aware truth |
-| `block_number` | `NUMERIC(78,0)` | block number | ordering |
-| `block_hash` | `TEXT` | block hash | lineage |
-| `transaction_hash` | `TEXT` | tx hash | grouping |
-| `transaction_index` | `NUMERIC(78,0)` | tx order | ordering |
-| `source_event_index` | `NUMERIC(78,0)` | event index if one exists | provenance |
-| `direction` | `TEXT` | `bridge_in` or `bridge_out` | semantic classification |
-| `l1_sender` | `TEXT` | L1 sender address | bridge-in attribution |
-| `l1_recipient` | `TEXT` | L1 recipient address | bridge-out attribution |
-| `l2_contract_address` | `TEXT` | relevant L2 contract | bridge attribution |
-| `l2_wallet_address` | `TEXT` | wallet-level attribution when available | later wallet analytics |
-| `token_address` | `TEXT` | token if known | later enrichment |
-| `amount` | `NUMERIC(78,0)` | amount if known | later enrichment |
-| `message_to_address` | `TEXT` | target address of message | message tracking |
-| `payload` | `JSONB` | message payload | exact raw context |
-| `classification` | `TEXT` | bridge classification label | e.g. `l1_handler`, `message_to_l1` |
-| `metadata` | `JSONB` | structured extra context | future-proofing |
-| `created_at` | `TIMESTAMPTZ` | creation time | auditability |
-| `updated_at` | `TIMESTAMPTZ` | update time | auditability |
-
-Why this table is useful even before full bridge enrichment:
-
-1. message movement itself is important
-2. wallet tracking benefits from bridge direction detection
-3. later phases can enrich token and amount attribution on top
-
-## 8. Why Phase 2 Still Uses `NUMERIC` Everywhere
-
-Phase 2 continues the Phase 1 rule:
-
-All chain-derived quantities use `NUMERIC`.
-
-That includes:
-
-1. block numbers
-2. transaction indexes
-3. event indexes
-4. transfer amounts
-5. fee amounts
-6. protocol delta fields
-
-Why:
+This is the raw transaction table.
 
-1. Starknet values are not safely representable as JS `Number`
-2. `BigInt` is correct in memory
-3. `NUMERIC` is correct in Postgres
+It stores:
 
-If we relaxed this rule during decoding:
+- transaction hash
+- tx type
+- execution status
+- finality status
+- sender / contract / L1 sender info
+- calldata
+- full raw transaction JSON
+- full raw receipt JSON
 
-1. raw truth might remain exact
-2. but normalized facts would become lossy
-3. downstream analytics would be wrong even though raw storage was correct
+Important columns:
 
-## 9. Why Unknown Audit Was Added Instead Of Silent Ignore
+- `lane`
+- `block_number`
+- `block_hash`
+- `transaction_index`
+- `transaction_hash`
+- `tx_type`
+- `execution_status`
+- `finality_status`
+- `sender_address`
+- `contract_address`
+- `l1_sender_address`
+- `actual_fee_amount`
+- `calldata`
+- `raw_transaction`
+- `raw_receipt`
+- `normalized_status`
 
-Silent ignore is bad engineering for an indexer.
+### 8.3 `stark_event_raw`
 
-If an event is unsupported, operators and developers should know:
+This is the raw event table.
 
-1. what selector was seen
-2. which contract emitted it
-3. in which block and transaction it happened
-4. why it was not normalized
+It stores every receipt event exactly as seen, plus event order.
 
-That is why Phase 2 writes unknowns into `stark_unknown_event_audit`.
+Important columns:
 
-This gives three benefits:
+- `transaction_hash`
+- `receipt_event_index`
+- `from_address`
+- `selector`
+- `resolved_class_hash`
+- `keys`
+- `data`
+- `raw_event`
+- `normalized_status`
 
-1. coverage backlog becomes measurable
-2. false route attempts become visible
-3. protocol expansion can be prioritized by observed real activity
+This table is very important because Phase 2 decoding is built on it.
 
-## 10. Why Routing Was Tightened After Smoke Testing
+### 8.4 `stark_message_l2_to_l1`
 
-During live smoke testing we found a real issue:
+This stores raw L2 to L1 messages.
 
-1. generic `Transfer` selectors were too common
-2. generic `Swap` selectors were too common
-3. loose routing produced false decoder attempts
+It is mainly used for bridge-out tracking.
 
-That was corrected.
+Important columns:
 
-The new rule is:
+- `transaction_hash`
+- `message_index`
+- `from_address`
+- `to_address`
+- `payload`
+- `raw_message`
 
-1. standard ERC-20 transfer must match standard Starknet shape or registry metadata
-2. JediSwap events must match expected exact shape or registry metadata
-3. otherwise they stay `UNKNOWN`
+### 8.5 `stark_unknown_event_audit`
 
-This is a good example of why Phase 2 was built conservatively.
+This table stores events we did not promote into business truth.
 
-If we had kept the loose route logic:
+This includes cases like:
 
-1. fake action rows would have been created
-2. txs would show `FAILED` for unsupported third-party contracts
-3. protocol coverage metrics would be misleading
+- `NO_DECODER_ROUTE`
+- `TRANSFER_UNVERIFIED`
+- shape mismatch audits
 
-## 11. End-to-End Lifecycle Of One Block In Phase 2
+Important columns:
 
-When one block is processed now, the logical sequence is:
+- `transaction_hash`
+- `source_event_index`
+- `emitter_address`
+- `selector`
+- `reason`
+- `metadata`
 
-1. fetch block and state update
-2. validate block/state consistency
-3. lock checkpoint row
-4. verify parent continuity
-5. mark conflicting old same-height rows orphaned
-6. delete prior derived rows for this block to ensure replay safety
-7. upsert block journal
-8. resolve class hashes for unique emitters in the block
-9. insert raw tx rows
-10. insert raw event rows
-11. insert raw message rows
-12. load the block back through the sequencer
-13. for each tx:
-   - skip normalized outputs if reverted
-   - extract bridge facts
-   - route events
-   - decode supported protocol events
-   - store unknowns in audit
-   - flush Ekubo receipt context
-   - mark raw rows with final processing status
-14. advance checkpoint
-15. commit transaction
+This table is the backlog for future decoder expansion.
 
-This preserves idempotency and replayability.
+### 8.6 `stark_action_norm`
 
-If any step fails before commit:
+This is the general normalized business-action table.
 
-1. raw writes roll back
-2. normalized writes roll back
-3. checkpoint does not move
-4. the block can be retried safely
+It stores actions like:
 
-## 12. What Would Go Wrong If These Choices Were Not Made
+- transfers
+- swaps
+- mints
+- burns
+- bridge_in
+- bridge_out
+- position updates
 
-### Without raw tx/event/message tables
+Important columns:
 
-1. decoder replay would be weak
-2. auditability would be poor
-3. debugging would depend on live RPC refetch
+- `action_key`
+- `protocol`
+- `action_type`
+- `account_address`
+- `pool_id`
+- `token0_address`
+- `token1_address`
+- `token_address`
+- `amount0`
+- `amount1`
+- `amount`
+- `router_protocol`
+- `execution_protocol`
+- `metadata`
 
-### Without `receipt_event_index`
+This is a generic action layer.
+It is not yet the final trade table.
 
-1. event order would be lost
-2. Ekubo multicall interpretation would degrade
-3. some later analytics would be ambiguous
+### 8.7 `stark_transfers`
 
-### Without reverted filtering
+This is the canonical token transfer table.
 
-1. false transfers would enter holder state
-2. false swaps would enter trade analytics
-3. wallet PnL would become unreliable
+It stores only verified token transfers.
 
-### Without unknown audit
+Important columns:
 
-1. unsupported coverage would disappear silently
-2. there would be no clean decoder expansion backlog
-3. bugs and gaps would blend together
+- `transfer_key`
+- `token_address`
+- `from_address`
+- `to_address`
+- `amount`
+- `protocol`
+- `metadata`
 
-### Without class-hash-aware routing
+Later holder balance logic will be built from this table.
 
-1. historical ABI mismatches would occur
-2. upgradeable contract decoding would be unsafe
-3. protocol upgrades could silently rewrite history
+### 8.8 `stark_bridge_activities`
 
-### Without strict route heuristics
+This stores bridge-related actions.
 
-1. `Transfer` collisions would create fake token transfers
-2. `Swap` collisions would create fake DEX actions
-3. action tables would look fuller but be less trustworthy
+Important columns:
 
-## 13. What Phase 2 Does Not Fully Solve Yet
+- `bridge_key`
+- `direction`
+- `l1_sender`
+- `l1_recipient`
+- `l2_contract_address`
+- `l2_wallet_address`
+- `token_address`
+- `amount`
+- `message_to_address`
+- `payload`
+- `classification`
+- `metadata`
 
-Phase 2 intentionally does not finalize:
+This is where official StarkGate bridge-in enrichment now lands.
 
-1. canonical trade table design
-2. OHLCV generation
-3. price-tick generation
-4. holder balance materialization
-5. token metadata enrichment
-6. full StarkGate-specific token/amount bridge parsing
-7. AVNU routing attribution
-8. wallet PnL
-9. whale alerts
-10. websocket fanout
+## 9. What Phase 2 Does Not Create Yet
 
-What it does do is create the semantic foundation those phases will rely on.
+This is the important answer to your question:
 
-## 14. Final Summary
+Phase 2 does **not** create a trades table yet.
 
-Phase 2 transformed StarknetDeg from a safe block ingestor into a real Starknet decoder engine.
+There is currently:
 
-What was achieved:
+- `stark_action_norm`
+- `stark_transfers`
+- `stark_bridge_activities`
 
-1. raw transaction persistence
-2. raw event persistence
-3. raw L2 to L1 message persistence
-4. receipt-aware ordered sequencing
-5. conservative ABI/class-hash-aware routing
-6. ERC-20 transfer normalization
-7. JediSwap action normalization
-8. Ekubo receipt-context decoding
-9. bridge-in and bridge-out activity extraction
-10. unknown-event audit trail
-11. replay-safe block reprocessing
-12. checkpoint safety preserved end to end
+There is **no** `stark_trades` table in `sql/002_registry_and_raw.sql`.
 
-The main design principle of Phase 2 was:
+That means:
 
-Do not confuse unsupported activity with decoded activity, and do not confuse raw truth with business truth.
+- swaps are currently stored as normalized actions
+- trades are not yet materialized into a dedicated trade table
+- OHLCV is also not built yet
 
-That is why the phase stores more than it normalizes, routes cautiously, and treats `UNKNOWN` as a first-class operational outcome instead of a failure.
+That work belongs to the next phase.
+
+## 10. What Phase 2 Gives Us Before Phase 3
+
+Before Phase 3 starts, Phase 2 already gives us:
+
+1. a safe raw data layer
+2. event order preservation
+3. conservative routing
+4. ERC-20 verification gating
+5. Ekubo receipt-aware decoding
+6. JediSwap action decoding
+7. bridge activity extraction
+8. unknown-event auditing
+
+So Phase 3 does not need to fight raw RPC complexity.
+
+It can build on clean normalized inputs.
+
+## 11. Final Summary
+
+Phase 2 turns StarknetDeg from a raw block ingester into a real decoder engine.
+
+The most important idea is this:
+
+Do not guess business truth from raw chain data too early.
+
+That is why Phase 2:
+
+- stores raw truth first
+- routes carefully
+- decodes only what it can justify
+- audits what it does not understand
+
+And yes, at this stage there is still no dedicated trades table yet.

@@ -22,6 +22,10 @@ function normalizeActionMetadata(value) {
   return stringifyBigInts(value ?? {});
 }
 
+function toJsonbString(value) {
+  return JSON.stringify(stringifyBigInts(value));
+}
+
 function buildActionKey({ lane, transactionHash, sourceEventIndex, actionType, sequence = 0 }) {
   return [
     lane,
@@ -57,4 +61,5 @@ module.exports = {
   buildTransferKey,
   normalizeActionMetadata,
   stringifyBigInts,
+  toJsonbString,
 };

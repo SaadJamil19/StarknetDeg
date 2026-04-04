@@ -1,5 +1,6 @@
 'use strict';
 
+const { knownErc20Cache } = require('../known-erc20-cache');
 const { normalizeAddress, parseU256FromArray } = require('../normalize');
 const { buildActionKey, buildTransferKey, normalizeActionMetadata } = require('./shared');
 
@@ -19,12 +20,34 @@ function decodeEvent({ tx, event }) {
   const toAddress = normalizeAddress(event.keys[2], 'erc20.to');
   const amount = parseU256FromArray(event.data, 0, 'erc20.value');
   const tokenAddress = normalizeAddress(event.fromAddress, 'erc20.token');
+  const verifiedToken = knownErc20Cache.getToken(tokenAddress);
+
+  if (!verifiedToken) {
+    return {
+      actions: [],
+      audits: [buildAuditEntry(tx, event, 'TRANSFER_UNVERIFIED', {
+        amount_encoding: 'u256',
+        from_key_index: 1,
+        to_key_index: 2,
+        token_address: tokenAddress,
+        verification_gate: 'known_erc20_cache',
+        verification_source: 'known_erc20_cache_miss',
+      }, 'UNKNOWN')],
+      transfers: [],
+    };
+  }
+
   const actionMetadata = normalizeActionMetadata({
     standard: 'erc20',
     selector: event.selector,
     from_key_index: 1,
     to_key_index: 2,
     amount_encoding: 'u256',
+    token_decimals: verifiedToken.decimals,
+    token_name: verifiedToken.name,
+    token_symbol: verifiedToken.symbol,
+    verification_gate: 'known_erc20_cache',
+    verification_source: verifiedToken.verificationSource,
   });
 
   return {
@@ -67,13 +90,14 @@ function decodeEvent({ tx, event }) {
   };
 }
 
-function buildAuditEntry(tx, event, reason, metadata) {
+function buildAuditEntry(tx, event, reason, metadata, normalizedStatus = null) {
   return {
     blockHash: tx.blockHash,
     blockNumber: tx.blockNumber,
     emitterAddress: event.fromAddress,
     lane: tx.lane,
     metadata: normalizeActionMetadata(metadata),
+    normalizedStatus,
     reason,
     selector: event.selector,
     sourceEventIndex: event.receiptEventIndex,

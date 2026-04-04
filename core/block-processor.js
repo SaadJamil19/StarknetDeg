@@ -7,6 +7,11 @@ const { advanceCheckpoint, ensureIndexStateRows, getCheckpoint } = require('./ch
 const { decodeBlockFromRaw } = require('./event-router');
 const { FINALITY_LANES, assertValidFinalityLane, normalizeFinalityStatus, summarizeBlockReceipts } = require('./finality');
 const { normalizeAddress, normalizeHexArray, normalizeOptionalAddress, normalizeSelector } = require('./normalize');
+const { persistTradesForBlock } = require('./trades');
+const { persistPoolStateForBlock, resetPoolStateForBlock } = require('./pool-state');
+const { persistPriceDataForBlock, resetLatestPricesForBlock } = require('./prices');
+const { persistOhlcvForBlock } = require('./ohlcv');
+const { publishBlockRealtimeUpdates } = require('./realtime');
 
 async function processAcceptedBlock({ rpcClient, indexerKey, lane = FINALITY_LANES.ACCEPTED_ON_L2, blockNumber }) {
   if (!rpcClient) {
@@ -17,7 +22,7 @@ async function processAcceptedBlock({ rpcClient, indexerKey, lane = FINALITY_LAN
   const requestedBlockNumber = toBigIntStrict(blockNumber, 'block number');
 
   if (canonicalLane !== FINALITY_LANES.ACCEPTED_ON_L2) {
-    throw new Error(`Phase 2 canonical processor only supports ${FINALITY_LANES.ACCEPTED_ON_L2}. Received ${canonicalLane}.`);
+    throw new Error(`Phase 3 canonical processor only supports ${FINALITY_LANES.ACCEPTED_ON_L2}. Received ${canonicalLane}.`);
   }
 
   const [block, stateUpdate] = await Promise.all([
@@ -32,7 +37,7 @@ async function processAcceptedBlock({ rpcClient, indexerKey, lane = FINALITY_LAN
     rpcClient,
   });
 
-  return withTransaction(async (client) => {
+  const committed = await withTransaction(async (client) => {
     await ensureIndexStateRows(client, indexerKey);
 
     const checkpoint = await getCheckpoint(client, {
@@ -72,6 +77,31 @@ async function processAcceptedBlock({ rpcClient, indexerKey, lane = FINALITY_LAN
       rpcClient,
     });
 
+    const blockTimestampDate = normalized.block.timestamp === undefined || normalized.block.timestamp === null
+      ? new Date(0)
+      : new Date(Number(toBigIntStrict(normalized.block.timestamp, 'block timestamp')) * 1000);
+    const tradesResult = await persistTradesForBlock(client, {
+      blockHash: normalized.block.block_hash,
+      blockNumber: normalized.blockNumber,
+      blockTimestamp: normalized.block.timestamp,
+      lane: canonicalLane,
+    });
+    const poolStateResult = await persistPoolStateForBlock(client, {
+      blockNumber: normalized.blockNumber,
+      blockTimestampDate,
+      lane: canonicalLane,
+      latestUsdByToken: tradesResult.latestUsdByToken,
+    });
+    const pricesResult = await persistPriceDataForBlock(client, {
+      priceCandidates: tradesResult.priceCandidates,
+    });
+    const ohlcvResult = await persistOhlcvForBlock(client, {
+      blockHash: normalized.block.block_hash,
+      blockNumber: normalized.blockNumber,
+      lane: canonicalLane,
+      trades: tradesResult.trades,
+    });
+
     await advanceCheckpoint(client, {
       blockHash: normalized.block.block_hash,
       blockNumber: normalized.blockNumber,
@@ -101,9 +131,39 @@ async function processAcceptedBlock({ rpcClient, indexerKey, lane = FINALITY_LAN
       blockNumber: normalized.blockNumber,
       decodeSummary,
       finalityStatus: normalized.finalityStatus,
+      phase3Summary: {
+        candles: ohlcvResult.summary.touchedCandles,
+        fullRebuildCandles: ohlcvResult.summary.fullRebuildCandles,
+        latestPrices: pricesResult.summary.latestPrices,
+        poolHistoryRows: poolStateResult.summary.poolHistoryRows,
+        poolLatestRows: poolStateResult.summary.poolLatestRows,
+        priceTicks: pricesResult.summary.priceTicks,
+        seededCandles: ohlcvResult.summary.seededCandles,
+        stalePrices: pricesResult.summary.stalePrices,
+        trades: tradesResult.summary.trades,
+      },
+      realtimePayload: {
+        candles: ohlcvResult.realtimeCandles,
+        trades: tradesResult.realtimeTrades,
+      },
       summary: normalized.summary,
     };
   });
+
+  let realtimeSummary = null;
+  let realtimeError = null;
+
+  try {
+    realtimeSummary = await publishBlockRealtimeUpdates(committed.realtimePayload);
+  } catch (error) {
+    realtimeError = error.stack || error.message || String(error);
+  }
+
+  return {
+    ...committed,
+    realtimeError,
+    realtimeSummary,
+  };
 }
 
 function normalizeFetchedBlock({ block, stateUpdate, requestedBlockNumber }) {
@@ -181,6 +241,8 @@ async function markConflictingBlockRows(client, { lane, blockNumber, blockHash }
 async function clearBlockDerivedRows(client, { lane, blockNumber }) {
   const params = [lane, toNumericString(blockNumber, 'block number')];
   const statements = [
+    'DELETE FROM stark_ohlcv_1m WHERE lane = $1 AND block_number = $2',
+    'DELETE FROM stark_trades WHERE lane = $1 AND block_number = $2',
     'DELETE FROM stark_action_norm WHERE lane = $1 AND block_number = $2',
     'DELETE FROM stark_transfers WHERE lane = $1 AND block_number = $2',
     'DELETE FROM stark_bridge_activities WHERE lane = $1 AND block_number = $2',
@@ -189,6 +251,9 @@ async function clearBlockDerivedRows(client, { lane, blockNumber }) {
     'DELETE FROM stark_message_l2_to_l1 WHERE lane = $1 AND block_number = $2',
     'DELETE FROM stark_tx_raw WHERE lane = $1 AND block_number = $2',
   ];
+
+  await resetLatestPricesForBlock(client, { blockNumber, lane });
+  await resetPoolStateForBlock(client, { blockNumber, lane });
 
   for (const statement of statements) {
     await client.query(statement, params);

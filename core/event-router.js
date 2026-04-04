@@ -6,7 +6,7 @@ const { resolveRoute } = require('./abi-registry');
 const erc20 = require('./protocols/erc20');
 const jediswap = require('./protocols/jediswap');
 const ekubo = require('./protocols/ekubo');
-const { normalizeActionMetadata } = require('./protocols/shared');
+const { normalizeActionMetadata, toJsonbString } = require('./protocols/shared');
 const { toNumericString } = require('../lib/cairo/bigint');
 
 const DECODERS = Object.freeze({
@@ -28,7 +28,7 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
   };
 
   for (const tx of transactions) {
-    const receiptContext = { protocols: {} };
+    const receiptContexts = createReceiptContextController();
 
     if (tx.executionStatus !== 'SUCCEEDED') {
       await markTransactionStatus(client, tx, 'SKIPPED_REVERTED', tx.revertReason ?? 'Transaction execution_status != SUCCEEDED');
@@ -46,6 +46,11 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
 
     for (const event of tx.events) {
       const route = await resolveRoute({ event, rpcClient, tx });
+      const protocolTransitionResult = receiptContexts.transitionTo(route?.decoder ?? null, tx);
+      await persistResultBundle(client, tx, protocolTransitionResult);
+      summary.actions += protocolTransitionResult.actions.length;
+      summary.bridgeActivities += protocolTransitionResult.bridges.length;
+      summary.transfers += protocolTransitionResult.transfers.length;
 
       if (!route) {
         await insertAudit(client, {
@@ -76,7 +81,7 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
       const result = decoder.decodeEvent({
         contractMetadata: route.contractMetadata,
         event,
-        receiptContext,
+        receiptContext: receiptContexts.get(route.decoder),
         route,
         tx,
       });
@@ -85,7 +90,8 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
 
       if (result.audits.length > 0) {
         const decodeError = result.audits.map((item) => item.reason).join('; ');
-        if (isFatalDecodeAudit(route)) {
+        const auditStatus = resolveAuditStatus(route, result.audits);
+        if (auditStatus === 'FAILED') {
           await markEventStatus(client, tx, event, 'FAILED', decodeError);
           failedEventCount += 1;
         } else {
@@ -100,9 +106,11 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
       summary.transfers += result.transfers.length;
     }
 
-    const ekuboFlush = ekubo.flushReceiptContext({ receiptContext, tx });
-    await persistResultBundle(client, tx, ekuboFlush);
-    summary.actions += ekuboFlush.actions.length;
+    const finalFlush = receiptContexts.flushAll(tx);
+    await persistResultBundle(client, tx, finalFlush);
+    summary.actions += finalFlush.actions.length;
+    summary.bridgeActivities += finalFlush.bridges.length;
+    summary.transfers += finalFlush.transfers.length;
 
     if (failedEventCount > 0) {
       await markTransactionStatus(client, tx, 'FAILED', `${failedEventCount} event(s) failed decoding.`);
@@ -199,7 +207,7 @@ async function upsertAction(client, tx, action) {
       toNullableNumeric(action.amount),
       action.routerProtocol ?? null,
       action.executionProtocol ?? null,
-      JSON.stringify(action.metadata ?? {}),
+      toJsonbString(action.metadata ?? {}),
     ],
   );
 }
@@ -243,7 +251,7 @@ async function upsertTransfer(client, tx, transfer) {
       transfer.toAddress,
       toNumericString(transfer.amount, 'transfer amount'),
       transfer.protocol,
-      JSON.stringify(transfer.metadata ?? {}),
+      toJsonbString(transfer.metadata ?? {}),
     ],
   );
 }
@@ -297,9 +305,9 @@ async function upsertBridge(client, tx, bridge) {
       bridge.tokenAddress ?? null,
       toNullableNumeric(bridge.amount),
       bridge.messageToAddress ?? null,
-      JSON.stringify(bridge.payload ?? []),
+      toJsonbString(bridge.payload ?? []),
       bridge.classification,
-      JSON.stringify(bridge.metadata ?? {}),
+      toJsonbString(bridge.metadata ?? {}),
     ],
   );
 }
@@ -329,7 +337,7 @@ async function insertAudit(client, audit) {
       audit.emitterAddress ?? null,
       audit.selector ?? null,
       audit.reason,
-      JSON.stringify(audit.metadata ?? {}),
+      toJsonbString(audit.metadata ?? {}),
     ],
   );
 }
@@ -406,6 +414,142 @@ function toNullableNumeric(value) {
 
 function isFatalDecodeAudit(route) {
   return Boolean(route?.contractMetadata?.decoder || route?.contractMetadata?.protocol);
+}
+
+function createReceiptContextController() {
+  const contexts = new Map();
+  let activeProtocol = null;
+
+  return {
+    flushAll(tx) {
+      const bundles = [];
+
+      if (activeProtocol) {
+        bundles.push(flushProtocol(activeProtocol, tx));
+      }
+
+      for (const protocol of Array.from(contexts.keys())) {
+        if (protocol === activeProtocol) {
+          continue;
+        }
+
+        bundles.push(flushProtocol(protocol, tx));
+      }
+
+      activeProtocol = null;
+      return mergeResultBundles(bundles);
+    },
+    get(protocol) {
+      if (!protocol) {
+        return null;
+      }
+
+      if (!contexts.has(protocol)) {
+        contexts.set(protocol, {});
+      }
+
+      return contexts.get(protocol);
+    },
+    transitionTo(protocol, tx) {
+      if (activeProtocol && activeProtocol !== protocol) {
+        const flushed = flushProtocol(activeProtocol, tx);
+        activeProtocol = protocol ?? null;
+        return flushed;
+      }
+
+      activeProtocol = protocol ?? null;
+      return emptyResultBundle();
+    },
+  };
+
+  function flushProtocol(protocol, tx) {
+    if (!protocol) {
+      return emptyResultBundle();
+    }
+
+    const receiptContext = contexts.get(protocol);
+    if (!receiptContext) {
+      return emptyResultBundle();
+    }
+
+    const decoder = DECODERS[protocol];
+    let result = emptyResultBundle();
+
+    if (decoder && typeof decoder.flushReceiptContext === 'function') {
+      result = normalizeResultBundle(decoder.flushReceiptContext({ receiptContext, tx }));
+    }
+
+    if (decoder && typeof decoder.clearReceiptContext === 'function') {
+      decoder.clearReceiptContext({ receiptContext });
+    }
+
+    contexts.delete(protocol);
+
+    if (activeProtocol === protocol) {
+      activeProtocol = null;
+    }
+
+    return result;
+  }
+}
+
+function mergeResultBundles(bundles) {
+  const merged = emptyResultBundle();
+
+  for (const bundle of bundles) {
+    const normalized = normalizeResultBundle(bundle);
+    merged.actions.push(...normalized.actions);
+    merged.audits.push(...normalized.audits);
+    merged.bridges.push(...normalized.bridges);
+    merged.transfers.push(...normalized.transfers);
+  }
+
+  return merged;
+}
+
+function normalizeResultBundle(bundle) {
+  return {
+    actions: bundle?.actions ?? [],
+    audits: bundle?.audits ?? [],
+    bridges: bundle?.bridges ?? [],
+    transfers: bundle?.transfers ?? [],
+  };
+}
+
+function emptyResultBundle() {
+  return {
+    actions: [],
+    audits: [],
+    bridges: [],
+    transfers: [],
+  };
+}
+
+function resolveAuditStatus(route, audits) {
+  const explicitStatuses = new Set();
+  let hasImplicitStatus = false;
+
+  for (const audit of audits) {
+    if (audit?.normalizedStatus) {
+      explicitStatuses.add(audit.normalizedStatus);
+    } else {
+      hasImplicitStatus = true;
+    }
+  }
+
+  if (explicitStatuses.has('FAILED')) {
+    return 'FAILED';
+  }
+
+  if (hasImplicitStatus) {
+    return isFatalDecodeAudit(route) ? 'FAILED' : 'UNKNOWN';
+  }
+
+  if (explicitStatuses.has('UNKNOWN')) {
+    return 'UNKNOWN';
+  }
+
+  return isFatalDecodeAudit(route) ? 'FAILED' : 'UNKNOWN';
 }
 
 module.exports = {

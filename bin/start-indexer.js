@@ -7,9 +7,10 @@ require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 const { setTimeout: sleep } = require('node:timers/promises');
 const { syncRegistryToDatabase } = require('../core/abi-registry');
 const { processAcceptedBlock } = require('../core/block-processor');
-const { assertFoundationTables, assertPhase2Tables, ensureIndexStateRows, getCheckpoint } = require('../core/checkpoint');
+const { assertFoundationTables, assertPhase2Tables, assertPhase3Tables, ensureIndexStateRows, getCheckpoint } = require('../core/checkpoint');
 const { FINALITY_LANES, normalizeFinalityStatus } = require('../core/finality');
 const { closePool, withClient, withTransaction } = require('../lib/db');
+const { closeRedis } = require('../lib/redis');
 const { StarknetRpcClient } = require('../lib/starknet-rpc');
 const { toBigIntStrict } = require('../lib/cairo/bigint');
 
@@ -24,7 +25,7 @@ async function main() {
   const rpcClient = new StarknetRpcClient();
 
   if (lane !== FINALITY_LANES.ACCEPTED_ON_L2) {
-    throw new Error(`Phase 2 start-indexer only supports ${FINALITY_LANES.ACCEPTED_ON_L2}.`);
+    throw new Error(`Phase 3 start-indexer only supports ${FINALITY_LANES.ACCEPTED_ON_L2}.`);
   }
 
   installSignalHandlers();
@@ -32,12 +33,13 @@ async function main() {
   await withTransaction(async (client) => {
     await assertFoundationTables(client);
     await assertPhase2Tables(client);
+    await assertPhase3Tables(client);
     await syncRegistryToDatabase(client);
     await ensureIndexStateRows(client, indexerKey);
   });
 
   console.log(
-    `[phase2] StarknetDeg indexer starting indexerKey=${indexerKey} lane=${lane} previewLane=${FINALITY_LANES.PRE_CONFIRMED} anchorLane=${FINALITY_LANES.ACCEPTED_ON_L1}`,
+    `[phase3] StarknetDeg indexer starting indexerKey=${indexerKey} lane=${lane} previewLane=${FINALITY_LANES.PRE_CONFIRMED} anchorLane=${FINALITY_LANES.ACCEPTED_ON_L1}`,
   );
 
   while (!shuttingDown) {
@@ -63,8 +65,12 @@ async function main() {
         });
 
         console.log(
-          `[phase2] committed block=${result.blockNumber.toString()} hash=${shortHash(result.blockHash)} status=${result.finalityStatus} tx=${result.summary.total} reverted=${result.summary.reverted} l1_handlers=${result.summary.l1Handlers} actions=${result.decodeSummary.actions} transfers=${result.decodeSummary.transfers} unknown_events=${result.decodeSummary.unknownEvents}`,
+          `[phase3] committed block=${result.blockNumber.toString()} hash=${shortHash(result.blockHash)} status=${result.finalityStatus} tx=${result.summary.total} reverted=${result.summary.reverted} l1_handlers=${result.summary.l1Handlers} actions=${result.decodeSummary.actions} transfers=${result.decodeSummary.transfers} unknown_events=${result.decodeSummary.unknownEvents} trades=${result.phase3Summary.trades} price_ticks=${result.phase3Summary.priceTicks} stale_prices=${result.phase3Summary.stalePrices} pool_history=${result.phase3Summary.poolHistoryRows} pool_latest=${result.phase3Summary.poolLatestRows} candles=${result.phase3Summary.candles}`,
         );
+
+        if (result.realtimeError) {
+          console.error(`[phase3] realtime publish warning: ${result.realtimeError}`);
+        }
 
         cursor += 1n;
         processedInBatch += 1;
@@ -74,11 +80,12 @@ async function main() {
         await sleep(pollIntervalMs);
       }
     } catch (error) {
-      console.error(`[phase2] indexer loop error: ${formatError(error)}`);
+      console.error(`[phase3] indexer loop error: ${formatError(error)}`);
       await sleep(pollIntervalMs);
     }
   }
 
+  await closeRedis();
   await closePool();
 }
 
@@ -145,13 +152,19 @@ function installSignalHandlers() {
   for (const signal of ['SIGINT', 'SIGTERM']) {
     process.once(signal, () => {
       shuttingDown = true;
-      console.log(`[phase2] received ${signal}, shutting down after current step.`);
+      console.log(`[phase3] received ${signal}, shutting down after current step.`);
     });
   }
 }
 
 main().catch(async (error) => {
-  console.error(`[phase2] fatal startup error: ${formatError(error)}`);
+  console.error(`[phase3] fatal startup error: ${formatError(error)}`);
+
+  try {
+    await closeRedis();
+  } catch (redisError) {
+    console.error(`[phase3] redis shutdown error: ${formatError(redisError)}`);
+  }
 
   try {
     await closePool();
