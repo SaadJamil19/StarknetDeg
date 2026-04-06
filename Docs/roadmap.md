@@ -812,7 +812,7 @@ V1 accounting logic:
 3. `extras/ethereum/bridge-watcher.js` is an optional but recommended correlation sidecar for:
    - StarkGate L1 `Deposit` events
    - final L1 `withdraw` completion
-4. `stark_bridge_activities` stores:
+4. `stark_bridge_activities`  stores:
    - direction
    - token
    - amount
