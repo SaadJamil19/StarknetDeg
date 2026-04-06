@@ -1,6 +1,7 @@
 'use strict';
 
 const { toBigIntStrict } = require('../lib/cairo/bigint');
+const { createTtlCache } = require('../lib/cache');
 const {
   SELECTORS,
   getCandidateProtocolsForSelector,
@@ -15,10 +16,12 @@ const { normalizeAddress, normalizeHex, normalizeSelector } = require('./normali
 
 const CLASS_HASH_CACHE = new Map();
 const PROBE_CACHE = new Map();
+const DB_REGISTRY_CACHE = createTtlCache({ defaultTtlMs: 30_000, maxEntries: 10_000 });
 const EMPTY_CLASS_HASH = normalizeHex(0, { label: 'empty class hash', padToBytes: 32 });
 
-async function resolveRoute({ event, tx, rpcClient }) {
+async function resolveRoute({ client, event, tx, rpcClient }) {
   const contractMetadata = await resolveContractMetadata({
+    client,
     blockNumber: tx.blockNumber,
     emitterAddress: event.fromAddress,
     eventSelector: event.selector,
@@ -60,7 +63,7 @@ async function resolveRoute({ event, tx, rpcClient }) {
   };
 }
 
-async function resolveContractMetadata({ blockNumber, emitterAddress, eventSelector, resolvedClassHash, rpcClient }) {
+async function resolveContractMetadata({ client, blockNumber, emitterAddress, eventSelector, resolvedClassHash, rpcClient }) {
   const normalizedAddress = normalizeAddress(emitterAddress, 'event emitter');
   const normalizedBlockNumber = toBigIntStrict(blockNumber, 'block number');
   const classHash = resolvedClassHash
@@ -70,6 +73,16 @@ async function resolveContractMetadata({ blockNumber, emitterAddress, eventSelec
       emitterAddress: normalizedAddress,
       rpcClient,
     });
+
+  const databaseMatch = await pickDatabaseMatch(client, {
+    blockNumber: normalizedBlockNumber,
+    classHash,
+    emitterAddress: normalizedAddress,
+    eventSelector,
+  });
+  if (databaseMatch) {
+    return databaseMatch;
+  }
 
   const staticMatch = pickStaticMatch({
     blockNumber: normalizedBlockNumber,
@@ -91,6 +104,51 @@ async function resolveContractMetadata({ blockNumber, emitterAddress, eventSelec
     emitterAddress: normalizedAddress,
     eventSelector,
     rpcClient,
+  });
+}
+
+async function pickDatabaseMatch(client, { blockNumber, classHash, emitterAddress, eventSelector }) {
+  if (!client || typeof client.query !== 'function') {
+    return null;
+  }
+
+  const cacheKey = `${blockNumber.toString(10)}:${emitterAddress}:${classHash ?? 'none'}:${eventSelector}`;
+  return DB_REGISTRY_CACHE.getOrLoad(cacheKey, async () => {
+    const result = await client.query(
+      `SELECT contract_address,
+              class_hash,
+              protocol,
+              role,
+              decoder,
+              abi_version,
+              metadata
+         FROM stark_contract_registry
+        WHERE is_active = TRUE
+          AND (
+               contract_address = $1
+            OR ($2::text IS NOT NULL AND class_hash = $2)
+          )
+          AND (valid_from_block IS NULL OR valid_from_block <= $3)
+          AND (valid_to_block IS NULL OR valid_to_block >= $3)
+        ORDER BY
+          CASE WHEN contract_address = $1 THEN 0 ELSE 1 END,
+          CASE WHEN class_hash = $2 THEN 0 ELSE 1 END,
+          updated_at DESC`,
+      [emitterAddress, classHash, blockNumber.toString(10)],
+    );
+
+    for (const row of result.rows) {
+      const candidate = materializeDatabaseMatch(row, {
+        emitterAddress,
+        resolvedClassHash: classHash,
+      });
+
+      if (candidate.selectorSet.size === 0 || candidate.selectorSet.has(eventSelector)) {
+        return candidate;
+      }
+    }
+
+    return null;
   });
 }
 
@@ -118,6 +176,31 @@ function pickStaticMatch({ blockNumber, classHash, emitterAddress, eventSelector
   }
 
   return null;
+}
+
+function materializeDatabaseMatch(row, { emitterAddress, resolvedClassHash }) {
+  const metadata = row.metadata && typeof row.metadata === 'object'
+    ? { ...row.metadata }
+    : {};
+  const selectorHandlers = metadata.selector_handlers && typeof metadata.selector_handlers === 'object'
+    ? metadata.selector_handlers
+    : {};
+  const storedClassHash = row.class_hash && row.class_hash !== EMPTY_CLASS_HASH ? row.class_hash : null;
+
+  return {
+    abiVersion: row.abi_version ?? null,
+    classHash: resolvedClassHash ?? storedClassHash ?? null,
+    contractAddress: emitterAddress,
+    decoder: row.decoder,
+    displayName: metadata.display_name ?? row.protocol,
+    family: metadata.family ?? null,
+    metadata,
+    protocol: row.protocol,
+    protocolKey: metadata.protocol_key ?? row.protocol,
+    role: row.role,
+    selectorSet: new Set(Object.keys(selectorHandlers)),
+    sourceUrls: Array.isArray(metadata.source_urls) ? metadata.source_urls : [],
+  };
 }
 
 async function probeDynamicDexEmitter({ blockNumber, classHash, emitterAddress, eventSelector, rpcClient }) {
@@ -333,7 +416,11 @@ async function syncRegistryToDatabase(client) {
         entry.role,
         entry.decoder,
         entry.abiVersion,
-        JSON.stringify(entry.metadata ?? {}),
+        JSON.stringify({
+          ...(entry.metadata ?? {}),
+          display_name: entry.displayName ?? null,
+          family: entry.family ?? null,
+        }),
       ],
     );
   }

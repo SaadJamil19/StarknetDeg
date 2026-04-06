@@ -49,6 +49,7 @@ async function persistOhlcvForBlock(client, { blockHash, blockNumber, lane, reco
           blockHash,
           blockNumber,
           fromBucketDate: previousBucketDate,
+          previousPendingEnrichment: previousCandle?.pendingEnrichment ?? false,
           previousCloseScaled,
           priceIsDecimalsNormalized: previousCandle?.priceIsDecimalsNormalized ?? bucketTrades[0].priceIsDecimalsNormalized,
           toBucketDate: bucketStart,
@@ -95,6 +96,7 @@ async function persistOhlcvForBlock(client, { blockHash, blockNumber, lane, reco
       previousCandle = {
         bucketStart,
         close: scaledToNumericString(candle.closeScaled, DEFAULT_SCALE),
+        pendingEnrichment: candle.pendingEnrichment,
         priceIsDecimalsNormalized: candle.priceIsDecimalsNormalized,
       };
     }
@@ -126,7 +128,16 @@ async function isReconciliationTriggered(client, { blockNumber, lane }) {
   return result.rowCount > 0;
 }
 
-function buildGapCandles({ anchorTrade, blockHash, blockNumber, fromBucketDate, previousCloseScaled, priceIsDecimalsNormalized, toBucketDate }) {
+function buildGapCandles({
+  anchorTrade,
+  blockHash,
+  blockNumber,
+  fromBucketDate,
+  previousCloseScaled,
+  previousPendingEnrichment,
+  priceIsDecimalsNormalized,
+  toBucketDate,
+}) {
   if (!fromBucketDate) {
     return [];
   }
@@ -145,11 +156,13 @@ function buildGapCandles({ anchorTrade, blockHash, blockNumber, fromBucketDate, 
       lowScaled: previousCloseScaled,
       metadata: {
         cache_mode: 'gap_seed',
+        pending_enrichment: Boolean(previousPendingEnrichment),
         reconciliation_triggered: false,
         source: 'seeded_from_previous_close',
       },
       openScaled: previousCloseScaled,
       poolId: anchorTrade.poolId,
+      pendingEnrichment: Boolean(previousPendingEnrichment),
       priceIsDecimalsNormalized,
       protocol: anchorTrade.protocol,
       seededFromPreviousClose: true,
@@ -188,10 +201,12 @@ function buildIncrementalCandle({ blockHash, blockNumber, bucketStart, bucketTra
       lowScaled: tradeAggregate.lowScaled,
       metadata: {
         cache_mode: 'incremental_new',
+        pending_enrichment: tradeAggregate.pendingEnrichment,
         reconciliation_triggered: false,
         source: 'current_block_trades',
       },
       openScaled: tradeAggregate.openScaled,
+      pendingEnrichment: tradeAggregate.pendingEnrichment,
       poolId: tradeAggregate.poolId,
       priceIsDecimalsNormalized: tradeAggregate.priceIsDecimalsNormalized,
       protocol: tradeAggregate.protocol,
@@ -218,11 +233,13 @@ function buildIncrementalCandle({ blockHash, blockNumber, bucketStart, bucketTra
     lowScaled: compareBigInt(existingCandle.lowScaled, tradeAggregate.lowScaled) <= 0 ? existingCandle.lowScaled : tradeAggregate.lowScaled,
     metadata: {
       cache_mode: 'incremental_append',
+      pending_enrichment: existingCandle.pendingEnrichment || tradeAggregate.pendingEnrichment,
       previous_trade_count: existingCandle.tradeCount.toString(10),
       reconciliation_triggered: false,
       source: 'existing_candle_plus_current_block_trades',
     },
     openScaled: existingCandle.openScaled,
+    pendingEnrichment: existingCandle.pendingEnrichment || tradeAggregate.pendingEnrichment,
     poolId: tradeAggregate.poolId,
     priceIsDecimalsNormalized: existingCandle.priceIsDecimalsNormalized || tradeAggregate.priceIsDecimalsNormalized,
     protocol: tradeAggregate.protocol,
@@ -262,6 +279,7 @@ function aggregateBucketTrades(bucketTrades) {
   let volume0 = 0n;
   let volume1 = 0n;
   let volumeUsdScaled = 0n;
+  let pendingEnrichment = false;
 
   for (let index = 0; index < sortedTrades.length; index += 1) {
     const trade = sortedTrades[index];
@@ -277,6 +295,7 @@ function aggregateBucketTrades(bucketTrades) {
 
     volume0 += trade.volumeToken0;
     volume1 += trade.volumeToken1;
+    pendingEnrichment = pendingEnrichment || Boolean(trade.pendingEnrichment);
 
     if (trade.notionalUsdScaled !== null) {
       volumeUsdScaled += trade.notionalUsdScaled;
@@ -292,6 +311,7 @@ function aggregateBucketTrades(bucketTrades) {
     lane: first.lane,
     lowScaled,
     openScaled: prices[0],
+    pendingEnrichment,
     poolId: first.poolId,
     priceIsDecimalsNormalized: last.priceIsDecimalsNormalized,
     protocol: first.protocol,
@@ -339,6 +359,7 @@ async function loadExistingCandle(client, { bucketStart, lane, poolId }) {
             low,
             close,
             price_is_decimals_normalized,
+            pending_enrichment,
             volume0,
             volume1,
             volume_usd,
@@ -362,6 +383,7 @@ async function loadExistingCandle(client, { bucketStart, lane, poolId }) {
     highScaled: decimalStringToScaled(row.high, DEFAULT_SCALE),
     lowScaled: decimalStringToScaled(row.low, DEFAULT_SCALE),
     openScaled: decimalStringToScaled(row.open, DEFAULT_SCALE),
+    pendingEnrichment: row.pending_enrichment,
     priceIsDecimalsNormalized: row.price_is_decimals_normalized,
     protocol: row.protocol,
     seededFromPreviousClose: row.seeded_from_previous_close,
@@ -379,6 +401,7 @@ async function loadPreviousCandle(client, { beforeBucketStart, lane, poolId }) {
     `SELECT bucket_start,
             close,
             price_is_decimals_normalized
+            , pending_enrichment
        FROM stark_ohlcv_1m
       WHERE lane = $1
         AND pool_id = $2
@@ -395,6 +418,7 @@ async function loadPreviousCandle(client, { beforeBucketStart, lane, poolId }) {
   return {
     bucketStart: result.rows[0].bucket_start,
     close: result.rows[0].close,
+    pendingEnrichment: result.rows[0].pending_enrichment,
     priceIsDecimalsNormalized: result.rows[0].price_is_decimals_normalized,
   };
 }
@@ -406,6 +430,7 @@ async function rebuildCandleForBucket(client, { bucketStart, lane, poolId }) {
             token1_address,
             price_token1_per_token0,
             price_is_decimals_normalized,
+            pending_enrichment,
             volume_token0,
             volume_token1,
             notional_usd,
@@ -432,6 +457,7 @@ async function rebuildCandleForBucket(client, { bucketStart, lane, poolId }) {
   let volume0 = 0n;
   let volume1 = 0n;
   let volumeUsdScaled = 0n;
+  let pendingEnrichment = false;
 
   for (let index = 0; index < result.rows.length; index += 1) {
     const row = result.rows[index];
@@ -447,6 +473,7 @@ async function rebuildCandleForBucket(client, { bucketStart, lane, poolId }) {
 
     volume0 += toBigIntStrict(row.volume_token0, 'candle volume0');
     volume1 += toBigIntStrict(row.volume_token1, 'candle volume1');
+    pendingEnrichment = pendingEnrichment || Boolean(row.pending_enrichment);
 
     if (row.notional_usd !== null) {
       volumeUsdScaled += decimalStringToScaled(row.notional_usd, DEFAULT_SCALE);
@@ -465,9 +492,11 @@ async function rebuildCandleForBucket(client, { bucketStart, lane, poolId }) {
     lane,
     lowScaled,
     metadata: {
+      pending_enrichment: pendingEnrichment,
       source: 'trades',
     },
     openScaled: prices[0],
+    pendingEnrichment,
     poolId,
     priceIsDecimalsNormalized: last.price_is_decimals_normalized,
     protocol: first.protocol,
@@ -482,6 +511,245 @@ async function rebuildCandleForBucket(client, { bucketStart, lane, poolId }) {
     volume1,
     volumeUsdScaled,
   };
+}
+
+async function rebuildPendingEnrichmentCandles(client, { tokenAddresses }) {
+  const normalizedTokenAddresses = Array.from(new Set((tokenAddresses ?? []).filter(Boolean)));
+  if (normalizedTokenAddresses.length === 0) {
+    return {
+      rebuiltCandles: 0,
+      touchedPools: 0,
+    };
+  }
+
+  const ranges = await loadPendingEnrichmentRanges(client, normalizedTokenAddresses);
+  let rebuiltCandles = 0;
+
+  for (const range of ranges) {
+    rebuiltCandles += await rebuildPendingRange(client, range);
+  }
+
+  return {
+    rebuiltCandles,
+    touchedPools: ranges.length,
+  };
+}
+
+async function loadPendingEnrichmentRanges(client, tokenAddresses) {
+  const result = await client.query(
+    `SELECT lane,
+            pool_id,
+            MIN(bucket_start) AS from_bucket_start,
+            MAX(bucket_start) AS to_bucket_start
+       FROM stark_ohlcv_1m
+      WHERE pending_enrichment = TRUE
+        AND (
+             token0_address = ANY($1::text[])
+          OR token1_address = ANY($1::text[])
+        )
+      GROUP BY lane, pool_id
+      ORDER BY lane ASC, pool_id ASC`,
+    [tokenAddresses],
+  );
+
+  return result.rows.map((row) => ({
+    fromBucketStart: row.from_bucket_start,
+    lane: row.lane,
+    poolId: row.pool_id,
+    toBucketStart: row.to_bucket_start,
+  }));
+}
+
+async function rebuildPendingRange(client, { fromBucketStart, lane, poolId, toBucketStart }) {
+  const [existingCandles, tradeRows] = await Promise.all([
+    loadCandlesInRange(client, { fromBucketStart, lane, poolId, toBucketStart }),
+    loadTradesInRange(client, { fromBucketStart, lane, poolId, toBucketStart }),
+  ]);
+
+  if (existingCandles.length === 0) {
+    return 0;
+  }
+
+  const existingByBucket = new Map(existingCandles.map((candle) => [candle.bucketStart.toISOString(), candle]));
+  const tradesByBucket = new Map();
+
+  for (const trade of tradeRows) {
+    const key = trade.bucketStart.toISOString();
+    if (!tradesByBucket.has(key)) {
+      tradesByBucket.set(key, []);
+    }
+    tradesByBucket.get(key).push(trade);
+  }
+
+  const sortedBucketKeys = Array.from(existingByBucket.keys()).sort();
+  let previousCandle = await loadPreviousCandle(client, { beforeBucketStart: fromBucketStart, lane, poolId });
+  let previousCloseScaled = previousCandle ? decimalStringToScaled(previousCandle.close, DEFAULT_SCALE) : null;
+  let previousPendingEnrichment = previousCandle ? Boolean(previousCandle.pendingEnrichment) : false;
+  let rebuilt = 0;
+
+  for (const bucketKey of sortedBucketKeys) {
+    const bucketStart = new Date(bucketKey);
+    const existing = existingByBucket.get(bucketKey);
+    const bucketTrades = tradesByBucket.get(bucketKey) ?? [];
+    let nextCandle;
+
+    if (bucketTrades.length > 0) {
+      const tradeAggregate = aggregateBucketTrades(bucketTrades);
+      nextCandle = {
+        blockHash: tradeAggregate.blockHash ?? bucketTrades[bucketTrades.length - 1].blockHash,
+        blockNumber: bucketTrades[bucketTrades.length - 1].blockNumber,
+        bucketStart,
+        closeScaled: tradeAggregate.closeScaled,
+        highScaled: tradeAggregate.highScaled,
+        lane,
+        lowScaled: tradeAggregate.lowScaled,
+        metadata: {
+          cache_mode: 'pending_enrichment_rebuild',
+          pending_enrichment: tradeAggregate.pendingEnrichment,
+          source: 'trades',
+        },
+        openScaled: tradeAggregate.openScaled,
+        pendingEnrichment: tradeAggregate.pendingEnrichment,
+        poolId,
+        priceIsDecimalsNormalized: tradeAggregate.priceIsDecimalsNormalized,
+        protocol: tradeAggregate.protocol,
+        seededFromPreviousClose: false,
+        sourceEventIndex: tradeAggregate.sourceEventIndex,
+        token0Address: tradeAggregate.token0Address,
+        token1Address: tradeAggregate.token1Address,
+        tradeCount: tradeAggregate.tradeCount,
+        transactionHash: tradeAggregate.transactionHash,
+        transactionIndex: tradeAggregate.transactionIndex,
+        volume0: tradeAggregate.volume0,
+        volume1: tradeAggregate.volume1,
+        volumeUsdScaled: tradeAggregate.volumeUsdScaled,
+      };
+    } else if (previousCloseScaled !== null) {
+      nextCandle = {
+        blockHash: existing.blockHash,
+        blockNumber: existing.blockNumber,
+        bucketStart,
+        closeScaled: previousCloseScaled,
+        highScaled: previousCloseScaled,
+        lane,
+        lowScaled: previousCloseScaled,
+        metadata: {
+          cache_mode: 'pending_enrichment_gap_rebuild',
+          pending_enrichment: previousPendingEnrichment,
+          source: 'seeded_from_previous_close',
+        },
+        openScaled: previousCloseScaled,
+        pendingEnrichment: previousPendingEnrichment,
+        poolId,
+        priceIsDecimalsNormalized: existing.priceIsDecimalsNormalized,
+        protocol: existing.protocol,
+        seededFromPreviousClose: true,
+        sourceEventIndex: existing.sourceEventIndex,
+        token0Address: existing.token0Address,
+        token1Address: existing.token1Address,
+        tradeCount: 0n,
+        transactionHash: existing.transactionHash,
+        transactionIndex: existing.transactionIndex,
+        volume0: 0n,
+        volume1: 0n,
+        volumeUsdScaled: 0n,
+      };
+    } else {
+      continue;
+    }
+
+    await upsertCandle(client, nextCandle);
+    previousCloseScaled = nextCandle.closeScaled;
+    previousPendingEnrichment = nextCandle.pendingEnrichment;
+    rebuilt += 1;
+  }
+
+  return rebuilt;
+}
+
+async function loadCandlesInRange(client, { fromBucketStart, lane, poolId, toBucketStart }) {
+  const result = await client.query(
+    `SELECT protocol,
+            token0_address,
+            token1_address,
+            bucket_start,
+            block_number,
+            block_hash,
+            transaction_hash,
+            transaction_index,
+            source_event_index,
+            price_is_decimals_normalized,
+            pending_enrichment
+       FROM stark_ohlcv_1m
+      WHERE lane = $1
+        AND pool_id = $2
+        AND bucket_start >= $3
+        AND bucket_start <= $4
+      ORDER BY bucket_start ASC`,
+    [lane, poolId, fromBucketStart, toBucketStart],
+  );
+
+  return result.rows.map((row) => ({
+    blockHash: row.block_hash,
+    blockNumber: toBigIntStrict(row.block_number, 'pending candle block number'),
+    bucketStart: row.bucket_start,
+    pendingEnrichment: row.pending_enrichment,
+    priceIsDecimalsNormalized: row.price_is_decimals_normalized,
+    protocol: row.protocol,
+    sourceEventIndex: row.source_event_index === null ? null : toBigIntStrict(row.source_event_index, 'pending candle source event index'),
+    token0Address: row.token0_address,
+    token1Address: row.token1_address,
+    transactionHash: row.transaction_hash,
+    transactionIndex: row.transaction_index === null ? null : toBigIntStrict(row.transaction_index, 'pending candle transaction index'),
+  }));
+}
+
+async function loadTradesInRange(client, { fromBucketStart, lane, poolId, toBucketStart }) {
+  const result = await client.query(
+    `SELECT block_number,
+            block_hash,
+            transaction_hash,
+            transaction_index,
+            source_event_index,
+            protocol,
+            token0_address,
+            token1_address,
+            bucket_1m,
+            price_token1_per_token0,
+            price_is_decimals_normalized,
+            pending_enrichment,
+            volume_token0,
+            volume_token1,
+            notional_usd
+       FROM stark_trades
+      WHERE lane = $1
+        AND pool_id = $2
+        AND bucket_1m >= $3
+        AND bucket_1m <= $4
+      ORDER BY bucket_1m ASC, transaction_index ASC, source_event_index ASC, trade_key ASC`,
+    [lane, poolId, fromBucketStart, toBucketStart],
+  );
+
+  return result.rows.map((row) => ({
+    blockHash: row.block_hash,
+    blockNumber: toBigIntStrict(row.block_number, 'pending trade block number'),
+    bucketStart: row.bucket_1m,
+    lane,
+    notionalUsdScaled: row.notional_usd === null ? null : decimalStringToScaled(row.notional_usd, DEFAULT_SCALE),
+    pendingEnrichment: row.pending_enrichment,
+    poolId,
+    priceIsDecimalsNormalized: row.price_is_decimals_normalized,
+    priceToken1PerToken0Scaled: decimalStringToScaled(row.price_token1_per_token0, DEFAULT_SCALE),
+    protocol: row.protocol,
+    sourceEventIndex: toBigIntStrict(row.source_event_index, 'pending trade source event index'),
+    token0Address: row.token0_address,
+    token1Address: row.token1_address,
+    tradeKey: `${row.transaction_hash}:${row.source_event_index}`,
+    transactionHash: row.transaction_hash,
+    transactionIndex: toBigIntStrict(row.transaction_index, 'pending trade transaction index'),
+    volumeToken0: toBigIntStrict(row.volume_token0, 'pending trade volume0'),
+    volumeToken1: toBigIntStrict(row.volume_token1, 'pending trade volume1'),
+  }));
 }
 
 async function upsertCandle(client, candle) {
@@ -504,6 +772,7 @@ async function upsertCandle(client, candle) {
          low,
          close,
          price_is_decimals_normalized,
+         pending_enrichment,
          volume0,
          volume1,
          volume_usd,
@@ -515,7 +784,7 @@ async function upsertCandle(client, candle) {
      ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
          $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-         $21, $22, $23::jsonb, NOW(), NOW()
+         $21, $22, $23, $24::jsonb, NOW(), NOW()
      )
      ON CONFLICT (lane, pool_id, bucket_start)
      DO UPDATE SET
@@ -532,6 +801,7 @@ async function upsertCandle(client, candle) {
          low = EXCLUDED.low,
          close = EXCLUDED.close,
          price_is_decimals_normalized = EXCLUDED.price_is_decimals_normalized,
+         pending_enrichment = EXCLUDED.pending_enrichment,
          volume0 = EXCLUDED.volume0,
          volume1 = EXCLUDED.volume1,
          volume_usd = EXCLUDED.volume_usd,
@@ -557,6 +827,7 @@ async function upsertCandle(client, candle) {
       scaledToNumericString(candle.lowScaled, DEFAULT_SCALE),
       scaledToNumericString(candle.closeScaled, DEFAULT_SCALE),
       candle.priceIsDecimalsNormalized,
+      candle.pendingEnrichment,
       toNumericString(candle.volume0, 'candle volume0'),
       toNumericString(candle.volume1, 'candle volume1'),
       scaledToNumericString(candle.volumeUsdScaled, DEFAULT_SCALE),
@@ -580,6 +851,7 @@ function serializeRealtimeCandle(candle) {
     lane: candle.lane,
     low: scaledToNumericString(candle.lowScaled, DEFAULT_SCALE),
     open: scaledToNumericString(candle.openScaled, DEFAULT_SCALE),
+    pendingEnrichment: candle.pendingEnrichment,
     poolId: candle.poolId,
     priceIsDecimalsNormalized: candle.priceIsDecimalsNormalized,
     protocol: candle.protocol,
@@ -593,4 +865,5 @@ function serializeRealtimeCandle(candle) {
 
 module.exports = {
   persistOhlcvForBlock,
+  rebuildPendingEnrichmentCandles,
 };

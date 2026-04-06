@@ -63,6 +63,10 @@ async function processAcceptedBlock({ rpcClient, indexerKey, lane = FINALITY_LAN
       lane: canonicalLane,
       normalized,
     });
+    await upsertBlockStateUpdate(client, {
+      lane: canonicalLane,
+      normalized,
+    });
 
     await upsertRawArtifacts(client, {
       emitterClassHashes,
@@ -241,6 +245,7 @@ async function markConflictingBlockRows(client, { lane, blockNumber, blockHash }
 async function clearBlockDerivedRows(client, { lane, blockNumber }) {
   const params = [lane, toNumericString(blockNumber, 'block number')];
   const statements = [
+    'DELETE FROM stark_block_state_updates WHERE lane = $1 AND block_number = $2',
     'DELETE FROM stark_ohlcv_1m WHERE lane = $1 AND block_number = $2',
     'DELETE FROM stark_trades WHERE lane = $1 AND block_number = $2',
     'DELETE FROM stark_action_norm WHERE lane = $1 AND block_number = $2',
@@ -353,6 +358,62 @@ async function upsertBlockJournal(client, { lane, normalized }) {
       toNumericString(summary.reverted, 'reverted transaction count'),
       toNumericString(summary.l1Handlers, 'l1 handler transaction count'),
       JSON.stringify(block),
+      JSON.stringify(stateUpdate),
+    ],
+  );
+}
+
+async function upsertBlockStateUpdate(client, { lane, normalized }) {
+  const { stateUpdate } = normalized;
+  const stateDiff = stateUpdate?.state_diff ?? {};
+
+  await client.query(
+    `INSERT INTO stark_block_state_updates (
+         lane,
+         block_number,
+         block_hash,
+         old_root,
+         new_root,
+         state_diff_length,
+         declared_classes,
+         deployed_contracts,
+         deprecated_declared_classes,
+         nonce_updates,
+         replaced_classes,
+         storage_diffs,
+         raw_state_update,
+         created_at,
+         updated_at
+     ) VALUES (
+         $1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb,
+         $11::jsonb, $12::jsonb, $13::jsonb, NOW(), NOW()
+     )
+     ON CONFLICT (lane, block_number, block_hash)
+     DO UPDATE SET
+         old_root = EXCLUDED.old_root,
+         new_root = EXCLUDED.new_root,
+         state_diff_length = EXCLUDED.state_diff_length,
+         declared_classes = EXCLUDED.declared_classes,
+         deployed_contracts = EXCLUDED.deployed_contracts,
+         deprecated_declared_classes = EXCLUDED.deprecated_declared_classes,
+         nonce_updates = EXCLUDED.nonce_updates,
+         replaced_classes = EXCLUDED.replaced_classes,
+         storage_diffs = EXCLUDED.storage_diffs,
+         raw_state_update = EXCLUDED.raw_state_update,
+         updated_at = NOW()`,
+    [
+      lane,
+      toNumericString(normalized.blockNumber, 'state update block number'),
+      normalized.block.block_hash,
+      stateUpdate.old_root ?? null,
+      stateUpdate.new_root ?? null,
+      toNumericString(resolveStateDiffLength(normalized), 'state diff length'),
+      JSON.stringify(ensureJsonValue(stateDiff.declared_classes, [])),
+      JSON.stringify(ensureJsonValue(stateDiff.deployed_contracts, [])),
+      JSON.stringify(ensureJsonValue(stateDiff.deprecated_declared_classes, [])),
+      JSON.stringify(ensureJsonValue(stateDiff.nonces, [])),
+      JSON.stringify(ensureJsonValue(stateDiff.replaced_classes, [])),
+      JSON.stringify(ensureJsonValue(stateDiff.storage_diffs, {})),
       JSON.stringify(stateUpdate),
     ],
   );
@@ -568,6 +629,45 @@ async function upsertRawArtifacts(client, { emitterClassHashes, lane, normalized
       );
     }
   }
+}
+
+function resolveStateDiffLength(normalized) {
+  const explicitLength = normalized.block.state_diff_length ?? normalized.stateUpdate.state_diff_length;
+  if (explicitLength !== undefined && explicitLength !== null) {
+    return toBigIntStrict(explicitLength, 'state diff length');
+  }
+
+  const stateDiff = normalized.stateUpdate?.state_diff ?? {};
+  let total = 0n;
+
+  total += countJsonEntries(stateDiff.declared_classes);
+  total += countJsonEntries(stateDiff.deployed_contracts);
+  total += countJsonEntries(stateDiff.deprecated_declared_classes);
+  total += countJsonEntries(stateDiff.nonces);
+  total += countJsonEntries(stateDiff.replaced_classes);
+  total += countJsonEntries(stateDiff.storage_diffs);
+
+  return total;
+}
+
+function countJsonEntries(value) {
+  if (Array.isArray(value)) {
+    return BigInt(value.length);
+  }
+
+  if (value && typeof value === 'object') {
+    return BigInt(Object.keys(value).length);
+  }
+
+  return 0n;
+}
+
+function ensureJsonValue(value, fallbackValue) {
+  if (value === undefined || value === null) {
+    return fallbackValue;
+  }
+
+  return value;
 }
 
 async function resolveEmitterClassHashes({ block, blockNumber, rpcClient }) {

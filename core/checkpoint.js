@@ -26,6 +26,11 @@ const PHASE3_TABLES = Object.freeze([
   'stark_price_ticks',
   'stark_ohlcv_1m',
 ]);
+const PHASE4_TABLES = Object.freeze([
+  'stark_block_state_updates',
+  'stark_token_metadata',
+  'stark_contract_security',
+]);
 
 async function assertFoundationTables(client) {
   await assertTablesExist(client, FOUNDATION_TABLES, 'Foundation', 'sql/001_foundation.sql');
@@ -37,6 +42,10 @@ async function assertPhase2Tables(client) {
 
 async function assertPhase3Tables(client) {
   await assertTablesExist(client, PHASE3_TABLES, 'Phase 3', 'sql/003_trading.sql');
+}
+
+async function assertPhase4Tables(client) {
+  await assertTablesExist(client, PHASE4_TABLES, 'Phase 4', 'sql/004_metadata_and_security.sql');
 }
 
 async function assertTablesExist(client, tableNames, label, migrationFile) {
@@ -135,6 +144,7 @@ module.exports = {
   assertFoundationTables,
   assertPhase2Tables,
   assertPhase3Tables,
+  assertPhase4Tables,
   advanceCheckpoint,
   ensureIndexStateRows,
   getCheckpoint,

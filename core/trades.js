@@ -19,6 +19,7 @@ const { toJsonbString } = require('./protocols/shared');
 const STABLE_TOKEN_SYMBOLS = new Set(['DAI', 'USDC', 'USDT']);
 const DEFAULT_BRIDGE_SYMBOLS = ['STRK', 'ETH', 'WBTC', 'USDC', 'USDT', 'DAI'];
 const DEFAULT_CMC_ALLOWLIST = ['STRK', 'ETH', 'WBTC', 'WSTETH', 'EKUBO'];
+const DEFAULT_PENDING_DECIMALS = 18;
 const USD_ONE_SCALED = decimalStringToScaled('1', DEFAULT_SCALE);
 
 async function persistTradesForBlock(client, { blockHash, blockNumber, blockTimestamp, lane }) {
@@ -30,6 +31,7 @@ async function persistTradesForBlock(client, { blockHash, blockNumber, blockTime
 
   const blockTimestampDate = toBlockTimestampDate(blockTimestamp);
   const tradeTokenAddresses = collectTradeTokenAddresses(actions);
+  const tokenMetadataByAddress = await loadTokenMetadataByAddress(client, tradeTokenAddresses);
   const priceContext = await loadLatestPriceContext(client, {
     blockNumber,
     lane,
@@ -68,6 +70,7 @@ async function persistTradesForBlock(client, { blockHash, blockNumber, blockTime
       latestUsdByToken,
       poolLiquidityById,
       priceContext,
+      tokenMetadataByAddress,
     });
 
     if (!trade) {
@@ -119,16 +122,27 @@ function deriveTrade(action, context) {
     return null;
   }
 
-  const token0Info = getTokenInfo(action.token0Address);
-  const token1Info = getTokenInfo(action.token1Address);
-  const decimals0 = token0Info?.decimals ?? null;
-  const decimals1 = token1Info?.decimals ?? null;
+  const token0Info = getTokenInfo(action.token0Address, context.tokenMetadataByAddress);
+  const token1Info = getTokenInfo(action.token1Address, context.tokenMetadataByAddress);
+  const token0Decimals = resolveTokenDecimals(token0Info);
+  const token1Decimals = resolveTokenDecimals(token1Info);
+  const decimals0 = token0Decimals.value;
+  const decimals1 = token1Decimals.value;
+  const pendingEnrichment = !token0Decimals.confirmed || !token1Decimals.confirmed;
+  const missingDecimalsFor = [
+    token0Decimals.confirmed ? null : action.token0Address,
+    token1Decimals.confirmed ? null : action.token1Address,
+  ].filter(Boolean);
   direction.tokenInAddress = direction.tokenInIndex === 0 ? action.token0Address : action.token1Address;
   direction.tokenOutAddress = direction.tokenOutIndex === 0 ? action.token0Address : action.token1Address;
   direction.tokenInDecimals = direction.tokenInIndex === 0 ? decimals0 : decimals1;
   direction.tokenOutDecimals = direction.tokenOutIndex === 0 ? decimals0 : decimals1;
 
-  const priceBundle = deriveTradePrice(action, { decimals0, decimals1 });
+  const priceBundle = deriveTradePrice(action, {
+    decimals0,
+    decimals1,
+    decimalsConfirmed: token0Decimals.confirmed && token1Decimals.confirmed,
+  });
   const actionLiquidityUsdScaled = context.poolLiquidityById.get(action.poolId) ?? null;
   const actionEdges = buildActionEdges(action, {
     actionLiquidityUsdScaled,
@@ -185,7 +199,10 @@ function deriveTrade(action, context) {
     amount0_delta: action.amount0Delta,
     amount1_delta: action.amount1Delta,
     decimals_known: priceBundle.priceIsDecimalsNormalized,
+    default_decimals_applied: pendingEnrichment ? DEFAULT_PENDING_DECIMALS : null,
+    missing_decimals_for: missingDecimalsFor,
     original_action_key: action.actionKey,
+    pending_enrichment: pendingEnrichment,
     pool_id: action.poolId,
     price_source: priceBundle.priceSource,
     protocol: action.protocol,
@@ -217,6 +234,7 @@ function deriveTrade(action, context) {
     protocol: action.protocol,
     routerProtocol: action.routerProtocol,
     sourceEventIndex: action.sourceEventIndex,
+    pendingEnrichment,
     token0Address: action.token0Address,
     token1Address: action.token1Address,
     tokenInAddress: direction.tokenInAddress,
@@ -259,7 +277,7 @@ function determineTradeDirection(amount0Delta, amount1Delta) {
   return null;
 }
 
-function deriveTradePrice(action, { decimals0, decimals1 }) {
+function deriveTradePrice(action, { decimals0, decimals1, decimalsConfirmed }) {
   let rawNumerator;
   let rawDenominator;
   let priceSource;
@@ -280,12 +298,11 @@ function deriveTradePrice(action, { decimals0, decimals1 }) {
 
   const priceRawToken1PerToken0Scaled = scaledRatio(rawNumerator, rawDenominator, 0, DEFAULT_SCALE);
   const priceRawToken0PerToken1Scaled = scaledRatio(rawDenominator, rawNumerator, 0, DEFAULT_SCALE);
-  const canNormalizeByDecimals = decimals0 !== null && decimals1 !== null;
-  const decimalExponent = canNormalizeByDecimals ? decimals0 - decimals1 : 0;
-  const inverseDecimalExponent = canNormalizeByDecimals ? decimals1 - decimals0 : 0;
+  const decimalExponent = decimals0 - decimals1;
+  const inverseDecimalExponent = decimals1 - decimals0;
 
   return {
-    priceIsDecimalsNormalized: canNormalizeByDecimals,
+    priceIsDecimalsNormalized: Boolean(decimalsConfirmed),
     priceRawToken0PerToken1Scaled,
     priceRawToken1PerToken0Scaled,
     priceSource,
@@ -658,8 +675,67 @@ function buildActionEdges(action, { actionLiquidityUsdScaled, priceBundle }) {
   ];
 }
 
-function getTokenInfo(tokenAddress) {
+async function loadTokenMetadataByAddress(client, tokenAddresses) {
+  const uniqueTokenAddresses = Array.from(new Set((tokenAddresses ?? []).filter(Boolean)));
+  const metadataByAddress = new Map();
+
+  for (const tokenAddress of uniqueTokenAddresses) {
+    const knownToken = knownErc20Cache.getToken(tokenAddress);
+    if (knownToken) {
+      metadataByAddress.set(tokenAddress, {
+        decimals: knownToken.decimals ?? null,
+        isVerified: true,
+        name: knownToken.name ?? null,
+        symbol: knownToken.symbol ?? null,
+      });
+    }
+  }
+
+  if (uniqueTokenAddresses.length === 0) {
+    return metadataByAddress;
+  }
+
+  const result = await client.query(
+    `SELECT token_address, name, symbol, decimals, is_verified
+       FROM stark_token_metadata
+      WHERE token_address = ANY($1::text[])`,
+    [uniqueTokenAddresses],
+  );
+
+  for (const row of result.rows) {
+    const existing = metadataByAddress.get(row.token_address) ?? {};
+    metadataByAddress.set(row.token_address, {
+      ...existing,
+      decimals: row.decimals === null ? existing.decimals ?? null : Number.parseInt(String(row.decimals), 10),
+      isVerified: row.is_verified ?? existing.isVerified ?? false,
+      name: row.name ?? existing.name ?? null,
+      symbol: row.symbol ?? existing.symbol ?? null,
+    });
+  }
+
+  return metadataByAddress;
+}
+
+function getTokenInfo(tokenAddress, tokenMetadataByAddress = null) {
+  if (tokenMetadataByAddress instanceof Map && tokenMetadataByAddress.has(tokenAddress)) {
+    return tokenMetadataByAddress.get(tokenAddress);
+  }
+
   return knownErc20Cache.getToken(tokenAddress);
+}
+
+function resolveTokenDecimals(tokenInfo) {
+  if (tokenInfo?.decimals !== undefined && tokenInfo?.decimals !== null && Number.isInteger(Number(tokenInfo.decimals))) {
+    return {
+      confirmed: true,
+      value: Number(tokenInfo.decimals),
+    };
+  }
+
+  return {
+    confirmed: false,
+    value: DEFAULT_PENDING_DECIMALS,
+  };
 }
 
 function isStableTokenAddress(tokenAddress) {
@@ -777,6 +853,7 @@ async function upsertTrade(client, trade) {
          price_token1_per_token0,
          price_token0_per_token1,
          price_is_decimals_normalized,
+         pending_enrichment,
          price_source,
          notional_usd,
          bucket_1m,
@@ -787,7 +864,7 @@ async function upsertTrade(client, trade) {
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
          $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
          $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
-         $31, $32::jsonb, NOW(), NOW()
+         $31, $32, $33, $34::jsonb, NOW(), NOW()
      )
      ON CONFLICT (transaction_hash, source_event_index)
      DO UPDATE SET
@@ -817,6 +894,7 @@ async function upsertTrade(client, trade) {
          price_token1_per_token0 = EXCLUDED.price_token1_per_token0,
          price_token0_per_token1 = EXCLUDED.price_token0_per_token1,
          price_is_decimals_normalized = EXCLUDED.price_is_decimals_normalized,
+         pending_enrichment = EXCLUDED.pending_enrichment,
          price_source = EXCLUDED.price_source,
          notional_usd = EXCLUDED.notional_usd,
          bucket_1m = EXCLUDED.bucket_1m,
@@ -851,12 +929,161 @@ async function upsertTrade(client, trade) {
       scaledToNumericString(trade.priceToken1PerToken0Scaled, DEFAULT_SCALE),
       scaledToNumericString(trade.priceToken0PerToken1Scaled, DEFAULT_SCALE),
       trade.priceIsDecimalsNormalized,
+      trade.pendingEnrichment,
       trade.priceSource,
       trade.notionalUsdScaled === null ? null : scaledToNumericString(trade.notionalUsdScaled, DEFAULT_SCALE),
       trade.bucketStart,
       toJsonbString(trade.metadata),
     ],
   );
+}
+
+async function repricePendingEnrichmentTrades(client, { tokenAddresses }) {
+  const normalizedTokenAddresses = Array.from(new Set((tokenAddresses ?? []).filter(Boolean)));
+  if (normalizedTokenAddresses.length === 0) {
+    return {
+      affectedBuckets: [],
+      repricedTrades: 0,
+    };
+  }
+
+  const pendingInputs = await loadPendingTradeInputs(client, normalizedTokenAddresses);
+  if (pendingInputs.length === 0) {
+    return {
+      affectedBuckets: [],
+      repricedTrades: 0,
+    };
+  }
+
+  const affectedBuckets = new Map();
+  let repricedTrades = 0;
+  const inputsByLane = groupItemsByLane(pendingInputs);
+
+  for (const [lane, items] of inputsByLane.entries()) {
+    const tradeTokenAddresses = collectTradeTokenAddresses(items);
+    const tokenMetadataByAddress = await loadTokenMetadataByAddress(client, tradeTokenAddresses);
+    const priceContext = await loadLatestPriceContext(client, {
+      blockNumber: items[items.length - 1].blockNumber,
+      lane,
+      tokenAddresses: tradeTokenAddresses,
+    });
+    seedStablePrices(priceContext, {
+      blockNumber: items[items.length - 1].blockNumber,
+      tokenAddresses: tradeTokenAddresses,
+    });
+
+    const bridgeEdges = await loadBridgeEdges(client, {
+      lane,
+      tokenAddresses: tradeTokenAddresses,
+    });
+    const poolLiquidityById = await loadPoolLiquidityById(client, {
+      lane,
+      poolIds: items.map((item) => item.poolId),
+    });
+
+    for (const item of items) {
+      const trade = deriveTrade(item, {
+        blockHash: item.blockHash,
+        blockNumber: item.blockNumber,
+        blockTimestampDate: item.blockTimestampDate,
+        bridgeEdges,
+        lane,
+        latestUsdByToken: new Map(),
+        poolLiquidityById,
+        priceContext,
+        tokenMetadataByAddress,
+      });
+
+      if (!trade) {
+        continue;
+      }
+
+      await upsertTrade(client, trade);
+      affectedBuckets.set(`${lane}:${trade.poolId}:${trade.bucketStart.toISOString()}`, {
+        bucketStart: trade.bucketStart,
+        lane,
+        poolId: trade.poolId,
+      });
+      repricedTrades += 1;
+    }
+  }
+
+  return {
+    affectedBuckets: Array.from(affectedBuckets.values()),
+    repricedTrades,
+  };
+}
+
+async function loadPendingTradeInputs(client, tokenAddresses) {
+  const result = await client.query(
+    `SELECT trade.lane,
+            trade.block_number,
+            trade.block_hash,
+            trade.block_timestamp,
+            trade.transaction_hash,
+            trade.transaction_index,
+            trade.source_event_index,
+            trade.pool_id,
+            action.action_key,
+            action.protocol,
+            action.account_address,
+            action.token0_address,
+            action.token1_address,
+            action.router_protocol,
+            action.execution_protocol,
+            action.amount0,
+            action.amount1,
+            action.metadata
+       FROM stark_trades AS trade
+       JOIN stark_action_norm AS action
+         ON action.lane = trade.lane
+        AND action.block_number = trade.block_number
+        AND action.transaction_hash = trade.transaction_hash
+        AND action.source_event_index = trade.source_event_index
+        AND action.action_type = 'swap'
+      WHERE trade.pending_enrichment = TRUE
+        AND (
+             trade.token0_address = ANY($1::text[])
+          OR trade.token1_address = ANY($1::text[])
+        )
+      ORDER BY trade.lane ASC, trade.block_number ASC, trade.transaction_index ASC, trade.source_event_index ASC`,
+    [tokenAddresses],
+  );
+
+  return result.rows.map((row) => ({
+    actionKey: row.action_key,
+    accountAddress: row.account_address,
+    amount0Delta: toBigIntStrict(row.amount0, 'pending trade amount0 delta'),
+    amount1Delta: toBigIntStrict(row.amount1, 'pending trade amount1 delta'),
+    blockHash: row.block_hash,
+    blockNumber: toBigIntStrict(row.block_number, 'pending trade block number'),
+    blockTimestampDate: new Date(row.block_timestamp),
+    executionProtocol: row.execution_protocol,
+    lane: row.lane,
+    metadata: row.metadata ?? {},
+    poolId: row.pool_id,
+    protocol: row.protocol,
+    routerProtocol: row.router_protocol,
+    sourceEventIndex: toBigIntStrict(row.source_event_index, 'pending trade source event index'),
+    token0Address: row.token0_address,
+    token1Address: row.token1_address,
+    transactionHash: row.transaction_hash,
+    transactionIndex: toBigIntStrict(row.transaction_index, 'pending trade transaction index'),
+  }));
+}
+
+function groupItemsByLane(items) {
+  const grouped = new Map();
+
+  for (const item of items) {
+    if (!grouped.has(item.lane)) {
+      grouped.set(item.lane, []);
+    }
+
+    grouped.get(item.lane).push(item);
+  }
+
+  return grouped;
 }
 
 function buildTradeKey(action) {
@@ -872,6 +1099,7 @@ function serializeRealtimeTrade(trade) {
     executionProtocol: trade.executionProtocol,
     lane: trade.lane,
     notionalUsd: trade.notionalUsdScaled === null ? null : scaledToNumericString(trade.notionalUsdScaled, DEFAULT_SCALE),
+    pendingEnrichment: trade.pendingEnrichment,
     poolId: trade.poolId,
     priceSource: trade.priceSource,
     priceToken0PerToken1: scaledToNumericString(trade.priceToken0PerToken1Scaled, DEFAULT_SCALE),
@@ -912,4 +1140,5 @@ function emptyTradeResult() {
 
 module.exports = {
   persistTradesForBlock,
+  repricePendingEnrichmentTrades,
 };

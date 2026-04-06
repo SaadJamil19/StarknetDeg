@@ -53,7 +53,7 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
     summary.bridgeActivities += bridgeResults.bridges.length;
 
     for (const event of tx.events) {
-      const route = await resolveRoute({ event, rpcClient, tx });
+      const route = await resolveRoute({ client, event, rpcClient, tx });
       const protocolTransitionResult = receiptContexts.transitionTo(route?.decoder ?? null, tx);
       await persistResultBundle(client, tx, protocolTransitionResult);
       summary.actions += protocolTransitionResult.actions.length;
