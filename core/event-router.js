@@ -74,6 +74,7 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
       }
 
       const decoded = await Promise.resolve(decoder.decodeEvent({
+        client,
         contractMetadata: route.contractMetadata,
         event,
         receiptContext: receiptContexts.get(route.decoder),

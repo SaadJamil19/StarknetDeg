@@ -1,10 +1,10 @@
 'use strict';
 
-const { knownErc20Cache } = require('../known-erc20-cache');
 const { normalizeAddress, parseU256FromArray } = require('../normalize');
+const { resolveTrustedToken } = require('../token-trust-cache');
 const { buildActionKey, buildTransferKey, normalizeActionMetadata } = require('./shared');
 
-function decodeEvent({ tx, event }) {
+async function decodeEvent({ client, tx, event }) {
   if (!Array.isArray(event.keys) || event.keys.length < 3 || !Array.isArray(event.data) || event.data.length < 2) {
     return {
       actions: [],
@@ -20,9 +20,9 @@ function decodeEvent({ tx, event }) {
   const toAddress = normalizeAddress(event.keys[2], 'erc20.to');
   const amount = parseU256FromArray(event.data, 0, 'erc20.value');
   const tokenAddress = normalizeAddress(event.fromAddress, 'erc20.token');
-  const verifiedToken = knownErc20Cache.getToken(tokenAddress);
+  const trustedToken = await resolveTrustedToken({ client, tokenAddress });
 
-  if (!verifiedToken) {
+  if (!trustedToken) {
     return {
       actions: [],
       audits: [buildAuditEntry(tx, event, 'TRANSFER_UNVERIFIED', {
@@ -30,8 +30,8 @@ function decodeEvent({ tx, event }) {
         from_key_index: 1,
         to_key_index: 2,
         token_address: tokenAddress,
-        verification_gate: 'known_erc20_cache',
-        verification_source: 'known_erc20_cache_miss',
+        verification_gate: 'trusted_token_lookup',
+        verification_source: 'trusted_token_lookup_miss',
       }, 'UNKNOWN')],
       transfers: [],
     };
@@ -43,11 +43,12 @@ function decodeEvent({ tx, event }) {
     from_key_index: 1,
     to_key_index: 2,
     amount_encoding: 'u256',
-    token_decimals: verifiedToken.decimals,
-    token_name: verifiedToken.name,
-    token_symbol: verifiedToken.symbol,
-    verification_gate: 'known_erc20_cache',
-    verification_source: verifiedToken.verificationSource,
+    token_decimals: trustedToken.decimals,
+    token_name: trustedToken.name,
+    token_symbol: trustedToken.symbol,
+    verification_gate: trustedToken.verificationGate,
+    verification_level: trustedToken.verificationLevel,
+    verification_source: trustedToken.verificationSource,
   });
 
   return {

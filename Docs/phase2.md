@@ -77,7 +77,7 @@ The current Phase 2 flow is:
 6. if a route is found, the correct decoder runs
 7. if no route is found, the event is audited as `UNKNOWN`
 8. normalized actions go to `stark_action_norm`
-9. verified token transfers go to `stark_transfers`
+9. trusted token transfers go to `stark_transfers`
 10. bridge activity goes to `stark_bridge_activities`
 11. unknown or suspicious cases go to `stark_unknown_event_audit`
 
@@ -322,11 +322,15 @@ This file still handles standard `Transfer` events.
 
 But it does not blindly trust any contract that emits `Transfer`.
 
-It only promotes a transfer when the token exists in the verified ERC-20 cache.
+It promotes a transfer when the token passes the trust gate.
 
-If not, it goes to audit as `TRANSFER_UNVERIFIED`.
+The trust gate is:
+- first check the static `known_erc20_cache`
+- if that misses, check `stark_token_metadata`
 
-That protects holder data from polluted transfer events.
+If the token still cannot be trusted, it goes to audit as `TRANSFER_UNVERIFIED`.
+
+That protects holder data from polluted transfer events, but it also lets us accept tokens that were discovered later by the metadata refresher instead of hard-blocking everything outside the static bridge-token list.
 
 ## 6. How Matching Works Now
 
