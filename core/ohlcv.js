@@ -643,7 +643,7 @@ async function rebuildCandleForBucket(client, { bucketStart, lane, poolId }) {
     lane,
     lowScaled,
     metadata: {
-      vwap_price_source: 'normalized_execution_price',
+      vwap_price_source: 'amount_usd_over_total_volume',
       volume_source: 'canonical_amount_deltas',
       pending_enrichment: pendingEnrichment,
       source: 'trades',
@@ -670,7 +670,11 @@ async function rebuildCandleForBucket(client, { bucketStart, lane, poolId }) {
     volume1,
     volume1UsdScaled,
     volumeUsdScaled,
-    vwapScaled: weightedPriceDenominator === 0n ? prices[prices.length - 1] : scaledDivide(weightedPriceNumerator, weightedPriceDenominator, DEFAULT_SCALE),
+    vwapScaled: computeExactRebuildVwapScaled({
+      fallbackVwapScaled: weightedPriceDenominator === 0n ? prices[prices.length - 1] : scaledDivide(weightedPriceNumerator, weightedPriceDenominator, DEFAULT_SCALE),
+      volume0,
+      volumeUsdScaled,
+    }),
   };
 }
 
@@ -771,7 +775,7 @@ async function rebuildPendingRange(client, { fromBucketStart, lane, poolId, toBu
           cache_mode: 'pending_enrichment_rebuild',
           pending_enrichment: tradeAggregate.pendingEnrichment,
           source: 'trades',
-          vwap_price_source: 'normalized_execution_price',
+          vwap_price_source: 'amount_usd_over_total_volume',
         },
         openScaled: tradeAggregate.openScaled,
         pendingEnrichment: tradeAggregate.pendingEnrichment,
@@ -795,7 +799,11 @@ async function rebuildPendingRange(client, { fromBucketStart, lane, poolId, toBu
         volume1: tradeAggregate.volume1,
         volume1UsdScaled: tradeAggregate.volume1UsdScaled,
         volumeUsdScaled: tradeAggregate.volumeUsdScaled,
-        vwapScaled: tradeAggregate.vwapScaled,
+        vwapScaled: computeExactRebuildVwapScaled({
+          fallbackVwapScaled: tradeAggregate.vwapScaled,
+          volume0: tradeAggregate.volume0,
+          volumeUsdScaled: tradeAggregate.volumeUsdScaled,
+        }),
       };
     } else if (previousCloseScaled !== null) {
       nextCandle = {
@@ -1114,6 +1122,14 @@ function combineVwap(existingCandle, tradeAggregate) {
   const leftWeighted = scaledMultiply(existingCandle.vwapScaled ?? existingCandle.closeScaled, leftWeight, DEFAULT_SCALE);
   const rightWeighted = scaledMultiply(tradeAggregate.vwapScaled, rightWeight, DEFAULT_SCALE);
   return scaledDivide(leftWeighted + rightWeighted, totalWeight, DEFAULT_SCALE);
+}
+
+function computeExactRebuildVwapScaled({ fallbackVwapScaled, volume0, volumeUsdScaled }) {
+  if (volume0 !== null && volume0 !== undefined && volume0 > 0n && volumeUsdScaled !== null && volumeUsdScaled !== undefined) {
+    return scaledDivide(volumeUsdScaled, volume0, DEFAULT_SCALE);
+  }
+
+  return fallbackVwapScaled;
 }
 
 function parseNonNegativeBigInt(value, fallbackValue) {

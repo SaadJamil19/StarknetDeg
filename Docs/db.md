@@ -292,7 +292,7 @@ This table stores 1-minute candles per pool.
 - `tick_spacing`: Tick spacing carried into the candle if the source trade had it.
 - `volume0_usd`: USD value of token0-side volume for the candle.
 - `volume1_usd`: USD value of token1-side volume for the candle.
-- `vwap`: Volume-weighted average price for the candle, calculated from the normalized execution price rather than the raw ratio so token-decimal mismatches do not distort the candle.
+- `vwap`: Volume-weighted average price for the candle, calculated from the normalized execution price rather than the raw ratio so token-decimal mismatches do not distort the candle. When a candle is fully rebuilt, VWAP is recomputed exactly from `sum(amount_usd) / total_volume` so the nightly rebuild stays mathematically correct.
 
 ## `stark_pool_latest`
 
@@ -614,8 +614,8 @@ This table stores canonical token transfer facts.
 - `metadata`: Extra transfer details such as symbol, decimals, and verification gate.
 - `created_at`: Time when this transfer row was inserted.
 - `updated_at`: Time when this row was last updated.
-- `amount_human`: Human-readable amount after applying token decimals.
-- `amount_usd`: USD value of the transfer when the token can be safely priced.
+- `amount_human`: Human-readable amount after applying token decimals. Stored as high-precision `NUMERIC(78,30)` so dust transfers do not collapse into scientific notation or lose fractional detail.
+- `amount_usd`: USD value of the transfer when the token can be safely priced. Stored with the same high-precision `NUMERIC(78,30)` handling as `amount_human`.
 - `token_symbol`: Token symbol copied into the transfer row for later analytics and APIs.
 - `token_name`: Token name copied into the transfer row for later analytics and APIs.
 - `token_decimals`: Decimals value used to derive `amount_human`.
@@ -669,6 +669,21 @@ This table stores events we intentionally did not trust or could not decode.
 - `reason`: Reason why the event was audited instead of promoted.
 - `metadata`: Extra context explaining the audit reason.
 - `created_at`: Time when the audit row was inserted.
+
+## `view_unidentified_protocols`
+
+This internal view counts unknown locker warnings so the team can see which protocol lockers still need registry coverage.
+
+- `locker_identifier`: Stable grouping key for the unidentified locker, using the router label when available.
+- `router_protocol`: The unknown locker label stored on the trade row, usually `unknown_locker_[HEX]`.
+- `locker_address`: Raw locker address if the decoder captured one.
+- `execution_protocol`: Execution venue tied to the unknown locker event.
+- `protocol`: Protocol family that produced the trade row.
+- `occurrence_count`: Number of times this unknown locker appeared.
+- `first_seen_block_number`: First block where this locker was seen.
+- `last_seen_block_number`: Latest block where this locker was seen.
+- `first_seen_at`: First time this locker was recorded.
+- `last_seen_at`: Latest time this locker was recorded.
 
 ## `stark_wallet_bridge_flows`
 

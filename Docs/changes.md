@@ -116,3 +116,11 @@ This file lists the report-driven schema enhancement and bug-fix changes in simp
 - Candle VWAP uses the normalized execution price, not the raw ratio, so mixed-decimal pools do not distort the weighted average.
 - Fixed another subtle VWAP bug in the incremental path: existing candles were loading `close` into `vwapScaled` instead of loading the stored `vwap`.
 - After the fix, incremental appends continue weighting from the real existing VWAP instead of drifting toward the last close.
+- Added a final metadata hard-lock for reorg safety.
+- The metadata refresher now only enriches tokens whose source blocks are deep enough to be considered finalized, so orphaned blocks cannot reintroduce token rows too early.
+- Tightened transfer precision for dust-sized values.
+- `amount_human` and `amount_usd` are now treated as high-precision numeric values so tiny 18-decimal transfers keep their fractional detail instead of turning into scientific notation.
+- Added protocol-locker telemetry for unknown lockers.
+- `view_unidentified_protocols` now counts `unknown_locker_[HEX]` rows so the team can see which lockers need registry coverage next.
+- Finalized the rebuild VWAP rule.
+- Full candle rebuilds now compute VWAP from `sum(amount_usd) / total_volume`, which gives the exact nightly truth instead of inheriting any incremental drift.

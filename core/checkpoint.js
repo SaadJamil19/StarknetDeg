@@ -45,6 +45,9 @@ const PHASE6_TABLES = Object.freeze([
 const SCHEMA_ENHANCEMENT_TABLES = Object.freeze([
   'tokens',
 ]);
+const SCHEMA_ENHANCEMENT_VIEWS = Object.freeze([
+  'view_unidentified_protocols',
+]);
 const SCHEMA_ENHANCEMENT_COLUMNS = Object.freeze([
   { table: 'stark_trades', column: 'route_group_key' },
   { table: 'stark_trades', column: 'locker_address' },
@@ -81,6 +84,10 @@ async function assertSchemaEnhancementTables(client) {
   await assertColumnsExist(client, SCHEMA_ENHANCEMENT_COLUMNS, 'Schema enhancement', 'sql/007_schema_enhancements.sql');
 }
 
+async function assertSchemaEnhancementViews(client) {
+  await assertViewsExist(client, SCHEMA_ENHANCEMENT_VIEWS, 'Schema enhancement', 'sql/008_preproduction_hardening.sql');
+}
+
 async function assertTablesExist(client, tableNames, label, migrationFile) {
   const result = await client.query(
     `SELECT table_name, to_regclass('public.' || table_name) AS regclass
@@ -115,6 +122,22 @@ async function assertColumnsExist(client, expectedColumns, label, migrationFile)
 
   if (missing.length > 0) {
     throw new Error(`${label} columns are missing. Run ${migrationFile} first. Missing: ${missing.join(', ')}`);
+  }
+}
+
+async function assertViewsExist(client, viewNames, label, migrationFile) {
+  const result = await client.query(
+    `SELECT view_name, to_regclass('public.' || view_name) AS regclass
+       FROM unnest($1::text[]) AS view_name`,
+    [viewNames],
+  );
+
+  const missing = result.rows
+    .filter((row) => row.regclass === null)
+    .map((row) => row.view_name);
+
+  if (missing.length > 0) {
+    throw new Error(`${label} views are missing. Run ${migrationFile} first. Missing: ${missing.join(', ')}`);
   }
 }
 
@@ -201,6 +224,7 @@ module.exports = {
   assertPhase4Tables,
   assertPhase6Tables,
   assertSchemaEnhancementTables,
+  assertSchemaEnhancementViews,
   advanceCheckpoint,
   ensureIndexStateRows,
   getCheckpoint,

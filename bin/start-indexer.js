@@ -13,6 +13,7 @@ const {
   assertPhase3Tables,
   assertPhase4Tables,
   assertSchemaEnhancementTables,
+  assertSchemaEnhancementViews,
   ensureIndexStateRows,
   getCheckpoint,
 } = require('../core/checkpoint');
@@ -45,6 +46,7 @@ async function main() {
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
     await assertSchemaEnhancementTables(client);
+    await assertSchemaEnhancementViews(client);
     await syncRegistryToDatabase(client);
     await seedKnownTokens(client);
     await ensureIndexStateRows(client, indexerKey);

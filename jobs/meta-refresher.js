@@ -79,10 +79,12 @@ async function refreshTokenMetadata({ batchSize, rpcClient }) {
   return withClient(async (client) => {
     const refreshedAtBlock = await safeGetLatestBlockNumber(rpcClient);
     const metadataTtlBlocks = parseOptionalBigInt(process.env.PHASE4_METADATA_TTL_BLOCKS, 10_000n);
+    const metadataFinalityDepthBlocks = parsePositiveInteger(process.env.PHASE4_METADATA_FINALITY_DEPTH_BLOCKS, 5);
     const candidates = await loadRefreshCandidates(client, {
       currentBlock: refreshedAtBlock,
       limit: batchSize,
       metadataTtlBlocks,
+      metadataFinalityDepthBlocks: BigInt(metadataFinalityDepthBlocks),
     });
 
     let refreshed = 0;
@@ -109,6 +111,7 @@ async function refreshTokenMetadata({ batchSize, rpcClient }) {
       });
       await syncTokenRegistryFromMetadata(client, {
         ...metadata,
+        verifiedAtBlock: candidate.latestSourceBlockNumber,
         refreshedAtBlock,
         registryMetadata: metadata.metadata ?? {},
         source: 'meta_refresher',
@@ -136,28 +139,51 @@ async function refreshTokenMetadata({ batchSize, rpcClient }) {
   });
 }
 
-async function loadRefreshCandidates(client, { currentBlock, limit, metadataTtlBlocks }) {
+async function loadRefreshCandidates(client, { currentBlock, limit, metadataTtlBlocks, metadataFinalityDepthBlocks }) {
+  if (currentBlock === null || currentBlock === undefined) {
+    return [];
+  }
+
+  const finalizedCutoff = currentBlock > metadataFinalityDepthBlocks
+    ? currentBlock - metadataFinalityDepthBlocks
+    : 0n;
   const result = await client.query(
-    `SELECT DISTINCT tokens.token_address,
+    `WITH token_sources AS (
+         SELECT token_address, block_number
+           FROM stark_transfers
+         UNION ALL
+         SELECT token_address, block_number
+           FROM stark_bridge_activities
+          WHERE token_address IS NOT NULL
+         UNION ALL
+         SELECT token_address, block_number
+           FROM stark_prices
+         UNION ALL
+         SELECT token0_address AS token_address, block_number
+           FROM stark_trades
+         UNION ALL
+         SELECT token1_address AS token_address, block_number
+           FROM stark_trades
+     ),
+     latest_sources AS (
+         SELECT token_address,
+                MAX(block_number) AS latest_source_block_number
+           FROM token_sources
+          WHERE token_address IS NOT NULL
+          GROUP BY token_address
+     )
+     SELECT latest_sources.token_address,
+            latest_sources.latest_source_block_number,
             metadata.name,
             metadata.symbol,
             metadata.decimals,
             metadata.last_refreshed_block
-       FROM (
-             SELECT token_address FROM stark_transfers
-             UNION
-             SELECT token_address FROM stark_bridge_activities WHERE token_address IS NOT NULL
-             UNION
-             SELECT token_address FROM stark_prices
-             UNION
-             SELECT token0_address AS token_address FROM stark_trades
-             UNION
-             SELECT token1_address AS token_address FROM stark_trades
-       ) AS tokens
+       FROM latest_sources
        LEFT JOIN stark_token_metadata AS metadata
-              ON metadata.token_address = tokens.token_address
-      WHERE tokens.token_address IS NOT NULL
-      ORDER BY tokens.token_address`,
+              ON metadata.token_address = latest_sources.token_address
+      WHERE latest_sources.latest_source_block_number <= $1
+      ORDER BY latest_sources.token_address`,
+    [toNumericString(finalizedCutoff, 'metadata finality cutoff')],
   );
 
   const candidates = [];
@@ -171,6 +197,9 @@ async function loadRefreshCandidates(client, { currentBlock, limit, metadataTtlB
     candidates.push({
       refreshReason,
       tokenAddress: row.token_address,
+      latestSourceBlockNumber: row.latest_source_block_number === null
+        ? null
+        : toBigIntStrict(row.latest_source_block_number, 'token latest source block'),
     });
   }
 

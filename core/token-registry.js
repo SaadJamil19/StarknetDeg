@@ -65,7 +65,11 @@ async function syncTokenRegistryFromMetadata(client, metadata) {
     symbol: metadata.symbol ?? null,
     tokenType: metadata.tokenType ?? 'ERC20',
     verificationSource: metadata.source ?? 'stark_token_metadata',
-    verifiedAtBlock: metadata.refreshedAtBlock ?? metadata.lastRefreshedBlock ?? null,
+    verifiedAtBlock: metadata.verifiedAtBlock
+      ?? metadata.latestSourceBlockNumber
+      ?? metadata.refreshedAtBlock
+      ?? metadata.lastRefreshedBlock
+      ?? null,
   });
 }
 
@@ -263,7 +267,7 @@ async function upsertTokenRegistryRow(client, token) {
          created_at,
          updated_at
      ) VALUES (
-         $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, NOW(), NOW()
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW(), NOW()
      )
      ON CONFLICT (address)
      DO UPDATE SET
@@ -280,7 +284,7 @@ async function upsertTokenRegistryRow(client, token) {
          verification_source = COALESCE(EXCLUDED.verification_source, tokens.verification_source),
          metadata = COALESCE(EXCLUDED.metadata, tokens.metadata),
          updated_at = NOW()`,
-    [
+     [
       normalizedAddress,
       token.symbol ?? null,
       token.name ?? null,
