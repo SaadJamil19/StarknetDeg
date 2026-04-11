@@ -39,6 +39,17 @@ It now has:
 - one generic AMM decoder for repeated pair/pool patterns
 - protocol-specific decoders only where the event model is truly different
 
+The latest enhancement pass added one more layer on top of that:
+
+- one central token registry in the database
+- explicit Ekubo locker capture
+- better AVNU route context so later phases can group hops safely
+- richer transfer rows so later jobs do not have to rediscover token facts again
+
+So Phase 2 is no longer only "decode the event".
+
+It is also responsible for carrying forward the pieces that later phases need for correctness.
+
 ## 3. The Big Design Decision
 
 ### 3.1 Why A Registry Was Necessary
@@ -118,6 +129,30 @@ It also stores a selector-to-handler map for each protocol.
 That means the registry does not only say:
 
 - "this address belongs to AVNU"
+- "this selector on that AVNU contract means swap"
+
+### 5.1.1 `core/token-registry.js`
+
+This is the new shared token-truth layer.
+
+Before this file existed, token knowledge was split across:
+
+- static JSON allowlists
+- `stark_token_metadata`
+- local stable-token checks inside pricing code
+
+That caused a real integrity problem:
+
+- a token could be considered "known" in one part of the pipeline and "unknown" in another
+
+This file fixes that by making the `tokens` table the shared registry for:
+
+- stable-token identification
+- verified-token trust
+- token symbol and decimals lookups
+- metadata sync from Phase 4
+
+That matters directly for Phase 2 because transfer promotion now uses the same token truth as later pricing and analytics.
 
 It also says:
 
@@ -183,6 +218,20 @@ That means it understands things like:
 - underlying pool swaps inside the same transaction are route legs
 
 This is how we stop double counting AVNU.
+
+The newer version of this file does two extra things that matter a lot.
+
+First, it now tracks AVNU swap actions separately instead of treating every swap-like action inside the transaction as one generic bucket.
+
+That means:
+
+- only AVNU actions become multi-hop candidates
+- route metadata is attached more carefully
+- underlying venue swaps can still exist without automatically being counted as user-facing route hops
+
+Second, it now tries to infer `router_protocol` from Ekubo locker addresses when possible.
+
+That matters because the core Ekubo contract tells us where execution happened, but the locker can tell us who routed the flow into Ekubo.
 
 ### 5.4 `core/protocols/base-amm.js`
 
@@ -288,10 +337,20 @@ The important refinement here is:
 
 - trader attribution now prefers `transaction.sender_address`
 - the raw `locker` is still stored in metadata
+- `locker_address`, `fee_tier`, `tick_spacing`, and `extension_address` are also carried forward in clearer fields
 
 That fixes one of the biggest Starknet mistakes people make:
 
 using the router or executor address as the trader.
+
+The locker field is especially important now.
+
+Without it:
+
+- we would know Ekubo executed the swap
+- but we would not know which router or locker actually delivered the flow
+
+That was one of the key attribution gaps identified in the verification report.
 
 ### 5.10 `data/registry/contracts.json`
 
@@ -331,6 +390,19 @@ The trust gate is:
 If the token still cannot be trusted, it goes to audit as `TRANSFER_UNVERIFIED`.
 
 That protects holder data from polluted transfer events, but it also lets us accept tokens that were discovered later by the metadata refresher instead of hard-blocking everything outside the static bridge-token list.
+
+This decoder now also writes richer transfer facts.
+
+It can carry forward:
+
+- human-readable amount
+- USD amount for stable tokens
+- token symbol
+- token name
+- token decimals
+- transfer type
+
+That means Phase 6 does not have to keep rebuilding those basic facts from scratch for every holder or bridge query.
 
 ## 6. How Matching Works Now
 
@@ -405,6 +477,17 @@ This gives us the best of both worlds:
 - no volume double count
 - no loss of venue-level state changes
 
+The enhancement pass prepares more explicit route fields for Phase 3:
+
+- `is_multi_hop`
+- `hop_index`
+- `total_hops`
+- `route_group_key`
+
+Those fields are important because one AVNU route can contain several legs but still represent one user intent.
+
+If we failed to carry that structure forward, later volume and price logic would keep inflating activity.
+
 ## 9. What Still Goes To `UNKNOWN`
 
 The new DEX coverage reduces `UNKNOWN`, but it does not make `UNKNOWN` disappear completely.
@@ -450,6 +533,12 @@ Now:
 - fewer supported DEX events should fall into `stark_unknown_event_audit`
 - transfer promotion is still strict
 - AVNU route legs are marked in metadata
+
+The later schema-enhancement pass also added:
+
+- a central `tokens` table for shared token truth
+- richer trade columns for locker, routing, and price-quality fields
+- richer transfer columns for human amount and token identity fields
 
 ## 11. What This Unlocks For Phase 3
 

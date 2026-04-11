@@ -284,6 +284,15 @@ This table stores 1-minute candles per pool.
 - `created_at`: Time when the candle row was inserted.
 - `updated_at`: Time when the candle row was last updated.
 - `pending_enrichment`: Flag showing that the candle needs recalculation after metadata or prices improve.
+- `tick_open`: Opening tick value for the minute when the protocol exposes ticks.
+- `tick_close`: Closing tick value for the minute when the protocol exposes ticks.
+- `sqrt_ratio_open`: Opening sqrt-ratio value for the candle window.
+- `sqrt_ratio_close`: Closing sqrt-ratio value for the candle window.
+- `fee_tier_bps`: Fee tier carried into the candle if the source trade had it.
+- `tick_spacing`: Tick spacing carried into the candle if the source trade had it.
+- `volume0_usd`: USD value of token0-side volume for the candle.
+- `volume1_usd`: USD value of token1-side volume for the candle.
+- `vwap`: Volume-weighted average price for the candle, calculated from the normalized execution price rather than the raw ratio so token-decimal mismatches do not distort the candle.
 
 ## `stark_pool_latest`
 
@@ -312,6 +321,13 @@ This table stores the latest materialized state for each pool.
 - `metadata`: Extra pool snapshot details.
 - `created_at`: Time when this latest row was inserted.
 - `updated_at`: Time when this latest row was last updated.
+- `tick_after`: Latest known tick after the event that produced this snapshot.
+- `tick_spacing`: Tick spacing for the pool when known.
+- `fee_tier`: Pool fee tier when known.
+- `extension_address`: Extra extension or hook address if the pool model uses one.
+- `locker_address`: Locker or router-like address that delivered the flow into the pool when known.
+- `amount0_delta`: Signed token0 delta associated with this snapshot when it came from a swap-style event.
+- `amount1_delta`: Signed token1 delta associated with this snapshot when it came from a swap-style event.
 
 ## `stark_pool_state`
 
@@ -369,6 +385,13 @@ This is the append-only history table for pool state changes.
 - `metadata`: Extra details for this state change.
 - `created_at`: Time when this row was inserted.
 - `updated_at`: Time when this row was last updated.
+- `tick_after`: Tick value after the pool event when the protocol exposes one.
+- `tick_spacing`: Tick spacing for the pool when known.
+- `fee_tier`: Pool fee tier when known.
+- `extension_address`: Extra extension or hook address for pool models that support it.
+- `locker_address`: Locker or router-like address tied to the pool event when known.
+- `amount0_delta`: Signed token0 delta tied to the state change if it came from a swap-style event.
+- `amount1_delta`: Signed token1 delta tied to the state change if it came from a swap-style event.
 
 ## `stark_price_ticks`
 
@@ -394,6 +417,13 @@ This table stores high-frequency token price updates.
 - `updated_at`: Time when this row was last updated.
 - `price_is_stale`: Flag showing whether the price source is stale.
 - `price_updated_at_block`: Block where the underlying price source was last refreshed.
+- `hops_from_stable`: Number of intermediate bridge assets on the shortest cycle-free path between this token and the stable anchor used for pricing, so direct stable is `0`, one bridge is `1`, and two bridges are `2`.
+- `is_aggregator_derived`: Flag showing whether this price came from an aggregator-derived trade rather than a direct venue observation.
+- `sell_amount_raw`: Raw sold-side amount that backed this price observation.
+- `buy_amount_raw`: Raw bought-side amount that backed this price observation.
+- `price_raw_execution`: Raw execution price before later normalization or smoothing.
+- `price_deviation_pct`: Deviation percentage between raw execution price and final stored price.
+- `low_confidence`: Flag showing that this price observation is too many bridge hops away from a stable anchor to be treated as strong price truth.
 
 ## `stark_prices`
 
@@ -417,6 +447,14 @@ This table stores the latest price per token.
 - `updated_at`: Time when the row was last updated.
 - `price_is_stale`: Flag showing whether the latest price is stale.
 - `price_updated_at_block`: Block where the price source was last refreshed.
+- `bucket_1m`: Minute bucket where the latest contributing observation belongs.
+- `hops_from_stable`: Number of intermediate bridge assets on the shortest cycle-free path between this token and the stable anchor used for pricing, so direct stable is `0`, one bridge is `1`, and two bridges are `2`.
+- `is_aggregator_derived`: Flag showing whether the latest price came from an aggregator-derived observation.
+- `sell_amount_raw`: Raw sold-side amount that backed the latest price.
+- `buy_amount_raw`: Raw bought-side amount that backed the latest price.
+- `price_raw_execution`: Raw execution price before later normalization or smoothing.
+- `price_deviation_pct`: Deviation percentage between raw execution price and final stored price.
+- `low_confidence`: Flag showing that this latest price row is weak and should be treated carefully because the pricing path is too far from a stable anchor.
 
 ## `stark_reconciliation_log`
 
@@ -476,6 +514,32 @@ This table stores token metadata and token-level enrichment.
 - `created_at`: Time when this token metadata row was inserted.
 - `updated_at`: Time when this row was last updated.
 
+## `tokens`
+
+This is the shared token registry table used by transfer trust, pricing, and enrichment.
+
+- `address`: Token contract address used as the primary key.
+- `symbol`: Shared token symbol that the rest of the pipeline can reuse.
+- `name`: Shared token name that the rest of the pipeline can reuse.
+- `decimals`: Canonical decimals value used by pricing and transfer normalization.
+- `token_type`: Internal token classification such as `erc20` or another registry label.
+- `is_stable`: Flag showing whether this token should be treated as a stable anchor for price logic.
+- `is_verified`: Flag showing whether this token is trusted enough for shared pipeline use.
+- `verified_at_block`: Block number when this token row was last verified from live indexed metadata instead of only seed truth.
+- `verification_source`: Source that most recently verified this token row, such as the metadata refresher or the static seed registry.
+- `coingecko_id`: Optional external market-data identifier for enrichment or UI mapping.
+- `logo_url`: Optional logo URL for downstream display layers.
+- `deploy_tx_hash`: Transaction hash that deployed the token contract when known.
+- `deployed_at`: Deployment timestamp when known.
+- `metadata`: Extra token-registry details, including sync notes from enrichment jobs.
+- `created_at`: Time when this token-registry row was inserted.
+- `updated_at`: Time when this token-registry row was last updated.
+
+Important strategy:
+- `UNIQUE(address)` alone is not enough for reorg safety.
+- `verified_at_block` is used so token rows learned during orphaned blocks can be reverted or re-verified later.
+- During reconciliation, metadata rows refreshed in the orphaned window are deleted and affected token-registry rows are either removed or reset back to safe seed truth.
+
 ## `stark_trades`
 
 This table stores normalized DEX trades.
@@ -489,7 +553,7 @@ This table stores normalized DEX trades.
 - `transaction_index`: Position of the transaction inside the block.
 - `source_event_index`: Event index that produced the trade.
 - `protocol`: Protocol that emitted the trade action.
-- `router_protocol`: Router or aggregator used for the trade, if any.
+- `router_protocol`: Human-readable router or aggregator name used for the trade when we can resolve the locker, such as `AVNU`, `Haiko`, or `Fibrous`. If the locker is not mapped yet, this becomes `unknown_locker_[HEX]` so attribution loss is visible instead of silent.
 - `execution_protocol`: Actual venue that executed the trade.
 - `pool_id`: Canonical pool id for the trade.
 - `trader_address`: Wallet we attribute the trade to.
@@ -515,6 +579,21 @@ This table stores normalized DEX trades.
 - `created_at`: Time when this trade row was inserted.
 - `updated_at`: Time when this trade row was last updated.
 - `pending_enrichment`: Flag showing whether this trade needs recalculation after metadata improves.
+- `locker_address`: Locker or router-like address that delivered the flow into the execution venue when known.
+- `liquidity_after`: Liquidity value after the trade when the protocol reports it.
+- `sqrt_ratio_after`: Sqrt-ratio after the trade when the protocol reports it, stored in high-precision numeric form so it can be reconstructed without float loss.
+- `tick_after`: Tick value after the trade when the protocol reports it.
+- `tick_spacing`: Tick spacing for the pool when known.
+- `fee_tier`: Fee tier for the pool when known.
+- `extension_address`: Extra extension or hook address for protocols that expose one.
+- `is_multi_hop`: Flag showing whether this trade belongs to a grouped multi-hop route.
+- `hop_index`: Position of this trade inside a grouped route when route grouping applies.
+- `total_hops`: Total number of hops inside the grouped route when known.
+- `route_group_key`: Shared key used to tie multiple route hops back to one route group.
+- `price_raw_execution`: Raw execution price captured before the stability filter and later normalization layers.
+- `price_deviation_pct`: Deviation percentage between raw execution price and final stored price.
+- `hops_from_stable`: Number of intermediate bridge assets on the shortest cycle-free path between this trade and the stable anchor used for valuation, so direct stable is `0`, one bridge is `1`, and two bridges are `2`.
+- `is_aggregator_derived`: Flag showing whether the trade row came from an aggregator-derived route summary.
 
 ## `stark_transfers`
 
@@ -535,6 +614,14 @@ This table stores canonical token transfer facts.
 - `metadata`: Extra transfer details such as symbol, decimals, and verification gate.
 - `created_at`: Time when this transfer row was inserted.
 - `updated_at`: Time when this row was last updated.
+- `amount_human`: Human-readable amount after applying token decimals.
+- `amount_usd`: USD value of the transfer when the token can be safely priced.
+- `token_symbol`: Token symbol copied into the transfer row for later analytics and APIs.
+- `token_name`: Token name copied into the transfer row for later analytics and APIs.
+- `token_decimals`: Decimals value used to derive `amount_human`.
+- `transfer_type`: Internal classification such as `standard_transfer`.
+- `is_internal`: Flag showing whether the transfer is considered internal movement rather than external flow.
+- `counterparty_type`: Lightweight counterparty label used by later analytics.
 
 ## `stark_tx_raw`
 

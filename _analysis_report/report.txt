@@ -1,0 +1,233 @@
+  DEGENTER INDEXER
+Starknet Database Schema
+Verification Report & Field Enhancement Specification
+BeencoLabs  |  April 2026
+1. Executive Summary
+This document presents a comprehensive on-chain verification of the Degenter Starknet DEX indexer database schema. Each table has been verified by cross-referencing raw Starknet blockchain event data against indexed records. Additionally, missing fields have been identified, analysed, and prioritised with detailed justifications.
+Tables verified in this report:
+trades — DEX swap trade records (Ekubo / AVNU)
+price_ticks — Per-event price snapshots
+prices — Token price registry
+pool_latest — Real-time pool state snapshots
+ohlcv_1m — 1-minute OHLCV candlestick data
+token_metadata — Token information registry
+stark_transfers — ERC-20 token transfer records
+stark_token_concentration — Token holder concentration (currently empty)
+stark_message_l2_to_l1 — L2 to L1 cross-chain messages (currently empty)
+Priority classification used throughout this document:
+2. trades Table
+2.1 Verification Status
+  FULLY VERIFIED — All fields match raw on-chain Ekubo Swapped event exactly
+Trade:0 from transaction 0x023e2dff... was verified against raw Ekubo Swapped event data. Pool key components (token0 ETH, token1 USDC, fee, tick_spacing=5982, extension=0x0), swap amounts, token direction, price derivation, and notional USD were all confirmed correct.
+2.2 Current Fields (Existing Schema)
+The following fields are currently present and verified correct:
+trade_key — Composite primary key (tx_hash:event_index). Correct format.
+lane — ACCEPTED_ON_L2. Correct Starknet finality status.
+block_number, block_hash, block_timestamp — Correct block context.
+transaction_hash, transaction_index, source_event_index — Correct event pointers.
+protocol, router_protocol, execution_protocol — Protocol attribution.
+pool_id — Full pool identifier string (token0:token1:fee:tick_spacing:extension).
+trader_address — Wallet that initiated the swap.
+token0_address, token1_address — Pool token pair.
+token_in_address, token_out_address — Directional token identification.
+amount0_delta, amount1_delta — Raw signed pool deltas. Verified against on-chain mag+sign values.
+volume_token0, volume_token1 — Absolute volume (unsigned).
+amount_in, amount_out — User-facing amounts (direction-correct).
+price_raw_token1_per_token0, price_raw_token0_per_token1 — Raw ratio prices.
+price_token1_per_token0, price_token0_per_token1 — Decimal-normalised prices.
+price_is_decimals_normalized — Boolean flag. Verified true for ETH/USDC pair.
+price_source — ekubo_reported_ratio. Verified against sqrt_ratio_after derivation.
+notional_usd — Correct: amount1_delta (USDC) / 1e6 = 24.134045.
+bucket_1m — 1-minute time bucket. Present and correct.
+metadata — JSONB with enrichment context, price path, pending flags.
+created_at, updated_at — Timestamps. Correct.
+pending_enrichment — Boolean flag. Correctly false after enrichment.
+2.3 Missing Fields — Detailed Analysis
+3. price_ticks Table
+3.1 Verification Status
+  PARTIALLY VERIFIED — Ekubo-sourced ticks correct. AVNU multi-hop ticks show contamination bugs.
+14 price_ticks from transaction 0x00ce1f54... were verified. Ekubo-direct ticks (event indices 4, 33, 40, 44) are correct. AVNU aggregator ticks (event indices 10, 52) show price contamination from multi-hop intermediate amounts — price_usd values of 984 billion and 1000 trillion are clearly erroneous.
+3.2 Current Fields (Existing Schema)
+tick_key — Composite primary key. Correct format.
+lane, block_number, block_hash, block_timestamp — Correct block context.
+transaction_hash, transaction_index, source_event_index — Correct event pointers.
+token_address — Token being priced. Correct.
+source_pool_id — Pool used to derive the price.
+quote_token_address — Token used as price denominator.
+price_quote — Price in quote token units. Verified for Ekubo ticks. Bug in AVNU multi-hop ticks.
+price_usd — USD equivalent. Correct for Ekubo and stable-seeded ticks. Bug in AVNU multi-hop.
+price_source — stable_direct_current_trade / stable_seed. Correct classification.
+price_is_stale — Boolean. Correct.
+price_updated_at_block — Last block where price was updated. Present.
+bucket_1m — 1-minute time bucket. Present.
+metadata — JSONB with path_source, price_source, execution_protocol.
+created_at, updated_at — Timestamps. Correct.
+3.3 Missing Fields — Detailed Analysis
+4. prices Table
+4.1 Verification Status
+  VERIFIED WITH ONE SYSTEMATIC CAVEAT — ~0.23% price deviation from raw on-chain amounts detected across all AVNU-derived rows.
+Transaction 0x0201a9... AVNU swap: STRK sold (0x346f9790ef131c00 = 3.7698 STRK), USDT received (0x01fad7 = 129,751 = 0.129751 USDT). Derived execution price = 0.034418 USDT/STRK. Indexer stores 0.034340 — a systematic 0.23% offset consistent across both rows, indicating a computation path difference in the enrichment pipeline rather than a random error.
+4.2 Current Fields (Existing Schema)
+lane — ACCEPTED_ON_L2. Correct.
+token_address — Token being priced. Correct.
+block_number, block_hash, block_timestamp — Correct block context.
+transaction_hash, transaction_index, source_event_index — Correct.
+source_pool_id — Pool or aggregator route used. Correct.
+quote_token_address — Price denominator token. Correct.
+price_quote — Enriched price. ~0.23% systematic offset vs raw for AVNU rows.
+price_usd — USD equivalent. Logic correct (USDT row = $1 seed, STRK row = price_quote since USDT ~ $1).
+price_source — stable_direct_current_trade / stable_seed. Correct classification.
+price_is_stale — Boolean. Correct.
+price_updated_at_block — Correct.
+metadata — JSONB with pool_id, path_source, price_source, execution_protocol.
+created_at, updated_at — Timestamps. Correct.
+4.3 Missing Fields — Detailed Analysis
+NOTE: prices table does NOT have bucket_1m unlike trades and price_ticks. This is a significant omission.
+5. pool_latest Table
+5.1 Verification Status
+  FULLY VERIFIED — Row 2 (source_event_index 29) verified exactly against raw Ekubo Swapped event.
+Token pair (0x124aeb.../0x452810...), tick_spacing=354892 (0x56a4c), extension=0x43e4f09c..., fee=0x0 all confirmed correct. liquidity_after = 0x64d9417efb4f42048e8 = 29,765,269,452,296,053,344,488 matches indexer exactly. sqrt_ratio_after = 0x36f2bbeecd16de0ae3105cd7753b883c = 73,038,659,342,521,518,627,787,165,021,708,716,092 matches indexer exactly. Price derived from Q128.128 sqrt_ratio confirmed correct.
+IMPORTANT BUG: price_is_decimals_normalized is inconsistent — rows 1-3 have false, row 4 has true. Prices in rows 1-3 are NOT comparable to row 4 without decimal adjustment. This will cause silent errors in any cross-pool analytics.
+5.2 Current Fields (Existing Schema)
+lane, pool_id, protocol — Correct.
+token0_address, token1_address — Correct token pair.
+block_number, block_hash, block_timestamp — Correct.
+transaction_hash, transaction_index, source_event_index — Correct.
+reserve0, reserve1 — ALWAYS NULL. Ekubo does not emit reserves in events.
+liquidity — Verified exact match to raw liquidity_after field in event.
+sqrt_ratio — Verified exact match to raw sqrt_ratio_after field in event.
+price_token1_per_token0, price_token0_per_token1 — Derived from sqrt_ratio. Correct (tiny rounding from integer precision).
+price_is_decimals_normalized — INCONSISTENT across rows. Bug.
+tvl_usd — ALWAYS NULL. Schema field exists but never populated.
+snapshot_kind — swap. Correct.
+metadata — JSONB with protocol, snapshot_kind, receipt_context_id.
+created_at, updated_at — Correct.
+5.3 Missing Fields — Detailed Analysis
+6. ohlcv_1m Table
+6.1 Verification Status
+  MOSTLY VERIFIED — 4 of 5 rows correct. Row 1 (DAI/USDC) has real volume1 mismatch bug. Multi-trade candle (Row 5) correct.
+Verified against raw Ekubo Swapped event for DAI/USDC pool (tick_spacing=200). Pool key, fee, tokens all confirmed. Price derivation via Q128.128 sqrt_ratio formula confirmed: open/high/low/close = 1.000514 correct for DAI/USDC.
+BUG DETECTED — Row 1 (trade_count=1, cache_mode=incremental_new): volume1 = 11,978,828 but raw on-chain amount1 = 11,992,606. Difference of 13,778 USDC on a single-trade candle with no prior data is a real bug. Either wrong trade's volume was added or volume1 is populated from a different source than amount1_delta.
+Row 5 ETH/USDC aggregated candle (trade_count=5, previous_trade_count=3+2): high > close > open > low ordering valid. volume_usd = $603.52 reasonable for 5 ETH swaps. cache_mode=incremental_append correct.
+6.2 Current Fields (Existing Schema)
+candle_key — Composite PK (lane:token0:token1:fee:ts:bucket). Correct.
+lane — ACCEPTED_ON_L2. Same on every row — wasted storage.
+pool_id, protocol, token0_address, token1_address — Correct.
+bucket_start — 1-minute bucket start time. Correct.
+block_number, block_hash — From the last trade in bucket. Inconsistent semantics for multi-trade candles.
+transaction_hash, transaction_index, source_event_index — Only meaningful for single-trade candles. Meaningless for multi-trade.
+open, high, low, close — OHLC prices. Verified correct including decimal normalisation.
+price_is_decimals_normalized — Boolean. Correct (true for all verified rows).
+volume0, volume1 — Token volumes. volume1 BUG detected on Row 1.
+volume_usd — Combined USD volume. Reasonable but not per-token attributable.
+trade_count — Integer. Correct.
+seeded_from_previous_close — Boolean. Correct.
+metadata — JSONB with source, cache_mode, pending_enrichment, previous_trade_count, reconciliation_triggered.
+created_at, updated_at — Timestamps. Correct.
+pending_enrichment — Boolean. Correct.
+6.3 Missing Fields — Detailed Analysis
+7. token_metadata Table
+7.1 Verification Status
+  PIPELINE BUG — Table returned empty for tested signature. Token data exists in system (UI shows Cash token $1.00, 373 holders) but indexer fails to link it.
+Response: token_count=0, note='No related token addresses found from signature in trade/price/pool/ohlcv tables.' The pipeline only populates token_metadata when a token appears in a trade/price/pool event. Tokens not yet traded (or with all-failed enrichments) never appear. The table needs an independent seed process from a known token registry.
+UI fields verified from screenshot: Cash token, $1.00 price (stable), verified badge, Starknet TVL $313.94K, Cross-Chain Market Cap $311.46K, 373 holders, Token Supply 311.89K.
+7.2 Missing Fields — Detailed Analysis
+8. stark_transfers Table
+8.1 Verification Status
+  FULLY VERIFIED — All 6 rows match raw ERC-20 Transfer events exactly. Transfer flow reconstruction correct.
+Transaction 0x04ff327b... contains 6 NSTR (Nostra token) transfers forming a complete Nostra lending protocol interaction. source_event_index 25 verified: from=0x4270219d (Router), to=0x191e94b (Trader), value=0x010924008c3cee692f=19,105,396,121,530,165,551. All fields match exactly.
+Transfer flow reconstructed: Nostra Pool -> Ekubo Locker -> Router -> Trader -> Router -> Ekubo Locker -> Nostra Pool. Amount difference between outgoing and return leg: 164,962,139,912,495 NSTR = swap fee retained by pool. Correct behavior confirmed.
+8.2 Current Fields (Existing Schema)
+transfer_key — Composite PK (lane:tx_hash:event_index:transfer). Correct.
+lane, block_number, block_hash — Correct.
+transaction_hash, transaction_index, source_event_index — Correct.
+token_address — NSTR contract address. Correct.
+from_address, to_address — Correct. Verified against raw event.
+amount — Raw integer amount. Verified exact match.
+protocol — erc20. Correct.
+metadata — JSONB containing: selector, standard, token_name (Nostra), token_symbol (NSTR), token_decimals (18), amount_encoding (u256), verification_gate, verification_level (static_verified), verification_source.
+created_at, updated_at — Timestamps. Correct.
+8.3 Missing Fields — Detailed Analysis
+9. stark_token_concentration & stark_message_l2_to_l1
+9.1 stark_token_concentration
+  CURRENTLY EMPTY — Low priority for Degenter DEX analytics phase.
+This table tracks token holder distribution metrics: top-N holder percentages, whale counts, Gini coefficient, Herfindahl index. It is empty because the indexer processes Swap events, not Transfer events. Populating this table requires:
+Indexing all ERC-20 Transfer events for tracked tokens
+Maintaining a token_holders balance table (address, holder_address, balance_raw)
+Running periodic concentration computations (Gini, top-N percentages)
+Recommendation: Defer to Phase 3. For current DEX analytics use case, this data is available from CoinGecko / Starkscan API and can be cached rather than computed independently.
+If implemented, key fields to add: token_address, block_number, block_timestamp, holder_count, top1_pct, top10_pct, top100_pct, whale_count, whale_pct_combined, herfindahl_index, gini_coefficient, snapshot_kind.
+9.2 stark_message_l2_to_l1
+  CURRENTLY EMPTY — Only populated by bridge withdrawals and cross-chain governance.
+L2-to-L1 messages are emitted by Starknet contracts calling the send_message_to_l1 syscall. Primary use case is StarkGate bridge withdrawals. The table is empty because the indexer currently listens to DEX contract events (Ekubo, AVNU), not Starknet core contract events (address 0x1).
+To populate: listen to MessageSentToL1 events from contract 0x0000...0001 (Starknet core). Parse from_address (L2 sender), to_address (L1 recipient), payload array. For StarkGate bridge messages, decode payload[0]=l1_recipient, payload[1..2]=amount (uint256 low/high bits).
+Key fields to add: message_hash, from_address, to_address, payload (JSONB), status (SENT/CONSUMED/CANCELLED), consumed_at_block, consumed_at_tx, is_bridge_withdrawal, bridge_token_address, bridge_l1_recipient, bridge_amount_raw, bridge_amount_usd, bucket_1m.
+10. Recommended New Table: tokens
+A centralised token registry table is recommended as a foundation for all other tables. Multiple tables currently embed token information redundantly (symbol, decimals, name in stark_transfers metadata; decimals needed in trades, price_ticks, prices; verification status in multiple places).
+10.1 Recommended Schema
+CREATE TABLE public.tokens (
+  address              TEXT PRIMARY KEY,
+  symbol               TEXT NOT NULL,          -- ETH, USDC, STRK
+  name                 TEXT NOT NULL,          -- Ether, USD Coin
+  decimals             INTEGER NOT NULL,       -- 18, 6, 8
+  token_type           TEXT DEFAULT 'ERC20',
+  is_stable            BOOLEAN DEFAULT FALSE,  -- USDC/USDT/DAI
+  is_verified          BOOLEAN DEFAULT FALSE,
+  coingecko_id         TEXT,
+  logo_url             TEXT,
+  deploy_tx_hash       TEXT,
+  deployed_at          TIMESTAMPTZ,
+  metadata             JSONB,
+  created_at           TIMESTAMPTZ DEFAULT NOW(),
+  updated_at           TIMESTAMPTZ DEFAULT NOW()
+);
+10.2 Seed Data — Known Starknet Tokens
+INSERT INTO public.tokens (address, symbol, name, decimals, is_stable, is_verified) VALUES
+('0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7', 'ETH',  'Ether',          18, false, true),
+('0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8', 'USDC', 'USD Coin',        6,  true,  true),
+('0x068f5c6a61780768455de69077e07e89787839bf8166decfbf92b645209c0fb8', 'USDT', 'Tether USD',      6,  true,  true),
+('0x00da114221cb83fa859dbdb4c44beeaa0bb37c7537ad5ae66fe5e0efd20e6eb3', 'DAI',  'Dai Stablecoin',  18, true,  true),
+('0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d', 'STRK', 'Starknet Token',  18, false, true),
+('0x03fe2b97c1fd336e750087d68b9b867997fd64a2661ff3ca5a7c771641e8e7ac', 'WBTC', 'Wrapped Bitcoin',  8, false, true)
+ON CONFLICT (address) DO NOTHING;
+10.3 Readable View — trades_readable
+CREATE VIEW trades_readable AS
+SELECT t.*,
+  t_in.symbol      AS token_in_symbol,
+  t_in.decimals    AS token_in_decimals,
+  t_out.symbol     AS token_out_symbol,
+  t_out.decimals   AS token_out_decimals,
+  (t.amount_in::NUMERIC  / power(10, t_in.decimals))  AS amount_in_human,
+  (t.amount_out::NUMERIC / power(10, t_out.decimals)) AS amount_out_human
+FROM trades t
+LEFT JOIN tokens t_in  ON t_in.address  = t.token_in_address
+LEFT JOIN tokens t_out ON t_out.address = t.token_out_address;
+11. Master Summary — All Tables
+11.1 Verification Results
+11.2 Field Count Summary
+11.3 Implementation Roadmap
+Phase 1 — Critical (Immediate)
+Create tokens registry table and seed with known Starknet tokens
+trades: Add locker_address, liquidity_after, sqrt_ratio_after, tick_after, is_multi_hop, hop_index, total_hops
+price_ticks: Add hops_from_stable, is_aggregator_derived, sell/buy_amount_raw, price_raw_execution, price_deviation_pct
+prices: Add bucket_1m, sell/buy_amount_raw, price_raw_execution, price_deviation_pct
+pool_latest: Add tick_after, tick_spacing, fee_tier, extension_address, locker_address, amount0/1_delta. Drop reserve0/1 and tvl_usd (always NULL)
+ohlcv_1m: Add tick_open/close, sqrt_ratio_open/close, fee_tier_bps, tick_spacing, volume0/1_usd, vwap. Drop lane, block_hash, transaction_hash
+stark_transfers: Add amount_human, amount_usd, token_symbol/decimals/name (top-level), transfer_type, is_internal, counterparty_type
+Fix ohlcv_1m volume1 bug — investigate why single-trade candle shows 13,778 USDC discrepancy
+Fix AVNU multi-hop price contamination — implement hops_from_stable filter in price derivation pipeline
+Phase 2 — Medium (Next Sprint)
+trades: Add exact_input, fee_amount, price_impact_bps
+price_ticks: Add tick_spacing, fee_tier, price_confidence, price_updated_lag_blocks
+prices: Add taker_address, is_aggregator_derived, quote_token_is_stable, sell/buy_token_decimals
+pool_latest: Add token0/1_decimals, skip_ahead, volume_token0/1
+stark_transfers: Add block_timestamp, bucket_1m/1h/1d, verification_level, related_trade_key
+token_metadata: Add price_change_24h_pct, volume_24h_usd, is_verified, coingecko_id. Fix empty-table pipeline bug
+Phase 3 — Nice & Future
+Implement Transfer event indexing -> token_holders table -> stark_token_concentration
+Implement L2-to-L1 message indexing -> stark_message_l2_to_l1 for bridge withdrawal tracking
+trades: Add skip_ahead, swap_direction
+ohlcv_1m: Add liquidity_open/close, price_range_pct, is_single_trade, previous_close
+stark_transfers: Add selector, is_fee
+Degenter Indexer Schema Report  |  BeencoLabs  |  April 2026
+Verification based on live Starknet mainnet block data. All hex values cross-referenced against raw on-chain events.

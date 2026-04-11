@@ -1,7 +1,7 @@
 # StarknetDeg Master Roadmap
 
-Date: April 2, 2026  
-Scope: Updated end-to-end architecture and migration plan for building `StarknetDeg`, a Starknet-native DEX indexer that preserves Degenter's operating model while closing the remaining correctness gaps around receipt ordering, bridge flows, reorg-aware finality, and large-number precision.
+Date: April 10, 2026  
+Scope: Updated end-to-end architecture and migration plan for building `StarknetDeg`, a Starknet-native DEX indexer that preserves Degenter's operating model while also incorporating the schema-enhancement pass for token-registry centralization, AVNU route grouping, price-stability filtering, and richer trade/pool evidence.
 
 ## 0. Context and Inputs
 
@@ -254,7 +254,7 @@ StarknetDeg/
 |   |-- 004_metadata_and_security.sql
 |   |-- 005_realtime.sql
 |   |-- 006_analytics.sql
-|   `-- 007_bridge_messaging.sql
+|   `-- 007_schema_enhancements.sql
 |-- bin/
 |   |-- start-indexer.js
 |   |-- start-preconfirmed.js
@@ -271,6 +271,7 @@ StarknetDeg/
 |   |-- bridge.js
 |   |-- abi-registry.js
 |   |-- normalize.js
+|   |-- token-registry.js
 |   |-- trades.js
 |   |-- pool-state.js
 |   |-- prices.js
@@ -351,7 +352,7 @@ Why these additions matter:
 
 1. `core/event-sequencer.js` exists because Starknet receipts, especially Ekubo, are order-sensitive.
 2. `core/reconciliation.js` exists because `ACCEPTED_ON_L2` data must be rewindable until anchored on L1.
-3. `core/bridge.js`, `jobs/bridge-accounting.js`, and `sql/007_bridge_messaging.sql` exist because L1-L2 activity is part of wallet truth.
+3. `core/bridge.js` and `jobs/bridge-accounting.js` exist because L1-L2 activity is part of wallet truth.
 4. `lib/cairo/bigint.js` exists to ban accidental precision loss at the utility layer.
 5. `lib/registry/dex-registry.js` exists so DEX coverage grows by registry updates instead of router rewrites.
 
@@ -674,15 +675,19 @@ This is the StarknetDeg equivalent of Apibara invalidation plus DipDup rollback 
    - holder deltas and holder balances
 2. Partition write-heavy tables by block window or time bucket.
 3. Store enough lineage to enable bounded rollback and replay.
+4. Centralize token identity in one `tokens` table so transfer trust, pricing, and enrichment share one source of truth.
+5. Add route-aware and price-quality fields so AVNU multi-hop flows and unstable prices do not contaminate public analytics.
 
 ### Key files
 
 1. `sql/003_trading.sql`
-2. `core/trades.js`
-3. `core/pool-state.js`
-4. `core/prices.js`
-5. `core/ohlcv.js`
-6. `core/holders.js`
+2. `sql/007_schema_enhancements.sql`
+3. `core/trades.js`
+4. `core/pool-state.js`
+5. `core/prices.js`
+6. `core/ohlcv.js`
+7. `core/token-registry.js`
+8. `core/holders.js`
 
 ### Security and integrity guardrails
 
@@ -697,6 +702,7 @@ This is the StarknetDeg equivalent of Apibara invalidation plus DipDup rollback 
 4. Pool state updates are upserts scoped by pool identity and block lineage.
 5. Holder balances are derived from deltas, not written ad hoc by side jobs.
 6. Aggregator route legs are excluded from `stark_trades` while still being available for pool-state truth.
+7. Price tables and OHLCV only accept rows that pass the stability filter.
 
 ## Phase 4: Enrichment and Metadata
 
@@ -709,6 +715,7 @@ This is the StarknetDeg equivalent of Apibara invalidation plus DipDup rollback 
    - `totalSupply()`
 2. Refresh ABI mappings on class-hash changes.
 3. Add off-chain protocol metadata and security scoring.
+4. Sync verified token metadata into the shared `tokens` table.
 
 ### Key files
 
@@ -719,6 +726,7 @@ This is the StarknetDeg equivalent of Apibara invalidation plus DipDup rollback 
 5. `jobs/eth-price-feed.js`
 6. `data/registry/contracts.json`
 7. `tools/verify-abis.js`
+8. `core/token-registry.js`
 
 ### Security and integrity guardrails
 
@@ -726,6 +734,7 @@ This is the StarknetDeg equivalent of Apibara invalidation plus DipDup rollback 
 2. Security scoring is advisory only and never mutates canonical trade truth.
 3. ABI refresh is triggered by detected class replacement, not only manual registry edits.
 4. Registry writes are auditable and append-only where possible.
+5. Metadata refresh updates the shared token registry so later phases do not drift on token identity.
 
 ## Phase 5: Realtime API and WebSocket Layer
 
@@ -782,14 +791,13 @@ This is the StarknetDeg equivalent of Apibara invalidation plus DipDup rollback 
 ### Key files
 
 1. `sql/006_analytics.sql`
-2. `sql/007_bridge_messaging.sql`
-3. `jobs/wallet-rollups.js`
-4. `jobs/finality-promoter.js`
-5. `jobs/bridge-accounting.js`
-6. `jobs/matrix-rollups.js`
-7. `jobs/leaderboards.js`
-8. `jobs/concentration-rollups.js`
-9. `extras/ethereum/bridge-watcher.js`
+2. `jobs/wallet-rollups.js`
+3. `jobs/finality-promoter.js`
+4. `jobs/bridge-accounting.js`
+5. `jobs/matrix-rollups.js`
+6. `jobs/leaderboards.js`
+7. `jobs/concentration-rollups.js`
+8. `extras/ethereum/bridge-watcher.js`
 
 ### Security and integrity guardrails
 

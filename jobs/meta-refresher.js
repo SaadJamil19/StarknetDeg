@@ -5,9 +5,16 @@ const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 
 const { setTimeout: sleep } = require('node:timers/promises');
-const { assertFoundationTables, assertPhase2Tables, assertPhase3Tables, assertPhase4Tables } = require('../core/checkpoint');
+const {
+  assertFoundationTables,
+  assertPhase2Tables,
+  assertPhase3Tables,
+  assertPhase4Tables,
+  assertSchemaEnhancementTables,
+} = require('../core/checkpoint');
 const { knownErc20Cache } = require('../core/known-erc20-cache');
 const { normalizeAddress } = require('../core/normalize');
+const { seedKnownTokens, syncTokenRegistryFromMetadata } = require('../core/token-registry');
 const { rebuildPendingEnrichmentCandles } = require('../core/ohlcv');
 const { repricePendingEnrichmentTrades } = require('../core/trades');
 const { createTtlCache } = require('../lib/cache');
@@ -42,6 +49,8 @@ async function main() {
     await assertPhase2Tables(client);
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
+    await assertSchemaEnhancementTables(client);
+    await seedKnownTokens(client);
   });
 
   console.log(`[phase4] meta-refresher starting batch_size=${batchSize} run_once=${runOnce}`);
@@ -97,6 +106,12 @@ async function refreshTokenMetadata({ batchSize, rpcClient }) {
       await upsertTokenMetadata(client, {
         ...metadata,
         refreshedAtBlock,
+      });
+      await syncTokenRegistryFromMetadata(client, {
+        ...metadata,
+        refreshedAtBlock,
+        registryMetadata: metadata.metadata ?? {},
+        source: 'meta_refresher',
       });
 
       if (didResolveDecimals(previous, metadata)) {

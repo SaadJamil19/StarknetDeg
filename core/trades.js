@@ -1,9 +1,11 @@
 'use strict';
 
 const { fetchLatestQuotes } = require('../lib/cmc');
+const { getKnownLockerMatchByAddress, getProtocolDisplayName } = require('../lib/registry/dex-registry');
 const {
   DEFAULT_SCALE,
   absBigInt,
+  compareBigInt,
   decimalStringToScaled,
   integerAmountToScaled,
   resolveUsdPriceFromGraph,
@@ -14,16 +16,18 @@ const {
 } = require('../lib/cairo/fixed-point');
 const { toBigIntStrict, toNumericString } = require('../lib/cairo/bigint');
 const { knownErc20Cache } = require('./known-erc20-cache');
+const { parsePoolKeyId, sortTokenPair } = require('./normalize');
 const { toJsonbString } = require('./protocols/shared');
+const { getTokenRegistryInfo, isStableTokenInfo, loadTokenRegistryByAddress } = require('./token-registry');
 
-const STABLE_TOKEN_SYMBOLS = new Set(['DAI', 'USDC', 'USDT']);
 const DEFAULT_BRIDGE_SYMBOLS = ['STRK', 'ETH', 'WBTC', 'USDC', 'USDT', 'DAI'];
 const DEFAULT_CMC_ALLOWLIST = ['STRK', 'ETH', 'WBTC', 'WSTETH', 'EKUBO'];
 const DEFAULT_PENDING_DECIMALS = 18;
 const USD_ONE_SCALED = decimalStringToScaled('1', DEFAULT_SCALE);
+const HUNDRED_SCALED = decimalStringToScaled('100', DEFAULT_SCALE);
 
 async function persistTradesForBlock(client, { blockHash, blockNumber, blockTimestamp, lane }) {
-  const actions = await loadSwapActions(client, { blockNumber, lane });
+  const actions = buildMaterializedTradeActions(await loadSwapActions(client, { blockNumber, lane }));
 
   if (actions.length === 0) {
     return emptyTradeResult();
@@ -31,13 +35,17 @@ async function persistTradesForBlock(client, { blockHash, blockNumber, blockTime
 
   const blockTimestampDate = toBlockTimestampDate(blockTimestamp);
   const tradeTokenAddresses = collectTradeTokenAddresses(actions);
-  const tokenMetadataByAddress = await loadTokenMetadataByAddress(client, tradeTokenAddresses);
+  const tokenMetadataByAddress = await loadTokenRegistryByAddress(client, tradeTokenAddresses);
   const priceContext = await loadLatestPriceContext(client, {
     blockNumber,
     lane,
     tokenAddresses: tradeTokenAddresses,
   });
-  seedStablePrices(priceContext, { blockNumber, tokenAddresses: tradeTokenAddresses });
+  seedStablePrices(priceContext, {
+    blockNumber,
+    tokenAddresses: tradeTokenAddresses,
+    tokenMetadataByAddress,
+  });
 
   const cmcResult = await hydrateCmcReferencePrices({
     blockHash,
@@ -116,6 +124,184 @@ function collectTradeTokenAddresses(actions) {
   return Array.from(set);
 }
 
+function buildMaterializedTradeActions(actions) {
+  const actionsByTransaction = new Map();
+
+  for (const action of actions) {
+    if (!actionsByTransaction.has(action.transactionHash)) {
+      actionsByTransaction.set(action.transactionHash, []);
+    }
+
+    actionsByTransaction.get(action.transactionHash).push(action);
+  }
+
+  const materialized = [];
+
+  for (const transactionActions of actionsByTransaction.values()) {
+    const ordered = [...transactionActions].sort(compareActionOrder);
+    const aggregatorActions = ordered.filter(isAggregatorTradeAction);
+    const nonAggregatorActions = ordered.filter((action) => !isAggregatorTradeAction(action));
+
+    materialized.push(...nonAggregatorActions);
+
+    if (aggregatorActions.length === 0) {
+      continue;
+    }
+
+    materialized.push(...groupAggregatorTradeActions(aggregatorActions));
+  }
+
+  return materialized.sort(compareActionOrder);
+}
+
+function groupAggregatorTradeActions(actions) {
+  const ordered = [...actions].sort(compareActionOrder);
+  const grouped = [];
+  let currentGroup = [];
+
+  for (const action of ordered) {
+    if (currentGroup.length === 0) {
+      currentGroup.push(action);
+      continue;
+    }
+
+    const previous = currentGroup[currentGroup.length - 1];
+    if (canChainAggregatorHops(previous, action)) {
+      currentGroup.push(action);
+      continue;
+    }
+
+    grouped.push(materializeAggregatorGroup(currentGroup));
+    currentGroup = [action];
+  }
+
+  if (currentGroup.length > 0) {
+    grouped.push(materializeAggregatorGroup(currentGroup));
+  }
+
+  return grouped;
+}
+
+function materializeAggregatorGroup(group) {
+  if (group.length === 1) {
+    return annotateAggregatorAction(group[0], {
+      routeGroupKey: buildRouteGroupKey(group),
+      totalHops: 1n,
+    });
+  }
+
+  const first = group[0];
+  const firstDirection = determineTradeDirection(first.amount0Delta, first.amount1Delta);
+  const last = group[group.length - 1];
+  const lastDirection = determineTradeDirection(last.amount0Delta, last.amount1Delta);
+  if (!firstDirection || !lastDirection) {
+    return annotateAggregatorAction(first, {
+      routeGroupKey: buildRouteGroupKey(group),
+      totalHops: BigInt(group.length),
+    });
+  }
+
+  const tokenInAddress = firstDirection.tokenInIndex === 0 ? first.token0Address : first.token1Address;
+  const tokenOutAddress = lastDirection.tokenOutIndex === 0 ? last.token0Address : last.token1Address;
+  const amountIn = firstDirection.amountIn;
+  const amountOut = lastDirection.amountOut;
+  const [token0Address, token1Address] = sortTokenPair(tokenInAddress, tokenOutAddress, 'aggregated route token pair');
+  const routeGroupKey = buildRouteGroupKey(group);
+
+  return annotateAggregatorAction({
+    ...first,
+    amount0Delta: tokenInAddress === token0Address ? amountIn : -amountOut,
+    amount1Delta: tokenInAddress === token1Address ? amountIn : -amountOut,
+    metadata: {
+      ...(first.metadata ?? {}),
+      aggregated_buy_amount: amountOut,
+      aggregated_buy_token_address: tokenOutAddress,
+      aggregated_hops: group.map((item) => ({
+        amount0_delta: item.amount0Delta,
+        amount1_delta: item.amount1Delta,
+        source_event_index: item.sourceEventIndex,
+        token0_address: item.token0Address,
+        token1_address: item.token1Address,
+      })),
+      aggregated_sell_amount: amountIn,
+      aggregated_sell_token_address: tokenInAddress,
+      aggregated_source_event_indexes: group.map((item) => item.sourceEventIndex),
+    },
+    poolId: buildAggregatorRoutePoolId(tokenInAddress, tokenOutAddress),
+    token0Address,
+    token1Address,
+  }, {
+    routeGroupKey,
+    totalHops: BigInt(group.length),
+  });
+}
+
+function annotateAggregatorAction(action, { routeGroupKey, totalHops }) {
+  return {
+    ...action,
+    isMultiHop: totalHops > 1n,
+    metadata: {
+      ...(action.metadata ?? {}),
+      is_multi_hop: totalHops > 1n,
+      route_group_key: routeGroupKey,
+      total_hops: totalHops,
+    },
+    routeGroupKey,
+    totalHops,
+  };
+}
+
+function canChainAggregatorHops(previous, next) {
+  if (previous.transactionHash !== next.transactionHash) {
+    return false;
+  }
+
+  const previousDirection = determineTradeDirection(previous.amount0Delta, previous.amount1Delta);
+  const nextDirection = determineTradeDirection(next.amount0Delta, next.amount1Delta);
+  if (!previousDirection || !nextDirection) {
+    return false;
+  }
+
+  const previousOut = previousDirection.tokenOutIndex === 0 ? previous.token0Address : previous.token1Address;
+  const nextIn = nextDirection.tokenInIndex === 0 ? next.token0Address : next.token1Address;
+  return previousOut === nextIn;
+}
+
+function isAggregatorTradeAction(action) {
+  return Boolean(
+    action.protocol === 'avnu' ||
+    action.routerProtocol === 'avnu' ||
+    action.metadata?.is_aggregator_trade ||
+    action.metadata?.is_user_facing_aggregated_trade
+  );
+}
+
+function buildRouteGroupKey(group) {
+  const first = group[0];
+  const last = group[group.length - 1];
+  return `${first.transactionHash}:${first.sourceEventIndex.toString(10)}:${last.sourceEventIndex.toString(10)}`;
+}
+
+function buildAggregatorRoutePoolId(tokenInAddress, tokenOutAddress) {
+  return `avnu:${tokenInAddress}:${tokenOutAddress}`;
+}
+
+function compareActionOrder(left, right) {
+  if (left.blockNumber !== right.blockNumber) {
+    return left.blockNumber < right.blockNumber ? -1 : 1;
+  }
+
+  if (left.transactionIndex !== right.transactionIndex) {
+    return left.transactionIndex < right.transactionIndex ? -1 : 1;
+  }
+
+  if (left.sourceEventIndex !== right.sourceEventIndex) {
+    return left.sourceEventIndex < right.sourceEventIndex ? -1 : 1;
+  }
+
+  return left.actionKey < right.actionKey ? -1 : 1;
+}
+
 function deriveTrade(action, context) {
   const direction = determineTradeDirection(action.amount0Delta, action.amount1Delta);
   if (!direction) {
@@ -153,6 +339,7 @@ function deriveTrade(action, context) {
   const token0Price = resolveUsdPriceForToken(action.token0Address, {
     blockNumber: context.blockNumber,
     directStableAddress: action.token1Address,
+    tokenMetadataByAddress: context.tokenMetadataByAddress,
     priceContext: context.priceContext,
     priceScaled: priceBundle.priceToken1PerToken0Scaled,
     tradeGraphEdges: graphEdges,
@@ -161,6 +348,7 @@ function deriveTrade(action, context) {
     blockNumber: context.blockNumber,
     directStableAddress: action.token0Address,
     inverse: true,
+    tokenMetadataByAddress: context.tokenMetadataByAddress,
     priceContext: context.priceContext,
     priceScaled: priceBundle.priceToken1PerToken0Scaled,
     tradeGraphEdges: graphEdges,
@@ -175,39 +363,90 @@ function deriveTrade(action, context) {
 
   const tokenInPrice = direction.tokenInAddress === action.token0Address ? token0Price : token1Price;
   const tokenOutPrice = direction.tokenOutAddress === action.token0Address ? token0Price : token1Price;
-  const notionalUsdScaled = resolveNotionalUsd({
+  const valuation = resolveTradeValuation({
     amountInHumanScaled,
     amountOutHumanScaled,
     tokenInAddress: direction.tokenInAddress,
     tokenInPrice,
     tokenOutAddress: direction.tokenOutAddress,
     tokenOutPrice,
+    tokenMetadataByAddress: context.tokenMetadataByAddress,
+  });
+  const notionalUsdScaled = valuation.notionalUsdScaled;
+  const hopsFromStable = valuation.hopsFromStable;
+  const lowConfidence = hopsFromStable !== null && hopsFromStable > 1n;
+  const isAggregatorDerived = Boolean(
+    action.metadata?.is_aggregator_trade ||
+    action.metadata?.is_user_facing_aggregated_trade ||
+    action.protocol === 'avnu'
+  );
+  const blockPriceCandidateHops = parseNonNegativeBigInt(process.env.PHASE3_MAX_PRICE_TABLE_HOPS_FROM_STABLE, 1n);
+  const allowAggregatorPrices = parseBoolean(process.env.PHASE3_ALLOW_AGGREGATOR_PRICE_TABLES, false);
+  const excludeFromPriceTicks = isAggregatorDerived && !allowAggregatorPrices;
+  const excludeFromLatestPrices = excludeFromPriceTicks || (hopsFromStable !== null && hopsFromStable > blockPriceCandidateHops);
+  const priceTablesRejectionReason = excludeFromPriceTicks
+    ? 'aggregator_derived'
+    : (excludeFromLatestPrices ? 'hops_from_stable' : null);
+  const lockerAddress = action.lockerAddress ?? action.metadata?.locker_address ?? action.metadata?.raw_locker ?? null;
+  const routerAttribution = resolveMaterializedRouterProtocol({
+    executionProtocol: action.executionProtocol,
+    fallbackRouterProtocol: action.routerProtocol,
+    lockerAddress,
   });
 
   const priceCandidates = buildPriceCandidates(action, {
     blockHash: context.blockHash,
     blockNumber: context.blockNumber,
     blockTimestampDate: context.blockTimestampDate,
+    excludeFromLatestPrices,
+    excludeFromPriceTicks,
+    hopsFromStable,
+    isAggregatorDerived,
     lane: context.lane,
+    lowConfidence,
     priceBundle,
+    priceTablesRejectionReason,
+    tokenMetadataByAddress: context.tokenMetadataByAddress,
     token0Price,
     token1Price,
   });
 
   const bucketStart = floorToMinute(context.blockTimestampDate);
+  const poolKeyParts = parseActionPoolKeyParts(action);
   const metadata = {
     amount0_delta: action.amount0Delta,
     amount1_delta: action.amount1Delta,
     decimals_known: priceBundle.priceIsDecimalsNormalized,
     default_decimals_applied: pendingEnrichment ? DEFAULT_PENDING_DECIMALS : null,
+    exclude_from_latest_prices: excludeFromLatestPrices,
+    exclude_from_price_ticks: excludeFromPriceTicks,
+    extension_address: poolKeyParts?.extension ?? action.metadata?.extension_address ?? null,
+    fee_tier: poolKeyParts?.fee ?? action.metadata?.fee_tier ?? null,
+    hops_from_stable: hopsFromStable,
+    is_aggregator_derived: isAggregatorDerived,
+    is_multi_hop: Boolean(action.isMultiHop),
+    liquidity_after: action.metadata?.liquidity_after ?? null,
+    locker_address: lockerAddress,
+    low_confidence: lowConfidence,
+    low_confidence_reason: lowConfidence ? 'hops_from_stable' : null,
     missing_decimals_for: missingDecimalsFor,
     original_action_key: action.actionKey,
     pending_enrichment: pendingEnrichment,
+    price_deviation_pct: priceBundle.priceDeviationPctScaled === null ? null : scaledToNumericString(priceBundle.priceDeviationPctScaled, DEFAULT_SCALE),
+    price_raw_execution: scaledToNumericString(priceBundle.priceRawExecutionToken1PerToken0Scaled, DEFAULT_SCALE),
     pool_id: action.poolId,
     price_source: priceBundle.priceSource,
     protocol: action.protocol,
+    route_group_key: action.routeGroupKey ?? null,
+    route_rejection_reason: priceTablesRejectionReason,
+    router_protocol_key: routerAttribution.protocolKey,
+    router_protocol_source: routerAttribution.source,
+    sqrt_ratio_after: action.metadata?.sqrt_ratio_after ?? null,
+    tick_after: action.metadata?.tick_after ?? null,
+    tick_spacing: poolKeyParts?.tickSpacing ?? action.metadata?.tick_spacing ?? null,
     token0_price_path: token0Price?.pathSource ?? null,
     token1_price_path: token1Price?.pathSource ?? null,
+    total_hops: action.totalHops ?? 1n,
   };
 
   return {
@@ -220,25 +459,40 @@ function deriveTrade(action, context) {
     blockTimestampDate: context.blockTimestampDate,
     bucketStart,
     executionProtocol: action.executionProtocol,
+    extensionAddress: poolKeyParts?.extension ?? action.metadata?.extension_address ?? null,
+    feeTier: poolKeyParts?.fee ?? action.metadata?.fee_tier ?? null,
+    hopIndex: action.hopIndex ?? null,
+    hopsFromStable,
+    isAggregatorDerived,
+    isMultiHop: Boolean(action.isMultiHop),
     lane: context.lane,
+    liquidityAfter: action.metadata?.liquidity_after === undefined ? null : toBigIntStrict(action.metadata.liquidity_after, 'trade liquidity after'),
+    lockerAddress,
     metadata,
     notionalUsdScaled,
     poolId: action.poolId,
     priceCandidates,
+    priceDeviationPctScaled: priceBundle.priceDeviationPctScaled,
     priceIsDecimalsNormalized: priceBundle.priceIsDecimalsNormalized,
+    priceRawExecutionScaled: priceBundle.priceRawExecutionToken1PerToken0Scaled,
     priceRawToken0PerToken1Scaled: priceBundle.priceRawToken0PerToken1Scaled,
     priceRawToken1PerToken0Scaled: priceBundle.priceRawToken1PerToken0Scaled,
     priceSource: priceBundle.priceSource,
     priceToken0PerToken1Scaled: priceBundle.priceToken0PerToken1Scaled,
     priceToken1PerToken0Scaled: priceBundle.priceToken1PerToken0Scaled,
     protocol: action.protocol,
-    routerProtocol: action.routerProtocol,
+    routeGroupKey: action.routeGroupKey ?? null,
+    routerProtocol: routerAttribution.displayName,
     sourceEventIndex: action.sourceEventIndex,
+    sqrtRatioAfter: action.metadata?.sqrt_ratio_after === undefined ? null : toBigIntStrict(action.metadata.sqrt_ratio_after, 'trade sqrt ratio after'),
     pendingEnrichment,
+    tickAfter: action.metadata?.tick_after === undefined ? null : toBigIntStrict(action.metadata.tick_after, 'trade tick after'),
+    tickSpacing: poolKeyParts?.tickSpacing ?? action.metadata?.tick_spacing ?? null,
     token0Address: action.token0Address,
     token1Address: action.token1Address,
     tokenInAddress: direction.tokenInAddress,
     tokenOutAddress: direction.tokenOutAddress,
+    totalHops: action.totalHops ?? 1n,
     tradeKey: buildTradeKey(action),
     traderAddress: action.accountAddress,
     transactionHash: action.transactionHash,
@@ -277,6 +531,51 @@ function determineTradeDirection(amount0Delta, amount1Delta) {
   return null;
 }
 
+function resolveMaterializedRouterProtocol({ executionProtocol, fallbackRouterProtocol, lockerAddress }) {
+  const lockerMatch = lockerAddress ? getKnownLockerMatchByAddress(lockerAddress) : null;
+  if (lockerMatch) {
+    return {
+      displayName: lockerMatch.displayName ?? lockerMatch.protocol ?? fallbackRouterProtocol ?? null,
+      protocolKey: lockerMatch.protocolKey ?? lockerMatch.protocol ?? null,
+      source: 'locker_registry',
+    };
+  }
+
+  if (fallbackRouterProtocol && fallbackRouterProtocol.startsWith('unknown_locker_')) {
+    return {
+      displayName: fallbackRouterProtocol,
+      protocolKey: null,
+      source: 'unknown_locker',
+    };
+  }
+
+  const fallbackDisplayName = getProtocolDisplayName(fallbackRouterProtocol);
+  if (fallbackDisplayName) {
+    return {
+      displayName: fallbackDisplayName,
+      protocolKey: fallbackRouterProtocol,
+      source: 'action_router_protocol',
+    };
+  }
+
+  if (!fallbackRouterProtocol && executionProtocol && executionProtocol !== 'ekubo') {
+    const executionDisplayName = getProtocolDisplayName(executionProtocol);
+    if (executionDisplayName) {
+      return {
+        displayName: executionDisplayName,
+        protocolKey: executionProtocol,
+        source: 'execution_protocol_fallback',
+      };
+    }
+  }
+
+  return {
+    displayName: fallbackRouterProtocol ?? null,
+    protocolKey: fallbackRouterProtocol ?? null,
+    source: fallbackRouterProtocol ? 'action_router_protocol_unmapped' : null,
+  };
+}
+
 function deriveTradePrice(action, { decimals0, decimals1, decimalsConfirmed }) {
   let rawNumerator;
   let rawDenominator;
@@ -300,27 +599,59 @@ function deriveTradePrice(action, { decimals0, decimals1, decimalsConfirmed }) {
   const priceRawToken0PerToken1Scaled = scaledRatio(rawDenominator, rawNumerator, 0, DEFAULT_SCALE);
   const decimalExponent = decimals0 - decimals1;
   const inverseDecimalExponent = decimals1 - decimals0;
+  const priceToken1PerToken0Scaled = scaledRatio(rawNumerator, rawDenominator, decimalExponent, DEFAULT_SCALE);
+  const priceToken0PerToken1Scaled = scaledRatio(rawDenominator, rawNumerator, inverseDecimalExponent, DEFAULT_SCALE);
+  const priceRawExecutionToken1PerToken0Scaled = scaledRatio(absBigInt(action.amount1Delta), absBigInt(action.amount0Delta), decimalExponent, DEFAULT_SCALE);
+  const priceRawExecutionToken0PerToken1Scaled = scaledRatio(absBigInt(action.amount0Delta), absBigInt(action.amount1Delta), inverseDecimalExponent, DEFAULT_SCALE);
 
   return {
     priceIsDecimalsNormalized: Boolean(decimalsConfirmed),
+    priceDeviationPctScaled: computeDeviationPct(priceToken1PerToken0Scaled, priceRawExecutionToken1PerToken0Scaled),
+    priceRawExecutionToken0PerToken1Scaled,
+    priceRawExecutionToken1PerToken0Scaled,
     priceRawToken0PerToken1Scaled,
     priceRawToken1PerToken0Scaled,
     priceSource,
-    priceToken0PerToken1Scaled: scaledRatio(rawDenominator, rawNumerator, inverseDecimalExponent, DEFAULT_SCALE),
-    priceToken1PerToken0Scaled: scaledRatio(rawNumerator, rawDenominator, decimalExponent, DEFAULT_SCALE),
+    priceToken0PerToken1Scaled,
+    priceToken1PerToken0Scaled,
   };
+}
+
+function computeDeviationPct(referenceScaled, executionScaled) {
+  if (referenceScaled === null || executionScaled === null || executionScaled === 0n) {
+    return null;
+  }
+
+  const delta = absBigInt(referenceScaled - executionScaled);
+  const ratio = scaledDivide(delta, executionScaled, DEFAULT_SCALE);
+  return scaledMultiply(ratio, HUNDRED_SCALED, DEFAULT_SCALE);
+}
+
+function parseActionPoolKeyParts(action) {
+  if (!action?.poolId) {
+    return null;
+  }
+
+  try {
+    return parsePoolKeyId(action.poolId, 'trade pool id');
+  } catch (error) {
+    return null;
+  }
 }
 
 function resolveUsdPriceForToken(targetAddress, {
   blockNumber,
   directStableAddress,
   inverse = false,
+  tokenMetadataByAddress,
   priceContext,
   priceScaled,
   tradeGraphEdges,
 }) {
-  if (isStableTokenAddress(targetAddress)) {
+  if (isStableTokenAddress(targetAddress, tokenMetadataByAddress)) {
     return {
+      anchorTokenAddress: targetAddress,
+      hopsFromStable: 0n,
       path: [],
       pathSource: 'stable_seed',
       priceIsStale: false,
@@ -329,8 +660,10 @@ function resolveUsdPriceForToken(targetAddress, {
     };
   }
 
-  if (isStableTokenAddress(directStableAddress)) {
+  if (isStableTokenAddress(directStableAddress, tokenMetadataByAddress)) {
     return {
+      anchorTokenAddress: directStableAddress,
+      hopsFromStable: 0n,
       path: [],
       pathSource: 'stable_direct_current_trade',
       priceIsStale: false,
@@ -351,37 +684,80 @@ function resolveUsdPriceForToken(targetAddress, {
     return null;
   }
 
-  return resolved;
+  return {
+    ...resolved,
+    hopsFromStable: normalizeHopsFromStable(resolved.shortestAnchorHops ?? resolved.hops),
+  };
 }
 
-function resolveNotionalUsd({
+function normalizeHopsFromStable(resolvedHops) {
+  const normalized = toBigIntStrict(resolvedHops, 'resolved hops');
+  if (normalized <= 0n) {
+    return 0n;
+  }
+
+  return normalized - 1n;
+}
+
+function resolveTradeValuation({
   amountInHumanScaled,
   amountOutHumanScaled,
   tokenInAddress,
   tokenInPrice,
   tokenOutAddress,
   tokenOutPrice,
+  tokenMetadataByAddress,
 }) {
-  if (amountInHumanScaled !== null && isStableTokenAddress(tokenInAddress)) {
-    return amountInHumanScaled;
+  if (amountInHumanScaled !== null && isStableTokenAddress(tokenInAddress, tokenMetadataByAddress)) {
+    return {
+      hopsFromStable: 0n,
+      notionalUsdScaled: amountInHumanScaled,
+    };
   }
 
-  if (amountOutHumanScaled !== null && isStableTokenAddress(tokenOutAddress)) {
-    return amountOutHumanScaled;
+  if (amountOutHumanScaled !== null && isStableTokenAddress(tokenOutAddress, tokenMetadataByAddress)) {
+    return {
+      hopsFromStable: 0n,
+      notionalUsdScaled: amountOutHumanScaled,
+    };
   }
 
   if (amountInHumanScaled !== null && tokenInPrice?.priceUsdScaled) {
-    return scaledMultiply(amountInHumanScaled, tokenInPrice.priceUsdScaled, DEFAULT_SCALE);
+    return {
+      hopsFromStable: tokenInPrice.hopsFromStable ?? null,
+      notionalUsdScaled: scaledMultiply(amountInHumanScaled, tokenInPrice.priceUsdScaled, DEFAULT_SCALE),
+    };
   }
 
   if (amountOutHumanScaled !== null && tokenOutPrice?.priceUsdScaled) {
-    return scaledMultiply(amountOutHumanScaled, tokenOutPrice.priceUsdScaled, DEFAULT_SCALE);
+    return {
+      hopsFromStable: tokenOutPrice.hopsFromStable ?? null,
+      notionalUsdScaled: scaledMultiply(amountOutHumanScaled, tokenOutPrice.priceUsdScaled, DEFAULT_SCALE),
+    };
   }
 
-  return null;
+  return {
+    hopsFromStable: null,
+    notionalUsdScaled: null,
+  };
 }
 
-function buildPriceCandidates(action, { blockHash, blockNumber, blockTimestampDate, lane, priceBundle, token0Price, token1Price }) {
+function buildPriceCandidates(action, {
+  blockHash,
+  blockNumber,
+  blockTimestampDate,
+  excludeFromLatestPrices,
+  excludeFromPriceTicks,
+  hopsFromStable,
+  isAggregatorDerived,
+  lane,
+  lowConfidence,
+  priceBundle,
+  priceTablesRejectionReason,
+  tokenMetadataByAddress,
+  token0Price,
+  token1Price,
+}) {
   const candidates = [];
 
   if (token0Price?.priceUsdScaled) {
@@ -389,20 +765,38 @@ function buildPriceCandidates(action, { blockHash, blockNumber, blockTimestampDa
       blockHash,
       blockNumber,
       blockTimestampDate,
+      excludeFromLatestPrices,
+      excludeFromPriceTicks,
+      hopsFromStable: token0Price.hopsFromStable ?? hopsFromStable ?? null,
+      isAggregatorDerived,
       lane,
+      lowConfidence: lowConfidence || ((token0Price.hopsFromStable ?? hopsFromStable ?? null) !== null && (token0Price.hopsFromStable ?? hopsFromStable ?? null) > 1n),
       metadata: {
+        exclude_from_latest_prices: excludeFromLatestPrices,
+        exclude_from_price_ticks: excludeFromPriceTicks,
         execution_protocol: action.executionProtocol,
+        low_confidence: lowConfidence || ((token0Price.hopsFromStable ?? hopsFromStable ?? null) !== null && (token0Price.hopsFromStable ?? hopsFromStable ?? null) > 1n),
+        low_confidence_reason: (lowConfidence || ((token0Price.hopsFromStable ?? hopsFromStable ?? null) !== null && (token0Price.hopsFromStable ?? hopsFromStable ?? null) > 1n))
+          ? 'hops_from_stable'
+          : null,
+        price_deviation_pct: priceBundle.priceDeviationPctScaled === null ? null : scaledToNumericString(priceBundle.priceDeviationPctScaled, DEFAULT_SCALE),
+        price_raw_execution: scaledToNumericString(priceBundle.priceRawExecutionToken1PerToken0Scaled, DEFAULT_SCALE),
         path_source: token0Price.pathSource ?? null,
         pool_id: action.poolId,
         price_source: priceBundle.priceSource,
+        rejection_reason: priceTablesRejectionReason,
       },
       poolId: action.poolId,
       priceIsStale: token0Price.priceIsStale,
+      priceDeviationPctScaled: priceBundle.priceDeviationPctScaled,
+      priceRawExecutionScaled: priceBundle.priceRawExecutionToken1PerToken0Scaled,
       priceQuoteScaled: priceBundle.priceToken1PerToken0Scaled,
-      priceSource: token0Price.pathSource ?? resolveUsdPriceSource(action.token1Address, priceBundle.priceSource),
+      priceSource: token0Price.pathSource ?? resolveUsdPriceSource(action.token1Address, priceBundle.priceSource, tokenMetadataByAddress),
       priceUpdatedAtBlock: token0Price.priceUpdatedAtBlock ?? blockNumber,
       priceUsdScaled: token0Price.priceUsdScaled,
       quoteTokenAddress: action.token1Address,
+      buyAmountRaw: absBigInt(action.amount1Delta),
+      sellAmountRaw: absBigInt(action.amount0Delta),
       sourceEventIndex: action.sourceEventIndex,
       tokenAddress: action.token0Address,
       transactionHash: action.transactionHash,
@@ -415,20 +809,38 @@ function buildPriceCandidates(action, { blockHash, blockNumber, blockTimestampDa
       blockHash,
       blockNumber,
       blockTimestampDate,
+      excludeFromLatestPrices,
+      excludeFromPriceTicks,
+      hopsFromStable: token1Price.hopsFromStable ?? hopsFromStable ?? null,
+      isAggregatorDerived,
       lane,
+      lowConfidence: lowConfidence || ((token1Price.hopsFromStable ?? hopsFromStable ?? null) !== null && (token1Price.hopsFromStable ?? hopsFromStable ?? null) > 1n),
       metadata: {
+        exclude_from_latest_prices: excludeFromLatestPrices,
+        exclude_from_price_ticks: excludeFromPriceTicks,
         execution_protocol: action.executionProtocol,
+        low_confidence: lowConfidence || ((token1Price.hopsFromStable ?? hopsFromStable ?? null) !== null && (token1Price.hopsFromStable ?? hopsFromStable ?? null) > 1n),
+        low_confidence_reason: (lowConfidence || ((token1Price.hopsFromStable ?? hopsFromStable ?? null) !== null && (token1Price.hopsFromStable ?? hopsFromStable ?? null) > 1n))
+          ? 'hops_from_stable'
+          : null,
+        price_deviation_pct: priceBundle.priceDeviationPctScaled === null ? null : scaledToNumericString(priceBundle.priceDeviationPctScaled, DEFAULT_SCALE),
+        price_raw_execution: scaledToNumericString(priceBundle.priceRawExecutionToken1PerToken0Scaled, DEFAULT_SCALE),
         path_source: token1Price.pathSource ?? null,
         pool_id: action.poolId,
         price_source: priceBundle.priceSource,
+        rejection_reason: priceTablesRejectionReason,
       },
       poolId: action.poolId,
       priceIsStale: token1Price.priceIsStale,
+      priceDeviationPctScaled: priceBundle.priceDeviationPctScaled,
+      priceRawExecutionScaled: priceBundle.priceRawExecutionToken0PerToken1Scaled ?? priceBundle.priceRawExecutionToken1PerToken0Scaled,
       priceQuoteScaled: priceBundle.priceToken0PerToken1Scaled,
-      priceSource: token1Price.pathSource ?? resolveUsdPriceSource(action.token0Address, priceBundle.priceSource),
+      priceSource: token1Price.pathSource ?? resolveUsdPriceSource(action.token0Address, priceBundle.priceSource, tokenMetadataByAddress),
       priceUpdatedAtBlock: token1Price.priceUpdatedAtBlock ?? blockNumber,
       priceUsdScaled: token1Price.priceUsdScaled,
       quoteTokenAddress: action.token0Address,
+      buyAmountRaw: absBigInt(action.amount0Delta),
+      sellAmountRaw: absBigInt(action.amount1Delta),
       sourceEventIndex: action.sourceEventIndex,
       tokenAddress: action.token1Address,
       transactionHash: action.transactionHash,
@@ -439,8 +851,8 @@ function buildPriceCandidates(action, { blockHash, blockNumber, blockTimestampDa
   return candidates;
 }
 
-function resolveUsdPriceSource(counterpartyAddress, baseSource) {
-  return isStableTokenAddress(counterpartyAddress) ? `stable_direct:${baseSource}` : `bridge_latest:${baseSource}`;
+function resolveUsdPriceSource(counterpartyAddress, baseSource, tokenMetadataByAddress = null) {
+  return isStableTokenAddress(counterpartyAddress, tokenMetadataByAddress) ? `stable_direct:${baseSource}` : `bridge_latest:${baseSource}`;
 }
 
 function buildLatestUsdByToken(priceContext) {
@@ -493,9 +905,9 @@ async function loadLatestPriceContext(client, { blockNumber, lane, tokenAddresse
   return priceContext;
 }
 
-function seedStablePrices(priceContext, { blockNumber, tokenAddresses }) {
+function seedStablePrices(priceContext, { blockNumber, tokenAddresses, tokenMetadataByAddress }) {
   for (const tokenAddress of tokenAddresses) {
-    if (!isStableTokenAddress(tokenAddress)) {
+    if (!isStableTokenAddress(tokenAddress, tokenMetadataByAddress)) {
       continue;
     }
 
@@ -675,50 +1087,9 @@ function buildActionEdges(action, { actionLiquidityUsdScaled, priceBundle }) {
   ];
 }
 
-async function loadTokenMetadataByAddress(client, tokenAddresses) {
-  const uniqueTokenAddresses = Array.from(new Set((tokenAddresses ?? []).filter(Boolean)));
-  const metadataByAddress = new Map();
-
-  for (const tokenAddress of uniqueTokenAddresses) {
-    const knownToken = knownErc20Cache.getToken(tokenAddress);
-    if (knownToken) {
-      metadataByAddress.set(tokenAddress, {
-        decimals: knownToken.decimals ?? null,
-        isVerified: true,
-        name: knownToken.name ?? null,
-        symbol: knownToken.symbol ?? null,
-      });
-    }
-  }
-
-  if (uniqueTokenAddresses.length === 0) {
-    return metadataByAddress;
-  }
-
-  const result = await client.query(
-    `SELECT token_address, name, symbol, decimals, is_verified
-       FROM stark_token_metadata
-      WHERE token_address = ANY($1::text[])`,
-    [uniqueTokenAddresses],
-  );
-
-  for (const row of result.rows) {
-    const existing = metadataByAddress.get(row.token_address) ?? {};
-    metadataByAddress.set(row.token_address, {
-      ...existing,
-      decimals: row.decimals === null ? existing.decimals ?? null : Number.parseInt(String(row.decimals), 10),
-      isVerified: row.is_verified ?? existing.isVerified ?? false,
-      name: row.name ?? existing.name ?? null,
-      symbol: row.symbol ?? existing.symbol ?? null,
-    });
-  }
-
-  return metadataByAddress;
-}
-
 function getTokenInfo(tokenAddress, tokenMetadataByAddress = null) {
-  if (tokenMetadataByAddress instanceof Map && tokenMetadataByAddress.has(tokenAddress)) {
-    return tokenMetadataByAddress.get(tokenAddress);
+  if (tokenMetadataByAddress instanceof Map) {
+    return getTokenRegistryInfo(tokenAddress, tokenMetadataByAddress);
   }
 
   return knownErc20Cache.getToken(tokenAddress);
@@ -738,13 +1109,16 @@ function resolveTokenDecimals(tokenInfo) {
   };
 }
 
-function isStableTokenAddress(tokenAddress) {
-  const token = getTokenInfo(tokenAddress);
-  if (!token?.symbol) {
-    return false;
+function isStableTokenAddress(tokenAddress, tokenMetadataByAddress = null) {
+  const token = getTokenInfo(tokenAddress, tokenMetadataByAddress);
+  if (tokenMetadataByAddress instanceof Map) {
+    const registryToken = getTokenRegistryInfo(tokenAddress, tokenMetadataByAddress);
+    if (registryToken) {
+      return isStableTokenInfo(registryToken);
+    }
   }
 
-  return STABLE_TOKEN_SYMBOLS.has(String(token.symbol).toUpperCase());
+  return isStableTokenInfo(token);
 }
 
 function collectBridgeSymbols() {
@@ -837,7 +1211,12 @@ async function upsertTrade(client, trade) {
          router_protocol,
          execution_protocol,
          pool_id,
+         route_group_key,
+         is_multi_hop,
+         hop_index,
+         total_hops,
          trader_address,
+         locker_address,
          token0_address,
          token1_address,
          token_in_address,
@@ -848,12 +1227,22 @@ async function upsertTrade(client, trade) {
          volume_token1,
          amount_in,
          amount_out,
+         liquidity_after,
+         sqrt_ratio_after,
+         tick_after,
+         tick_spacing,
+         fee_tier,
+         extension_address,
+         price_raw_execution,
          price_raw_token1_per_token0,
          price_raw_token0_per_token1,
          price_token1_per_token0,
          price_token0_per_token1,
+         price_deviation_pct,
          price_is_decimals_normalized,
          pending_enrichment,
+         hops_from_stable,
+         is_aggregator_derived,
          price_source,
          notional_usd,
          bucket_1m,
@@ -864,7 +1253,8 @@ async function upsertTrade(client, trade) {
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
          $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
          $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
-         $31, $32, $33::jsonb, NOW(), NOW()
+         $31, $32, $33, $34, $35, $36, $37, $38, $39, $40,
+         $41, $42, $43, $44, $45, $46, $47, $48::jsonb, NOW(), NOW()
      )
      ON CONFLICT (transaction_hash, source_event_index)
      DO UPDATE SET
@@ -878,7 +1268,12 @@ async function upsertTrade(client, trade) {
          router_protocol = EXCLUDED.router_protocol,
          execution_protocol = EXCLUDED.execution_protocol,
          pool_id = EXCLUDED.pool_id,
+         route_group_key = EXCLUDED.route_group_key,
+         is_multi_hop = EXCLUDED.is_multi_hop,
+         hop_index = EXCLUDED.hop_index,
+         total_hops = EXCLUDED.total_hops,
          trader_address = EXCLUDED.trader_address,
+         locker_address = EXCLUDED.locker_address,
          token0_address = EXCLUDED.token0_address,
          token1_address = EXCLUDED.token1_address,
          token_in_address = EXCLUDED.token_in_address,
@@ -889,12 +1284,22 @@ async function upsertTrade(client, trade) {
          volume_token1 = EXCLUDED.volume_token1,
          amount_in = EXCLUDED.amount_in,
          amount_out = EXCLUDED.amount_out,
+         liquidity_after = EXCLUDED.liquidity_after,
+         sqrt_ratio_after = EXCLUDED.sqrt_ratio_after,
+         tick_after = EXCLUDED.tick_after,
+         tick_spacing = EXCLUDED.tick_spacing,
+         fee_tier = EXCLUDED.fee_tier,
+         extension_address = EXCLUDED.extension_address,
+         price_raw_execution = EXCLUDED.price_raw_execution,
          price_raw_token1_per_token0 = EXCLUDED.price_raw_token1_per_token0,
          price_raw_token0_per_token1 = EXCLUDED.price_raw_token0_per_token1,
          price_token1_per_token0 = EXCLUDED.price_token1_per_token0,
          price_token0_per_token1 = EXCLUDED.price_token0_per_token1,
+         price_deviation_pct = EXCLUDED.price_deviation_pct,
          price_is_decimals_normalized = EXCLUDED.price_is_decimals_normalized,
          pending_enrichment = EXCLUDED.pending_enrichment,
+         hops_from_stable = EXCLUDED.hops_from_stable,
+         is_aggregator_derived = EXCLUDED.is_aggregator_derived,
          price_source = EXCLUDED.price_source,
          notional_usd = EXCLUDED.notional_usd,
          bucket_1m = EXCLUDED.bucket_1m,
@@ -913,7 +1318,12 @@ async function upsertTrade(client, trade) {
       trade.routerProtocol ?? null,
       trade.executionProtocol,
       trade.poolId,
+      trade.routeGroupKey ?? null,
+      trade.isMultiHop,
+      trade.hopIndex === null || trade.hopIndex === undefined ? null : toNumericString(trade.hopIndex, 'trade hop index'),
+      trade.totalHops === null || trade.totalHops === undefined ? null : toNumericString(trade.totalHops, 'trade total hops'),
       trade.traderAddress ?? null,
+      trade.lockerAddress ?? null,
       trade.token0Address,
       trade.token1Address,
       trade.tokenInAddress,
@@ -924,12 +1334,22 @@ async function upsertTrade(client, trade) {
       toNumericString(trade.volumeToken1, 'trade volume token1'),
       toNumericString(trade.amountIn, 'trade amount in'),
       toNumericString(trade.amountOut, 'trade amount out'),
+      trade.liquidityAfter === null ? null : toNumericString(trade.liquidityAfter, 'trade liquidity after'),
+      trade.sqrtRatioAfter === null ? null : toNumericString(trade.sqrtRatioAfter, 'trade sqrt ratio after'),
+      trade.tickAfter === null ? null : toNumericString(trade.tickAfter, 'trade tick after'),
+      trade.tickSpacing === null || trade.tickSpacing === undefined ? null : toNumericString(trade.tickSpacing, 'trade tick spacing'),
+      trade.feeTier === null || trade.feeTier === undefined ? null : toNumericString(trade.feeTier, 'trade fee tier'),
+      trade.extensionAddress ?? null,
+      trade.priceRawExecutionScaled === null ? null : scaledToNumericString(trade.priceRawExecutionScaled, DEFAULT_SCALE),
       scaledToNumericString(trade.priceRawToken1PerToken0Scaled, DEFAULT_SCALE),
       scaledToNumericString(trade.priceRawToken0PerToken1Scaled, DEFAULT_SCALE),
       scaledToNumericString(trade.priceToken1PerToken0Scaled, DEFAULT_SCALE),
       scaledToNumericString(trade.priceToken0PerToken1Scaled, DEFAULT_SCALE),
+      trade.priceDeviationPctScaled === null ? null : scaledToNumericString(trade.priceDeviationPctScaled, DEFAULT_SCALE),
       trade.priceIsDecimalsNormalized,
       trade.pendingEnrichment,
+      trade.hopsFromStable === null || trade.hopsFromStable === undefined ? null : toNumericString(trade.hopsFromStable, 'trade hops from stable'),
+      trade.isAggregatorDerived,
       trade.priceSource,
       trade.notionalUsdScaled === null ? null : scaledToNumericString(trade.notionalUsdScaled, DEFAULT_SCALE),
       trade.bucketStart,
@@ -961,7 +1381,7 @@ async function repricePendingEnrichmentTrades(client, { tokenAddresses }) {
 
   for (const [lane, items] of inputsByLane.entries()) {
     const tradeTokenAddresses = collectTradeTokenAddresses(items);
-    const tokenMetadataByAddress = await loadTokenMetadataByAddress(client, tradeTokenAddresses);
+    const tokenMetadataByAddress = await loadTokenRegistryByAddress(client, tradeTokenAddresses);
     const priceContext = await loadLatestPriceContext(client, {
       blockNumber: items[items.length - 1].blockNumber,
       lane,
@@ -970,6 +1390,7 @@ async function repricePendingEnrichmentTrades(client, { tokenAddresses }) {
     seedStablePrices(priceContext, {
       blockNumber: items[items.length - 1].blockNumber,
       tokenAddresses: tradeTokenAddresses,
+      tokenMetadataByAddress,
     });
 
     const bridgeEdges = await loadBridgeEdges(client, {
@@ -1024,6 +1445,11 @@ async function loadPendingTradeInputs(client, tokenAddresses) {
             trade.transaction_index,
             trade.source_event_index,
             trade.pool_id,
+            trade.route_group_key,
+            trade.is_multi_hop,
+            trade.hop_index,
+            trade.total_hops,
+            trade.locker_address,
             action.action_key,
             action.protocol,
             action.account_address,
@@ -1059,14 +1485,19 @@ async function loadPendingTradeInputs(client, tokenAddresses) {
     blockNumber: toBigIntStrict(row.block_number, 'pending trade block number'),
     blockTimestampDate: new Date(row.block_timestamp),
     executionProtocol: row.execution_protocol,
+    hopIndex: row.hop_index === null ? null : toBigIntStrict(row.hop_index, 'pending trade hop index'),
+    isMultiHop: Boolean(row.is_multi_hop),
     lane: row.lane,
+    lockerAddress: row.locker_address,
     metadata: row.metadata ?? {},
     poolId: row.pool_id,
     protocol: row.protocol,
+    routeGroupKey: row.route_group_key,
     routerProtocol: row.router_protocol,
     sourceEventIndex: toBigIntStrict(row.source_event_index, 'pending trade source event index'),
     token0Address: row.token0_address,
     token1Address: row.token1_address,
+    totalHops: row.total_hops === null ? null : toBigIntStrict(row.total_hops, 'pending trade total hops'),
     transactionHash: row.transaction_hash,
     transactionIndex: toBigIntStrict(row.transaction_index, 'pending trade transaction index'),
   }));
@@ -1101,6 +1532,7 @@ function serializeRealtimeTrade(trade) {
     notionalUsd: trade.notionalUsdScaled === null ? null : scaledToNumericString(trade.notionalUsdScaled, DEFAULT_SCALE),
     pendingEnrichment: trade.pendingEnrichment,
     poolId: trade.poolId,
+    routeGroupKey: trade.routeGroupKey,
     priceSource: trade.priceSource,
     priceToken0PerToken1: scaledToNumericString(trade.priceToken0PerToken1Scaled, DEFAULT_SCALE),
     priceToken1PerToken0: scaledToNumericString(trade.priceToken1PerToken0Scaled, DEFAULT_SCALE),
@@ -1117,6 +1549,27 @@ function serializeRealtimeTrade(trade) {
 
 function floorToMinute(date) {
   return new Date(Math.floor(date.getTime() / 60_000) * 60_000);
+}
+
+function parseBoolean(value, fallbackValue) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return fallbackValue;
+  }
+
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+function parseNonNegativeBigInt(value, fallbackValue) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return fallbackValue;
+  }
+
+  try {
+    const parsed = BigInt(String(value).trim());
+    return parsed >= 0n ? parsed : fallbackValue;
+  } catch (error) {
+    return fallbackValue;
+  }
 }
 
 function toBlockTimestampDate(blockTimestamp) {

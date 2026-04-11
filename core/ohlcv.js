@@ -3,14 +3,18 @@
 const { toBigIntStrict, toNumericString } = require('../lib/cairo/bigint');
 const {
   DEFAULT_SCALE,
+  absBigInt,
   compareBigInt,
   decimalStringToScaled,
+  scaledDivide,
+  scaledMultiply,
   scaledToNumericString,
 } = require('../lib/cairo/fixed-point');
 const { toJsonbString } = require('./protocols/shared');
 
 async function persistOhlcvForBlock(client, { blockHash, blockNumber, lane, reconciliationTriggered, trades }) {
-  if (!trades || trades.length === 0) {
+  const candleEligibleTrades = filterTradesForOhlcv(trades);
+  if (!candleEligibleTrades || candleEligibleTrades.length === 0) {
     return {
       realtimeCandles: [],
       summary: {
@@ -25,7 +29,7 @@ async function persistOhlcvForBlock(client, { blockHash, blockNumber, lane, reco
   const shouldRebuild = reconciliationTriggered === undefined
     ? await isReconciliationTriggered(client, { blockNumber, lane })
     : Boolean(reconciliationTriggered);
-  const tradeBuckets = groupTradesByPoolAndBucket(trades);
+  const tradeBuckets = groupTradesByPoolAndBucket(candleEligibleTrades);
   const candleRows = [];
   let fullRebuildCandles = 0;
   let incrementalCandles = 0;
@@ -128,6 +132,46 @@ async function isReconciliationTriggered(client, { blockNumber, lane }) {
   return result.rowCount > 0;
 }
 
+function filterTradesForOhlcv(trades) {
+  const maxHopsFromStable = parseNonNegativeBigInt(process.env.PHASE3_MAX_OHLCV_HOPS_FROM_STABLE, 2n);
+  return (trades ?? []).filter((trade) => {
+    if (!trade) {
+      return false;
+    }
+
+    if (trade.isAggregatorDerived) {
+      return false;
+    }
+
+    if (trade.hopsFromStable !== null && trade.hopsFromStable !== undefined && trade.hopsFromStable > maxHopsFromStable) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
+function deriveCanonicalTradeVolumes(trade) {
+  const hasCanonicalDeltas = trade.amount0Delta !== undefined && trade.amount0Delta !== null &&
+    trade.amount1Delta !== undefined && trade.amount1Delta !== null;
+
+  if (hasCanonicalDeltas) {
+    return {
+      volume0: absBigInt(toBigIntStrict(trade.amount0Delta, 'ohlcv trade amount0 delta')),
+      volume1: absBigInt(toBigIntStrict(trade.amount1Delta, 'ohlcv trade amount1 delta')),
+    };
+  }
+
+  return {
+    volume0: toBigIntStrict(trade.volumeToken0, 'ohlcv trade volume0'),
+    volume1: toBigIntStrict(trade.volumeToken1, 'ohlcv trade volume1'),
+  };
+}
+
+function getNormalizedExecutionPriceScaled(trade) {
+  return toBigIntStrict(trade.priceToken1PerToken0Scaled, 'ohlcv normalized execution price');
+}
+
 function buildGapCandles({
   anchorTrade,
   blockHash,
@@ -165,16 +209,25 @@ function buildGapCandles({
       pendingEnrichment: Boolean(previousPendingEnrichment),
       priceIsDecimalsNormalized,
       protocol: anchorTrade.protocol,
+      feeTierBps: anchorTrade.feeTier ?? null,
       seededFromPreviousClose: true,
       sourceEventIndex: anchorTrade.sourceEventIndex,
+      sqrtRatioClose: anchorTrade.sqrtRatioAfter ?? null,
+      sqrtRatioOpen: anchorTrade.sqrtRatioAfter ?? null,
+      tickClose: anchorTrade.tickAfter ?? null,
+      tickOpen: anchorTrade.tickAfter ?? null,
+      tickSpacing: anchorTrade.tickSpacing ?? null,
       token0Address: anchorTrade.token0Address,
       token1Address: anchorTrade.token1Address,
       tradeCount: 0n,
       transactionHash: anchorTrade.transactionHash,
       transactionIndex: anchorTrade.transactionIndex,
       volume0: 0n,
+      volume0UsdScaled: 0n,
       volume1: 0n,
+      volume1UsdScaled: 0n,
       volumeUsdScaled: 0n,
+      vwapScaled: previousCloseScaled,
     });
     cursor = new Date(cursor.getTime() + 60_000);
   }
@@ -204,22 +257,33 @@ function buildIncrementalCandle({ blockHash, blockNumber, bucketStart, bucketTra
         pending_enrichment: tradeAggregate.pendingEnrichment,
         reconciliation_triggered: false,
         source: 'current_block_trades',
+        vwap_price_source: 'normalized_execution_price',
+        volume_source: 'canonical_amount_deltas',
       },
       openScaled: tradeAggregate.openScaled,
       pendingEnrichment: tradeAggregate.pendingEnrichment,
       poolId: tradeAggregate.poolId,
       priceIsDecimalsNormalized: tradeAggregate.priceIsDecimalsNormalized,
       protocol: tradeAggregate.protocol,
+      feeTierBps: tradeAggregate.feeTierBps,
       seededFromPreviousClose: false,
       sourceEventIndex: tradeAggregate.sourceEventIndex,
+      sqrtRatioClose: tradeAggregate.sqrtRatioClose,
+      sqrtRatioOpen: tradeAggregate.sqrtRatioOpen,
+      tickClose: tradeAggregate.tickClose,
+      tickOpen: tradeAggregate.tickOpen,
+      tickSpacing: tradeAggregate.tickSpacing,
       token0Address: tradeAggregate.token0Address,
       token1Address: tradeAggregate.token1Address,
       tradeCount: tradeAggregate.tradeCount,
       transactionHash: tradeAggregate.transactionHash,
       transactionIndex: tradeAggregate.transactionIndex,
       volume0: tradeAggregate.volume0,
+      volume0UsdScaled: tradeAggregate.volume0UsdScaled,
       volume1: tradeAggregate.volume1,
+      volume1UsdScaled: tradeAggregate.volume1UsdScaled,
       volumeUsdScaled: tradeAggregate.volumeUsdScaled,
+      vwapScaled: tradeAggregate.vwapScaled,
     };
   }
 
@@ -237,22 +301,33 @@ function buildIncrementalCandle({ blockHash, blockNumber, bucketStart, bucketTra
       previous_trade_count: existingCandle.tradeCount.toString(10),
       reconciliation_triggered: false,
       source: 'existing_candle_plus_current_block_trades',
+      vwap_price_source: 'normalized_execution_price',
+      volume_source: 'canonical_amount_deltas',
     },
     openScaled: existingCandle.openScaled,
     pendingEnrichment: existingCandle.pendingEnrichment || tradeAggregate.pendingEnrichment,
     poolId: tradeAggregate.poolId,
     priceIsDecimalsNormalized: existingCandle.priceIsDecimalsNormalized || tradeAggregate.priceIsDecimalsNormalized,
     protocol: tradeAggregate.protocol,
+    feeTierBps: existingCandle.feeTierBps ?? tradeAggregate.feeTierBps,
     seededFromPreviousClose: false,
     sourceEventIndex: tradeAggregate.sourceEventIndex,
+    sqrtRatioClose: tradeAggregate.sqrtRatioClose,
+    sqrtRatioOpen: existingCandle.sqrtRatioOpen ?? tradeAggregate.sqrtRatioOpen,
+    tickClose: tradeAggregate.tickClose,
+    tickOpen: existingCandle.tickOpen ?? tradeAggregate.tickOpen,
+    tickSpacing: existingCandle.tickSpacing ?? tradeAggregate.tickSpacing,
     token0Address: tradeAggregate.token0Address,
     token1Address: tradeAggregate.token1Address,
     tradeCount: existingCandle.tradeCount + tradeAggregate.tradeCount,
     transactionHash: tradeAggregate.transactionHash,
     transactionIndex: tradeAggregate.transactionIndex,
     volume0: existingCandle.volume0 + tradeAggregate.volume0,
+    volume0UsdScaled: existingCandle.volume0UsdScaled + tradeAggregate.volume0UsdScaled,
     volume1: existingCandle.volume1 + tradeAggregate.volume1,
+    volume1UsdScaled: existingCandle.volume1UsdScaled + tradeAggregate.volume1UsdScaled,
     volumeUsdScaled: existingCandle.volumeUsdScaled + tradeAggregate.volumeUsdScaled,
+    vwapScaled: combineVwap(existingCandle, tradeAggregate),
   };
 }
 
@@ -273,17 +348,22 @@ function aggregateBucketTrades(bucketTrades) {
     return left.tradeKey < right.tradeKey ? -1 : 1;
   });
 
-  const prices = sortedTrades.map((trade) => trade.priceToken1PerToken0Scaled);
+  const prices = sortedTrades.map((trade) => getNormalizedExecutionPriceScaled(trade));
   let highScaled = prices[0];
   let lowScaled = prices[0];
   let volume0 = 0n;
   let volume1 = 0n;
+  let volume0UsdScaled = 0n;
+  let volume1UsdScaled = 0n;
   let volumeUsdScaled = 0n;
+  let weightedPriceNumerator = 0n;
+  let weightedPriceDenominator = 0n;
   let pendingEnrichment = false;
 
   for (let index = 0; index < sortedTrades.length; index += 1) {
     const trade = sortedTrades[index];
     const priceScaled = prices[index];
+    const canonicalVolumes = deriveCanonicalTradeVolumes(trade);
 
     if (compareBigInt(priceScaled, highScaled) > 0) {
       highScaled = priceScaled;
@@ -293,13 +373,16 @@ function aggregateBucketTrades(bucketTrades) {
       lowScaled = priceScaled;
     }
 
-    volume0 += trade.volumeToken0;
-    volume1 += trade.volumeToken1;
-    pendingEnrichment = pendingEnrichment || Boolean(trade.pendingEnrichment);
-
+    volume0 += canonicalVolumes.volume0;
+    volume1 += canonicalVolumes.volume1;
     if (trade.notionalUsdScaled !== null) {
+      volume0UsdScaled += trade.notionalUsdScaled;
+      volume1UsdScaled += trade.notionalUsdScaled;
       volumeUsdScaled += trade.notionalUsdScaled;
     }
+    weightedPriceNumerator += scaledMultiply(priceScaled, canonicalVolumes.volume0, DEFAULT_SCALE);
+    weightedPriceDenominator += canonicalVolumes.volume0;
+    pendingEnrichment = pendingEnrichment || Boolean(trade.pendingEnrichment);
   }
 
   const first = sortedTrades[0];
@@ -307,23 +390,36 @@ function aggregateBucketTrades(bucketTrades) {
 
   return {
     closeScaled: prices[prices.length - 1],
+    feeTierBps: last.feeTier ?? null,
     highScaled,
     lane: first.lane,
     lowScaled,
+    metadata: {
+      vwap_price_source: 'normalized_execution_price',
+      volume_source: 'canonical_amount_deltas',
+    },
     openScaled: prices[0],
     pendingEnrichment,
     poolId: first.poolId,
     priceIsDecimalsNormalized: last.priceIsDecimalsNormalized,
     protocol: first.protocol,
     sourceEventIndex: last.sourceEventIndex,
+    sqrtRatioClose: last.sqrtRatioAfter ?? null,
+    sqrtRatioOpen: first.sqrtRatioAfter ?? null,
+    tickClose: last.tickAfter ?? null,
+    tickOpen: first.tickAfter ?? null,
+    tickSpacing: last.tickSpacing ?? first.tickSpacing ?? null,
     token0Address: first.token0Address,
     token1Address: first.token1Address,
     tradeCount: BigInt(sortedTrades.length),
     transactionHash: last.transactionHash,
     transactionIndex: last.transactionIndex,
     volume0,
+    volume0UsdScaled,
     volume1,
+    volume1UsdScaled,
     volumeUsdScaled,
+    vwapScaled: weightedPriceDenominator === 0n ? prices[prices.length - 1] : scaledDivide(weightedPriceNumerator, weightedPriceDenominator, DEFAULT_SCALE),
   };
 }
 
@@ -360,9 +456,18 @@ async function loadExistingCandle(client, { bucketStart, lane, poolId }) {
             close,
             price_is_decimals_normalized,
             pending_enrichment,
+            tick_open,
+            tick_close,
+            sqrt_ratio_open,
+            sqrt_ratio_close,
+            fee_tier_bps,
+            tick_spacing,
             volume0,
             volume1,
+            volume0_usd,
+            volume1_usd,
             volume_usd,
+            vwap,
             trade_count,
             seeded_from_previous_close
        FROM stark_ohlcv_1m
@@ -380,6 +485,7 @@ async function loadExistingCandle(client, { bucketStart, lane, poolId }) {
   const row = result.rows[0];
   return {
     closeScaled: decimalStringToScaled(row.close, DEFAULT_SCALE),
+    feeTierBps: row.fee_tier_bps === null ? null : toBigIntStrict(row.fee_tier_bps, 'existing candle fee tier bps'),
     highScaled: decimalStringToScaled(row.high, DEFAULT_SCALE),
     lowScaled: decimalStringToScaled(row.low, DEFAULT_SCALE),
     openScaled: decimalStringToScaled(row.open, DEFAULT_SCALE),
@@ -387,12 +493,20 @@ async function loadExistingCandle(client, { bucketStart, lane, poolId }) {
     priceIsDecimalsNormalized: row.price_is_decimals_normalized,
     protocol: row.protocol,
     seededFromPreviousClose: row.seeded_from_previous_close,
+    sqrtRatioClose: row.sqrt_ratio_close === null ? null : toBigIntStrict(row.sqrt_ratio_close, 'existing candle sqrt ratio close'),
+    sqrtRatioOpen: row.sqrt_ratio_open === null ? null : toBigIntStrict(row.sqrt_ratio_open, 'existing candle sqrt ratio open'),
+    tickClose: row.tick_close === null ? null : toBigIntStrict(row.tick_close, 'existing candle tick close'),
+    tickOpen: row.tick_open === null ? null : toBigIntStrict(row.tick_open, 'existing candle tick open'),
+    tickSpacing: row.tick_spacing === null ? null : toBigIntStrict(row.tick_spacing, 'existing candle tick spacing'),
     token0Address: row.token0_address,
     token1Address: row.token1_address,
     tradeCount: toBigIntStrict(row.trade_count, 'existing candle trade count'),
     volume0: toBigIntStrict(row.volume0, 'existing candle volume0'),
+    volume0UsdScaled: row.volume0_usd === null ? 0n : decimalStringToScaled(row.volume0_usd, DEFAULT_SCALE),
     volume1: toBigIntStrict(row.volume1, 'existing candle volume1'),
+    volume1UsdScaled: row.volume1_usd === null ? 0n : decimalStringToScaled(row.volume1_usd, DEFAULT_SCALE),
     volumeUsdScaled: decimalStringToScaled(row.volume_usd, DEFAULT_SCALE),
+    vwapScaled: row.vwap === null ? decimalStringToScaled(row.close, DEFAULT_SCALE) : decimalStringToScaled(row.vwap, DEFAULT_SCALE),
   };
 }
 
@@ -431,6 +545,14 @@ async function rebuildCandleForBucket(client, { bucketStart, lane, poolId }) {
             price_token1_per_token0,
             price_is_decimals_normalized,
             pending_enrichment,
+            tick_after,
+            sqrt_ratio_after,
+            fee_tier,
+            tick_spacing,
+            hops_from_stable,
+            is_aggregator_derived,
+            amount0_delta,
+            amount1_delta,
             volume_token0,
             volume_token1,
             notional_usd,
@@ -447,21 +569,44 @@ async function rebuildCandleForBucket(client, { bucketStart, lane, poolId }) {
     [lane, poolId, bucketStart],
   );
 
-  if (result.rowCount === 0) {
+  const rows = result.rows.filter((row) => {
+    if (row.is_aggregator_derived) {
+      return false;
+    }
+
+    const maxHops = parseNonNegativeBigInt(process.env.PHASE3_MAX_OHLCV_HOPS_FROM_STABLE, 2n);
+    if (row.hops_from_stable !== null && toBigIntStrict(row.hops_from_stable, 'rebuild hops from stable') > maxHops) {
+      return false;
+    }
+
+    return true;
+  });
+
+  if (rows.length === 0) {
     return null;
   }
 
-  const prices = result.rows.map((row) => decimalStringToScaled(row.price_token1_per_token0, DEFAULT_SCALE));
+  const prices = rows.map((row) => decimalStringToScaled(row.price_token1_per_token0, DEFAULT_SCALE));
   let highScaled = prices[0];
   let lowScaled = prices[0];
   let volume0 = 0n;
   let volume1 = 0n;
+  let volume0UsdScaled = 0n;
+  let volume1UsdScaled = 0n;
   let volumeUsdScaled = 0n;
+  let weightedPriceNumerator = 0n;
+  let weightedPriceDenominator = 0n;
   let pendingEnrichment = false;
 
-  for (let index = 0; index < result.rows.length; index += 1) {
-    const row = result.rows[index];
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
     const priceScaled = prices[index];
+    const canonicalVolumes = deriveCanonicalTradeVolumes({
+      amount0Delta: row.amount0_delta,
+      amount1Delta: row.amount1_delta,
+      volumeToken0: row.volume_token0,
+      volumeToken1: row.volume_token1,
+    });
 
     if (compareBigInt(priceScaled, highScaled) > 0) {
       highScaled = priceScaled;
@@ -471,27 +616,35 @@ async function rebuildCandleForBucket(client, { bucketStart, lane, poolId }) {
       lowScaled = priceScaled;
     }
 
-    volume0 += toBigIntStrict(row.volume_token0, 'candle volume0');
-    volume1 += toBigIntStrict(row.volume_token1, 'candle volume1');
+    volume0 += canonicalVolumes.volume0;
+    volume1 += canonicalVolumes.volume1;
+    weightedPriceNumerator += scaledMultiply(priceScaled, canonicalVolumes.volume0, DEFAULT_SCALE);
+    weightedPriceDenominator += canonicalVolumes.volume0;
     pendingEnrichment = pendingEnrichment || Boolean(row.pending_enrichment);
 
     if (row.notional_usd !== null) {
-      volumeUsdScaled += decimalStringToScaled(row.notional_usd, DEFAULT_SCALE);
+      const notionalUsdScaled = decimalStringToScaled(row.notional_usd, DEFAULT_SCALE);
+      volume0UsdScaled += notionalUsdScaled;
+      volume1UsdScaled += notionalUsdScaled;
+      volumeUsdScaled += notionalUsdScaled;
     }
   }
 
-  const first = result.rows[0];
-  const last = result.rows[result.rows.length - 1];
+  const first = rows[0];
+  const last = rows[rows.length - 1];
 
   return {
     blockHash: last.block_hash,
     blockNumber: toBigIntStrict(last.block_number, 'candle block number'),
     bucketStart,
     closeScaled: prices[prices.length - 1],
+    feeTierBps: last.fee_tier === null ? null : toBigIntStrict(last.fee_tier, 'rebuild fee tier'),
     highScaled,
     lane,
     lowScaled,
     metadata: {
+      vwap_price_source: 'normalized_execution_price',
+      volume_source: 'canonical_amount_deltas',
       pending_enrichment: pendingEnrichment,
       source: 'trades',
     },
@@ -502,14 +655,22 @@ async function rebuildCandleForBucket(client, { bucketStart, lane, poolId }) {
     protocol: first.protocol,
     seededFromPreviousClose: false,
     sourceEventIndex: toBigIntStrict(last.source_event_index, 'candle source event index'),
+    sqrtRatioClose: last.sqrt_ratio_after === null ? null : toBigIntStrict(last.sqrt_ratio_after, 'rebuild sqrt ratio close'),
+    sqrtRatioOpen: first.sqrt_ratio_after === null ? null : toBigIntStrict(first.sqrt_ratio_after, 'rebuild sqrt ratio open'),
+    tickClose: last.tick_after === null ? null : toBigIntStrict(last.tick_after, 'rebuild tick close'),
+    tickOpen: first.tick_after === null ? null : toBigIntStrict(first.tick_after, 'rebuild tick open'),
+    tickSpacing: last.tick_spacing === null ? null : toBigIntStrict(last.tick_spacing, 'rebuild tick spacing'),
     token0Address: first.token0_address,
     token1Address: first.token1_address,
-    tradeCount: BigInt(result.rowCount),
+    tradeCount: BigInt(rows.length),
     transactionHash: last.transaction_hash,
     transactionIndex: toBigIntStrict(last.transaction_index, 'candle transaction index'),
     volume0,
+    volume0UsdScaled,
     volume1,
+    volume1UsdScaled,
     volumeUsdScaled,
+    vwapScaled: weightedPriceDenominator === 0n ? prices[prices.length - 1] : scaledDivide(weightedPriceNumerator, weightedPriceDenominator, DEFAULT_SCALE),
   };
 }
 
@@ -593,13 +754,16 @@ async function rebuildPendingRange(client, { fromBucketStart, lane, poolId, toBu
     const bucketTrades = tradesByBucket.get(bucketKey) ?? [];
     let nextCandle;
 
-    if (bucketTrades.length > 0) {
-      const tradeAggregate = aggregateBucketTrades(bucketTrades);
+    const eligibleBucketTrades = filterTradesForOhlcv(bucketTrades);
+
+    if (eligibleBucketTrades.length > 0) {
+      const tradeAggregate = aggregateBucketTrades(eligibleBucketTrades);
       nextCandle = {
-        blockHash: tradeAggregate.blockHash ?? bucketTrades[bucketTrades.length - 1].blockHash,
-        blockNumber: bucketTrades[bucketTrades.length - 1].blockNumber,
+        blockHash: tradeAggregate.blockHash ?? eligibleBucketTrades[eligibleBucketTrades.length - 1].blockHash,
+        blockNumber: eligibleBucketTrades[eligibleBucketTrades.length - 1].blockNumber,
         bucketStart,
         closeScaled: tradeAggregate.closeScaled,
+        feeTierBps: tradeAggregate.feeTierBps,
         highScaled: tradeAggregate.highScaled,
         lane,
         lowScaled: tradeAggregate.lowScaled,
@@ -607,6 +771,7 @@ async function rebuildPendingRange(client, { fromBucketStart, lane, poolId, toBu
           cache_mode: 'pending_enrichment_rebuild',
           pending_enrichment: tradeAggregate.pendingEnrichment,
           source: 'trades',
+          vwap_price_source: 'normalized_execution_price',
         },
         openScaled: tradeAggregate.openScaled,
         pendingEnrichment: tradeAggregate.pendingEnrichment,
@@ -615,14 +780,22 @@ async function rebuildPendingRange(client, { fromBucketStart, lane, poolId, toBu
         protocol: tradeAggregate.protocol,
         seededFromPreviousClose: false,
         sourceEventIndex: tradeAggregate.sourceEventIndex,
+        sqrtRatioClose: tradeAggregate.sqrtRatioClose,
+        sqrtRatioOpen: tradeAggregate.sqrtRatioOpen,
+        tickClose: tradeAggregate.tickClose,
+        tickOpen: tradeAggregate.tickOpen,
+        tickSpacing: tradeAggregate.tickSpacing,
         token0Address: tradeAggregate.token0Address,
         token1Address: tradeAggregate.token1Address,
         tradeCount: tradeAggregate.tradeCount,
         transactionHash: tradeAggregate.transactionHash,
         transactionIndex: tradeAggregate.transactionIndex,
         volume0: tradeAggregate.volume0,
+        volume0UsdScaled: tradeAggregate.volume0UsdScaled,
         volume1: tradeAggregate.volume1,
+        volume1UsdScaled: tradeAggregate.volume1UsdScaled,
         volumeUsdScaled: tradeAggregate.volumeUsdScaled,
+        vwapScaled: tradeAggregate.vwapScaled,
       };
     } else if (previousCloseScaled !== null) {
       nextCandle = {
@@ -643,16 +816,25 @@ async function rebuildPendingRange(client, { fromBucketStart, lane, poolId, toBu
         poolId,
         priceIsDecimalsNormalized: existing.priceIsDecimalsNormalized,
         protocol: existing.protocol,
+        feeTierBps: existing.feeTierBps ?? null,
         seededFromPreviousClose: true,
         sourceEventIndex: existing.sourceEventIndex,
+        sqrtRatioClose: existing.sqrtRatioClose ?? null,
+        sqrtRatioOpen: existing.sqrtRatioOpen ?? null,
+        tickClose: existing.tickClose ?? null,
+        tickOpen: existing.tickOpen ?? null,
+        tickSpacing: existing.tickSpacing ?? null,
         token0Address: existing.token0Address,
         token1Address: existing.token1Address,
         tradeCount: 0n,
         transactionHash: existing.transactionHash,
         transactionIndex: existing.transactionIndex,
         volume0: 0n,
+        volume0UsdScaled: 0n,
         volume1: 0n,
+        volume1UsdScaled: 0n,
         volumeUsdScaled: 0n,
+        vwapScaled: previousCloseScaled,
       };
     } else {
       continue;
@@ -679,7 +861,13 @@ async function loadCandlesInRange(client, { fromBucketStart, lane, poolId, toBuc
             transaction_index,
             source_event_index,
             price_is_decimals_normalized,
-            pending_enrichment
+            pending_enrichment,
+            tick_open,
+            tick_close,
+            sqrt_ratio_open,
+            sqrt_ratio_close,
+            fee_tier_bps,
+            tick_spacing
        FROM stark_ohlcv_1m
       WHERE lane = $1
         AND pool_id = $2
@@ -693,10 +881,16 @@ async function loadCandlesInRange(client, { fromBucketStart, lane, poolId, toBuc
     blockHash: row.block_hash,
     blockNumber: toBigIntStrict(row.block_number, 'pending candle block number'),
     bucketStart: row.bucket_start,
+    feeTierBps: row.fee_tier_bps === null ? null : toBigIntStrict(row.fee_tier_bps, 'pending candle fee tier'),
     pendingEnrichment: row.pending_enrichment,
     priceIsDecimalsNormalized: row.price_is_decimals_normalized,
     protocol: row.protocol,
+    sqrtRatioClose: row.sqrt_ratio_close === null ? null : toBigIntStrict(row.sqrt_ratio_close, 'pending candle sqrt close'),
+    sqrtRatioOpen: row.sqrt_ratio_open === null ? null : toBigIntStrict(row.sqrt_ratio_open, 'pending candle sqrt open'),
     sourceEventIndex: row.source_event_index === null ? null : toBigIntStrict(row.source_event_index, 'pending candle source event index'),
+    tickClose: row.tick_close === null ? null : toBigIntStrict(row.tick_close, 'pending candle tick close'),
+    tickOpen: row.tick_open === null ? null : toBigIntStrict(row.tick_open, 'pending candle tick open'),
+    tickSpacing: row.tick_spacing === null ? null : toBigIntStrict(row.tick_spacing, 'pending candle tick spacing'),
     token0Address: row.token0_address,
     token1Address: row.token1_address,
     transactionHash: row.transaction_hash,
@@ -718,6 +912,14 @@ async function loadTradesInRange(client, { fromBucketStart, lane, poolId, toBuck
             price_token1_per_token0,
             price_is_decimals_normalized,
             pending_enrichment,
+            tick_after,
+            sqrt_ratio_after,
+            fee_tier,
+            tick_spacing,
+            hops_from_stable,
+            is_aggregator_derived,
+            amount0_delta,
+            amount1_delta,
             volume_token0,
             volume_token1,
             notional_usd
@@ -731,9 +933,14 @@ async function loadTradesInRange(client, { fromBucketStart, lane, poolId, toBuck
   );
 
   return result.rows.map((row) => ({
+    amount0Delta: row.amount0_delta === null ? null : toBigIntStrict(row.amount0_delta, 'pending trade amount0 delta'),
+    amount1Delta: row.amount1_delta === null ? null : toBigIntStrict(row.amount1_delta, 'pending trade amount1 delta'),
     blockHash: row.block_hash,
     blockNumber: toBigIntStrict(row.block_number, 'pending trade block number'),
     bucketStart: row.bucket_1m,
+    feeTier: row.fee_tier === null ? null : toBigIntStrict(row.fee_tier, 'pending trade fee tier'),
+    hopsFromStable: row.hops_from_stable === null ? null : toBigIntStrict(row.hops_from_stable, 'pending trade hops from stable'),
+    isAggregatorDerived: row.is_aggregator_derived,
     lane,
     notionalUsdScaled: row.notional_usd === null ? null : decimalStringToScaled(row.notional_usd, DEFAULT_SCALE),
     pendingEnrichment: row.pending_enrichment,
@@ -741,7 +948,10 @@ async function loadTradesInRange(client, { fromBucketStart, lane, poolId, toBuck
     priceIsDecimalsNormalized: row.price_is_decimals_normalized,
     priceToken1PerToken0Scaled: decimalStringToScaled(row.price_token1_per_token0, DEFAULT_SCALE),
     protocol: row.protocol,
+    sqrtRatioAfter: row.sqrt_ratio_after === null ? null : toBigIntStrict(row.sqrt_ratio_after, 'pending trade sqrt ratio after'),
     sourceEventIndex: toBigIntStrict(row.source_event_index, 'pending trade source event index'),
+    tickAfter: row.tick_after === null ? null : toBigIntStrict(row.tick_after, 'pending trade tick after'),
+    tickSpacing: row.tick_spacing === null ? null : toBigIntStrict(row.tick_spacing, 'pending trade tick spacing'),
     token0Address: row.token0_address,
     token1Address: row.token1_address,
     tradeKey: `${row.transaction_hash}:${row.source_event_index}`,
@@ -771,11 +981,20 @@ async function upsertCandle(client, candle) {
          high,
          low,
          close,
+         tick_open,
+         tick_close,
+         sqrt_ratio_open,
+         sqrt_ratio_close,
+         fee_tier_bps,
+         tick_spacing,
          price_is_decimals_normalized,
          pending_enrichment,
          volume0,
          volume1,
+         volume0_usd,
+         volume1_usd,
          volume_usd,
+         vwap,
          trade_count,
          seeded_from_previous_close,
          metadata,
@@ -784,7 +1003,8 @@ async function upsertCandle(client, candle) {
      ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
          $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-         $21, $22, $23, $24::jsonb, NOW(), NOW()
+         $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
+         $31, $32, $33::jsonb, NOW(), NOW()
      )
      ON CONFLICT (lane, pool_id, bucket_start)
      DO UPDATE SET
@@ -800,11 +1020,20 @@ async function upsertCandle(client, candle) {
          high = EXCLUDED.high,
          low = EXCLUDED.low,
          close = EXCLUDED.close,
+         tick_open = EXCLUDED.tick_open,
+         tick_close = EXCLUDED.tick_close,
+         sqrt_ratio_open = EXCLUDED.sqrt_ratio_open,
+         sqrt_ratio_close = EXCLUDED.sqrt_ratio_close,
+         fee_tier_bps = EXCLUDED.fee_tier_bps,
+         tick_spacing = EXCLUDED.tick_spacing,
          price_is_decimals_normalized = EXCLUDED.price_is_decimals_normalized,
          pending_enrichment = EXCLUDED.pending_enrichment,
          volume0 = EXCLUDED.volume0,
          volume1 = EXCLUDED.volume1,
+         volume0_usd = EXCLUDED.volume0_usd,
+         volume1_usd = EXCLUDED.volume1_usd,
          volume_usd = EXCLUDED.volume_usd,
+         vwap = EXCLUDED.vwap,
          trade_count = EXCLUDED.trade_count,
          seeded_from_previous_close = EXCLUDED.seeded_from_previous_close,
          metadata = EXCLUDED.metadata,
@@ -826,11 +1055,20 @@ async function upsertCandle(client, candle) {
       scaledToNumericString(candle.highScaled, DEFAULT_SCALE),
       scaledToNumericString(candle.lowScaled, DEFAULT_SCALE),
       scaledToNumericString(candle.closeScaled, DEFAULT_SCALE),
+      candle.tickOpen === null || candle.tickOpen === undefined ? null : toNumericString(candle.tickOpen, 'candle tick open'),
+      candle.tickClose === null || candle.tickClose === undefined ? null : toNumericString(candle.tickClose, 'candle tick close'),
+      candle.sqrtRatioOpen === null || candle.sqrtRatioOpen === undefined ? null : toNumericString(candle.sqrtRatioOpen, 'candle sqrt ratio open'),
+      candle.sqrtRatioClose === null || candle.sqrtRatioClose === undefined ? null : toNumericString(candle.sqrtRatioClose, 'candle sqrt ratio close'),
+      candle.feeTierBps === null || candle.feeTierBps === undefined ? null : toNumericString(candle.feeTierBps, 'candle fee tier bps'),
+      candle.tickSpacing === null || candle.tickSpacing === undefined ? null : toNumericString(candle.tickSpacing, 'candle tick spacing'),
       candle.priceIsDecimalsNormalized,
       candle.pendingEnrichment,
       toNumericString(candle.volume0, 'candle volume0'),
       toNumericString(candle.volume1, 'candle volume1'),
+      candle.volume0UsdScaled === null || candle.volume0UsdScaled === undefined ? null : scaledToNumericString(candle.volume0UsdScaled, DEFAULT_SCALE),
+      candle.volume1UsdScaled === null || candle.volume1UsdScaled === undefined ? null : scaledToNumericString(candle.volume1UsdScaled, DEFAULT_SCALE),
       scaledToNumericString(candle.volumeUsdScaled, DEFAULT_SCALE),
+      candle.vwapScaled === null || candle.vwapScaled === undefined ? null : scaledToNumericString(candle.vwapScaled, DEFAULT_SCALE),
       toNumericString(candle.tradeCount, 'candle trade count'),
       candle.seededFromPreviousClose,
       toJsonbString(candle.metadata ?? {}),
@@ -860,7 +1098,35 @@ function serializeRealtimeCandle(candle) {
     volume0: candle.volume0.toString(10),
     volume1: candle.volume1.toString(10),
     volumeUsd: scaledToNumericString(candle.volumeUsdScaled, DEFAULT_SCALE),
+    vwap: candle.vwapScaled === null || candle.vwapScaled === undefined ? null : scaledToNumericString(candle.vwapScaled, DEFAULT_SCALE),
   };
+}
+
+function combineVwap(existingCandle, tradeAggregate) {
+  const leftWeight = existingCandle.volume0;
+  const rightWeight = tradeAggregate.volume0;
+  const totalWeight = leftWeight + rightWeight;
+
+  if (totalWeight === 0n) {
+    return tradeAggregate.vwapScaled;
+  }
+
+  const leftWeighted = scaledMultiply(existingCandle.vwapScaled ?? existingCandle.closeScaled, leftWeight, DEFAULT_SCALE);
+  const rightWeighted = scaledMultiply(tradeAggregate.vwapScaled, rightWeight, DEFAULT_SCALE);
+  return scaledDivide(leftWeighted + rightWeighted, totalWeight, DEFAULT_SCALE);
+}
+
+function parseNonNegativeBigInt(value, fallbackValue) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return fallbackValue;
+  }
+
+  try {
+    const parsed = BigInt(String(value).trim());
+    return parsed >= 0n ? parsed : fallbackValue;
+  } catch (error) {
+    return fallbackValue;
+  }
 }
 
 module.exports = {

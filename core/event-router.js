@@ -3,7 +3,12 @@
 const { extractBridgeActivities } = require('./bridge');
 const { loadSequencedTransactions } = require('./event-sequencer');
 const { getCandidateProtocolsForSelector, isStandardDexSelector, resolveRoute } = require('./abi-registry');
-const { SELECTORS, isAggregatorSwapEvent } = require('../lib/registry/dex-registry');
+const {
+  SELECTORS,
+  getKnownLockerMatchByAddress,
+  getStaticMatchesByAddress,
+  isAggregatorSwapEvent,
+} = require('../lib/registry/dex-registry');
 const avnu = require('./protocols/avnu');
 const baseAmm = require('./protocols/base-amm');
 const ekubo = require('./protocols/ekubo');
@@ -12,6 +17,7 @@ const haiko = require('./protocols/haiko');
 const myswap = require('./protocols/myswap');
 const { normalizeActionMetadata, toJsonbString } = require('./protocols/shared');
 const { toNumericString } = require('../lib/cairo/bigint');
+const { DEFAULT_SCALE, scaledToNumericString } = require('../lib/cairo/fixed-point');
 
 const DECODERS = Object.freeze({
   avnu,
@@ -126,12 +132,11 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
 }
 
 function buildTransactionContext(tx) {
-  const hasAvnuSwap = tx.events.some((event) => isAggregatorSwapEvent(event));
-  const swapSignalCount = tx.events.filter((event) => isSwapSignal(event.selector)).length;
+  const avnuSwapEvents = tx.events.filter((event) => isAggregatorSwapEvent(event));
 
   return {
-    hasAvnuSwap,
-    swapSignalCount,
+    avnuSwapCount: avnuSwapEvents.length,
+    hasAvnuSwap: avnuSwapEvents.length > 0,
   };
 }
 
@@ -156,9 +161,9 @@ function applyTransactionRoutingContext(bundle, { route, tx, txContext }) {
       metadata,
     };
 
-    if (nextAction.actionType === 'swap' && txContext.swapSignalCount > 1) {
+    if (nextAction.actionType === 'swap' && nextAction.protocol === 'avnu' && txContext.avnuSwapCount > 1) {
       nextAction.metadata.is_multihop = true;
-      nextAction.metadata.hop_count = txContext.swapSignalCount;
+      nextAction.metadata.total_hops = txContext.avnuSwapCount;
     }
 
     if (nextAction.actionType === 'swap' && txContext.hasAvnuSwap) {
@@ -169,6 +174,14 @@ function applyTransactionRoutingContext(bundle, { route, tx, txContext }) {
         nextAction.routerProtocol = nextAction.routerProtocol ?? 'avnu';
         nextAction.metadata.is_route_leg = true;
         nextAction.metadata.via_aggregator = 'avnu';
+      }
+    }
+
+    if (!nextAction.routerProtocol) {
+      const lockerAddress = nextAction.metadata?.locker_address ?? nextAction.metadata?.raw_locker ?? null;
+      const inferredRouterProtocol = inferRouterProtocolFromLocker(lockerAddress, nextAction.protocol);
+      if (inferredRouterProtocol) {
+        nextAction.routerProtocol = inferredRouterProtocol;
       }
     }
 
@@ -317,16 +330,33 @@ async function upsertTransfer(client, tx, transfer) {
          from_address,
          to_address,
          amount,
+         amount_human,
+         amount_usd,
+         token_symbol,
+         token_name,
+         token_decimals,
+         transfer_type,
+         is_internal,
+         counterparty_type,
          protocol,
          metadata,
          created_at,
          updated_at
      ) VALUES (
-         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, NOW(), NOW()
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, NOW(), NOW()
      )
      ON CONFLICT (transfer_key)
      DO UPDATE SET
          amount = EXCLUDED.amount,
+         amount_human = EXCLUDED.amount_human,
+         amount_usd = EXCLUDED.amount_usd,
+         token_symbol = EXCLUDED.token_symbol,
+         token_name = EXCLUDED.token_name,
+         token_decimals = EXCLUDED.token_decimals,
+         transfer_type = EXCLUDED.transfer_type,
+         is_internal = EXCLUDED.is_internal,
+         counterparty_type = EXCLUDED.counterparty_type,
          metadata = EXCLUDED.metadata,
          updated_at = NOW()`,
     [
@@ -341,6 +371,14 @@ async function upsertTransfer(client, tx, transfer) {
       transfer.fromAddress,
       transfer.toAddress,
       toNumericString(transfer.amount, 'transfer amount'),
+      transfer.amountHumanScaled === undefined || transfer.amountHumanScaled === null ? null : scaledToNumericString(transfer.amountHumanScaled, DEFAULT_SCALE),
+      transfer.amountUsdScaled === undefined || transfer.amountUsdScaled === null ? null : scaledToNumericString(transfer.amountUsdScaled, DEFAULT_SCALE),
+      transfer.tokenSymbol ?? null,
+      transfer.tokenName ?? null,
+      transfer.tokenDecimals === undefined || transfer.tokenDecimals === null ? null : toNumericString(transfer.tokenDecimals, 'transfer token decimals'),
+      transfer.transferType ?? 'standard_transfer',
+      Boolean(transfer.isInternal),
+      transfer.counterpartyType ?? 'unknown',
       transfer.protocol,
       toJsonbString(transfer.metadata ?? {}),
     ],
@@ -505,6 +543,21 @@ function toNullableNumeric(value) {
 
 function isFatalDecodeAudit(route) {
   return Boolean(route?.contractMetadata?.decoder || route?.contractMetadata?.protocol);
+}
+
+function inferRouterProtocolFromLocker(lockerAddress, defaultProtocol) {
+  if (!lockerAddress) {
+    return null;
+  }
+
+  const knownLockerMatch = getKnownLockerMatchByAddress(lockerAddress);
+  if (knownLockerMatch?.protocolKey) {
+    return knownLockerMatch.protocolKey;
+  }
+
+  const matches = getStaticMatchesByAddress(lockerAddress);
+  const sameProtocolCore = matches.find((entry) => entry.protocolKey === defaultProtocol);
+  return sameProtocolCore?.protocolKey ?? null;
 }
 
 function createReceiptContextController() {

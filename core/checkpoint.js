@@ -42,6 +42,19 @@ const PHASE6_TABLES = Object.freeze([
   'stark_leaderboards',
   'stark_whale_alert_candidates',
 ]);
+const SCHEMA_ENHANCEMENT_TABLES = Object.freeze([
+  'tokens',
+]);
+const SCHEMA_ENHANCEMENT_COLUMNS = Object.freeze([
+  { table: 'stark_trades', column: 'route_group_key' },
+  { table: 'stark_trades', column: 'locker_address' },
+  { table: 'stark_prices', column: 'bucket_1m' },
+  { table: 'stark_price_ticks', column: 'hops_from_stable' },
+  { table: 'stark_price_ticks', column: 'low_confidence' },
+  { table: 'stark_pool_latest', column: 'tick_after' },
+  { table: 'stark_ohlcv_1m', column: 'vwap' },
+  { table: 'stark_transfers', column: 'amount_human' },
+]);
 
 async function assertFoundationTables(client) {
   await assertTablesExist(client, FOUNDATION_TABLES, 'Foundation', 'sql/001_foundation.sql');
@@ -63,6 +76,11 @@ async function assertPhase6Tables(client) {
   await assertTablesExist(client, PHASE6_TABLES, 'Phase 6', 'sql/006_analytics.sql');
 }
 
+async function assertSchemaEnhancementTables(client) {
+  await assertTablesExist(client, SCHEMA_ENHANCEMENT_TABLES, 'Schema enhancement', 'sql/007_schema_enhancements.sql');
+  await assertColumnsExist(client, SCHEMA_ENHANCEMENT_COLUMNS, 'Schema enhancement', 'sql/007_schema_enhancements.sql');
+}
+
 async function assertTablesExist(client, tableNames, label, migrationFile) {
   const result = await client.query(
     `SELECT table_name, to_regclass('public.' || table_name) AS regclass
@@ -76,6 +94,27 @@ async function assertTablesExist(client, tableNames, label, migrationFile) {
 
   if (missing.length > 0) {
     throw new Error(`${label} tables are missing. Run ${migrationFile} first. Missing: ${missing.join(', ')}`);
+  }
+}
+
+async function assertColumnsExist(client, expectedColumns, label, migrationFile) {
+  const result = await client.query(
+    `SELECT table_name, column_name
+       FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND (
+             ${expectedColumns.map((_, index) => `(table_name = $${(index * 2) + 1} AND column_name = $${(index * 2) + 2})`).join(' OR ')}
+        )`,
+    expectedColumns.flatMap((item) => [item.table, item.column]),
+  );
+
+  const existing = new Set(result.rows.map((row) => `${row.table_name}:${row.column_name}`));
+  const missing = expectedColumns
+    .filter((item) => !existing.has(`${item.table}:${item.column}`))
+    .map((item) => `${item.table}.${item.column}`);
+
+  if (missing.length > 0) {
+    throw new Error(`${label} columns are missing. Run ${migrationFile} first. Missing: ${missing.join(', ')}`);
   }
 }
 
@@ -161,6 +200,7 @@ module.exports = {
   assertPhase3Tables,
   assertPhase4Tables,
   assertPhase6Tables,
+  assertSchemaEnhancementTables,
   advanceCheckpoint,
   ensureIndexStateRows,
   getCheckpoint,

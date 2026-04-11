@@ -18,19 +18,27 @@ async function persistPriceDataForBlock(client, { priceCandidates }) {
 
   const staleAfterBlocks = parsePositiveBigInt(process.env.PHASE3_PRICE_STALE_AFTER_BLOCKS, 600n);
   const normalizedCandidates = normalizeCandidates(priceCandidates, staleAfterBlocks);
-  const sortedCandidates = [...normalizedCandidates].sort(compareCandidates);
+  const priceTickCandidates = normalizedCandidates
+    .filter((candidate) => !candidate.excludeFromPriceTicks)
+    .sort(compareCandidates);
+  const latestPriceCandidates = priceTickCandidates
+    .filter((candidate) => !candidate.excludeFromLatestPrices)
+    .sort(compareCandidates);
 
-  for (const candidate of sortedCandidates) {
+  for (const candidate of priceTickCandidates) {
     await insertPriceTick(client, candidate);
+  }
+
+  for (const candidate of latestPriceCandidates) {
     await upsertLatestPrice(client, candidate);
   }
 
   return {
-    realtimePriceTicks: sortedCandidates.map(serializeRealtimeTick),
+    realtimePriceTicks: priceTickCandidates.map(serializeRealtimeTick),
     summary: {
-      latestPrices: sortedCandidates.length,
-      priceTicks: sortedCandidates.length,
-      stalePrices: sortedCandidates.filter((candidate) => candidate.priceIsStale).length,
+      latestPrices: latestPriceCandidates.length,
+      priceTicks: priceTickCandidates.length,
+      stalePrices: priceTickCandidates.filter((candidate) => candidate.priceIsStale).length,
     },
   };
 }
@@ -84,8 +92,27 @@ function normalizeCandidates(priceCandidates, staleAfterBlocks) {
     return {
       ...candidate,
       blockNumber,
+      buyAmountRaw: candidate.buyAmountRaw === undefined || candidate.buyAmountRaw === null
+        ? null
+        : toBigIntStrict(candidate.buyAmountRaw, 'buy amount raw'),
+      excludeFromLatestPrices: Boolean(candidate.excludeFromLatestPrices),
+      excludeFromPriceTicks: Boolean(candidate.excludeFromPriceTicks),
+      hopsFromStable: candidate.hopsFromStable === undefined || candidate.hopsFromStable === null
+        ? null
+        : toBigIntStrict(candidate.hopsFromStable, 'candidate hops from stable'),
+      isAggregatorDerived: Boolean(candidate.isAggregatorDerived),
+      lowConfidence: Boolean(candidate.lowConfidence) || (
+        candidate.hopsFromStable !== undefined &&
+        candidate.hopsFromStable !== null &&
+        toBigIntStrict(candidate.hopsFromStable, 'candidate low-confidence hops from stable') > 1n
+      ),
       priceIsStale,
+      priceDeviationPctScaled: candidate.priceDeviationPctScaled === undefined ? null : candidate.priceDeviationPctScaled,
+      priceRawExecutionScaled: candidate.priceRawExecutionScaled === undefined ? null : candidate.priceRawExecutionScaled,
       priceUpdatedAtBlock: updatedAtBlock,
+      sellAmountRaw: candidate.sellAmountRaw === undefined || candidate.sellAmountRaw === null
+        ? null
+        : toBigIntStrict(candidate.sellAmountRaw, 'sell amount raw'),
       sourceEventIndex: toBigIntStrict(candidate.sourceEventIndex, 'price candidate source event index'),
       transactionIndex: toBigIntStrict(candidate.transactionIndex, 'price candidate transaction index'),
     };
@@ -129,10 +156,19 @@ async function loadLatestPriceTick(client, { lane, tokenAddress }) {
             price_source,
             price_is_stale,
             price_updated_at_block,
+            bucket_1m,
+            hops_from_stable,
+            low_confidence,
+            is_aggregator_derived,
+            sell_amount_raw,
+            buy_amount_raw,
+            price_raw_execution,
+            price_deviation_pct,
             metadata
-       FROM stark_price_ticks
-      WHERE lane = $1
-        AND token_address = $2
+      FROM stark_price_ticks
+     WHERE lane = $1
+       AND token_address = $2
+       AND low_confidence = FALSE
       ORDER BY block_number DESC, transaction_index DESC, source_event_index DESC
       LIMIT 1`,
     [lane, tokenAddress],
@@ -150,12 +186,19 @@ async function loadLatestPriceTick(client, { lane, tokenAddress }) {
     lane: row.lane,
     metadata: row.metadata ?? {},
     poolId: row.source_pool_id,
+    buyAmountRaw: row.buy_amount_raw === null ? null : toBigIntStrict(row.buy_amount_raw, 'restored buy amount raw'),
+    hopsFromStable: row.hops_from_stable === null ? null : toBigIntStrict(row.hops_from_stable, 'restored hops from stable'),
+    isAggregatorDerived: row.is_aggregator_derived,
+    lowConfidence: row.low_confidence,
     priceIsStale: row.price_is_stale,
+    priceDeviationPctScaled: row.price_deviation_pct === null ? null : decimalStringToScaled(row.price_deviation_pct, DEFAULT_SCALE),
+    priceRawExecutionScaled: row.price_raw_execution === null ? null : decimalStringToScaled(row.price_raw_execution, DEFAULT_SCALE),
     priceQuoteScaled: row.price_quote === null ? null : decimalStringToScaled(row.price_quote, DEFAULT_SCALE),
     priceSource: row.price_source,
     priceUpdatedAtBlock: toBigIntStrict(row.price_updated_at_block, 'restored price updated at block'),
     priceUsdScaled: decimalStringToScaled(row.price_usd, DEFAULT_SCALE),
     quoteTokenAddress: row.quote_token_address,
+    sellAmountRaw: row.sell_amount_raw === null ? null : toBigIntStrict(row.sell_amount_raw, 'restored sell amount raw'),
     sourceEventIndex: toBigIntStrict(row.source_event_index, 'restored latest price source event index'),
     tokenAddress: row.token_address,
     transactionHash: row.transaction_hash,
@@ -203,12 +246,20 @@ async function insertPriceTick(client, candidate) {
          price_is_stale,
          price_updated_at_block,
          bucket_1m,
+         hops_from_stable,
+         low_confidence,
+         is_aggregator_derived,
+         sell_amount_raw,
+         buy_amount_raw,
+         price_raw_execution,
+         price_deviation_pct,
          metadata,
          created_at,
          updated_at
      ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-         $11, $12, $13, $14, $15, $16, $17, $18::jsonb, NOW(), NOW()
+         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+         $21, $22, $23, $24, $25::jsonb, NOW(), NOW()
      )
      ON CONFLICT (lane, token_address, transaction_hash, source_event_index, source_pool_id)
      DO UPDATE SET
@@ -222,6 +273,13 @@ async function insertPriceTick(client, candidate) {
          price_is_stale = EXCLUDED.price_is_stale,
          price_updated_at_block = EXCLUDED.price_updated_at_block,
          bucket_1m = EXCLUDED.bucket_1m,
+         hops_from_stable = EXCLUDED.hops_from_stable,
+         low_confidence = EXCLUDED.low_confidence,
+         is_aggregator_derived = EXCLUDED.is_aggregator_derived,
+         sell_amount_raw = EXCLUDED.sell_amount_raw,
+         buy_amount_raw = EXCLUDED.buy_amount_raw,
+         price_raw_execution = EXCLUDED.price_raw_execution,
+         price_deviation_pct = EXCLUDED.price_deviation_pct,
          metadata = EXCLUDED.metadata,
          updated_at = NOW()`,
     [
@@ -242,6 +300,13 @@ async function insertPriceTick(client, candidate) {
       candidate.priceIsStale,
       toNumericString(candidate.priceUpdatedAtBlock, 'price updated at block'),
       floorToMinute(candidate.blockTimestampDate),
+      candidate.hopsFromStable === null || candidate.hopsFromStable === undefined ? null : toNumericString(candidate.hopsFromStable, 'price tick hops from stable'),
+      candidate.lowConfidence,
+      candidate.isAggregatorDerived,
+      candidate.sellAmountRaw === null || candidate.sellAmountRaw === undefined ? null : toNumericString(candidate.sellAmountRaw, 'price tick sell amount raw'),
+      candidate.buyAmountRaw === null || candidate.buyAmountRaw === undefined ? null : toNumericString(candidate.buyAmountRaw, 'price tick buy amount raw'),
+      candidate.priceRawExecutionScaled === null || candidate.priceRawExecutionScaled === undefined ? null : scaledToNumericString(candidate.priceRawExecutionScaled, DEFAULT_SCALE),
+      candidate.priceDeviationPctScaled === null || candidate.priceDeviationPctScaled === undefined ? null : scaledToNumericString(candidate.priceDeviationPctScaled, DEFAULT_SCALE),
       toJsonbString(candidate.metadata ?? {}),
     ],
   );
@@ -265,12 +330,21 @@ async function upsertLatestPrice(client, candidate) {
          price_source,
          price_is_stale,
          price_updated_at_block,
+         bucket_1m,
+         hops_from_stable,
+         low_confidence,
+         is_aggregator_derived,
+         sell_amount_raw,
+         buy_amount_raw,
+         price_raw_execution,
+         price_deviation_pct,
          metadata,
          created_at,
          updated_at
      ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-         $11, $12, $13, $14, $15, $16::jsonb, NOW(), NOW()
+         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+         $21, $22, $23, $24::jsonb, NOW(), NOW()
      )
      ON CONFLICT (lane, token_address)
      DO UPDATE SET
@@ -287,6 +361,14 @@ async function upsertLatestPrice(client, candidate) {
          price_source = EXCLUDED.price_source,
          price_is_stale = EXCLUDED.price_is_stale,
          price_updated_at_block = EXCLUDED.price_updated_at_block,
+         bucket_1m = EXCLUDED.bucket_1m,
+         hops_from_stable = EXCLUDED.hops_from_stable,
+         low_confidence = EXCLUDED.low_confidence,
+         is_aggregator_derived = EXCLUDED.is_aggregator_derived,
+         sell_amount_raw = EXCLUDED.sell_amount_raw,
+         buy_amount_raw = EXCLUDED.buy_amount_raw,
+         price_raw_execution = EXCLUDED.price_raw_execution,
+         price_deviation_pct = EXCLUDED.price_deviation_pct,
          metadata = EXCLUDED.metadata,
          updated_at = NOW()
      WHERE stark_prices.block_number < EXCLUDED.block_number
@@ -314,6 +396,14 @@ async function upsertLatestPrice(client, candidate) {
       candidate.priceSource,
       candidate.priceIsStale,
       toNumericString(candidate.priceUpdatedAtBlock, 'price updated at block'),
+      floorToMinute(candidate.blockTimestampDate),
+      candidate.hopsFromStable === null || candidate.hopsFromStable === undefined ? null : toNumericString(candidate.hopsFromStable, 'latest price hops from stable'),
+      candidate.lowConfidence,
+      candidate.isAggregatorDerived,
+      candidate.sellAmountRaw === null || candidate.sellAmountRaw === undefined ? null : toNumericString(candidate.sellAmountRaw, 'latest price sell amount raw'),
+      candidate.buyAmountRaw === null || candidate.buyAmountRaw === undefined ? null : toNumericString(candidate.buyAmountRaw, 'latest price buy amount raw'),
+      candidate.priceRawExecutionScaled === null || candidate.priceRawExecutionScaled === undefined ? null : scaledToNumericString(candidate.priceRawExecutionScaled, DEFAULT_SCALE),
+      candidate.priceDeviationPctScaled === null || candidate.priceDeviationPctScaled === undefined ? null : scaledToNumericString(candidate.priceDeviationPctScaled, DEFAULT_SCALE),
       toJsonbString(candidate.metadata ?? {}),
     ],
   );
@@ -334,8 +424,10 @@ function serializeRealtimeTick(candidate) {
     blockNumber: candidate.blockNumber.toString(10),
     blockTimestamp: candidate.blockTimestampDate.toISOString(),
     lane: candidate.lane,
+    lowConfidence: candidate.lowConfidence,
     poolId: candidate.poolId,
     priceIsStale: candidate.priceIsStale,
+    priceDeviationPct: candidate.priceDeviationPctScaled === null ? null : scaledToNumericString(candidate.priceDeviationPctScaled, DEFAULT_SCALE),
     priceQuote: candidate.priceQuoteScaled === null ? null : scaledToNumericString(candidate.priceQuoteScaled, DEFAULT_SCALE),
     priceSource: candidate.priceSource,
     priceUpdatedAtBlock: candidate.priceUpdatedAtBlock.toString(10),

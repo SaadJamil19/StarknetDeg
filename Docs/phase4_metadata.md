@@ -1,7 +1,7 @@
 # StarknetDeg Phase 4 Metadata
 
-Date: April 6, 2026  
-Scope: Plain-English explanation of the Phase 4 enrichment layer. This phase does not create new trades. It makes the existing trading data more useful and safer by attaching token metadata, tracking class-hash changes, and adding basic contract-risk signals.
+Date: April 10, 2026  
+Scope: Plain-English explanation of the Phase 4 enrichment layer after the schema-enhancement pass. This phase still does not create new trades, but it now feeds a shared token registry and keeps the rest of the pipeline aligned on token identity and contract risk.
 
 ## 1. What Phase 4 Actually Does
 
@@ -25,6 +25,10 @@ But the data is still incomplete in three important ways:
 4. Trades can arrive before metadata does. If decimals are missing at trade time, we still need the row, but we must clearly mark it as incomplete and reprocess it later.
 
 Phase 4 solves those three gaps.
+
+The enhancement pass added one more important responsibility:
+
+- Phase 4 now syncs enriched token facts into a shared `tokens` table so transfer trust, pricing, and analytics do not each keep their own separate token truth.
 
 ## 2. Why We Did Not Put This Inside The Canonical Block Commit
 
@@ -56,6 +60,15 @@ It also refined two Phase 3 tables:
 - `stark_ohlcv_1m`
 
 Both now carry `pending_enrichment`.
+
+After the enhancement pass, there is also a shared `tokens` table in the database.
+
+That table is not a replacement for `stark_token_metadata`.
+
+The right way to think about them is:
+
+- `stark_token_metadata` = raw enrichment record for a token
+- `tokens` = shared token identity record that the rest of the pipeline uses
 
 ### 3.1 `stark_block_state_updates`
 
@@ -222,7 +235,7 @@ This file now handles the metadata race condition directly.
 
 What changed:
 
-- trade materialization now loads token metadata from `stark_token_metadata`, not only from the static known-token cache
+- trade materialization now loads token truth through the shared `tokens` table, which is itself fed by `stark_token_metadata`
 - if decimals are missing, it uses a default of `18`
 - the trade is still written
 - but `pending_enrichment = true` is set on the row
@@ -364,14 +377,16 @@ What it does:
    - `totalSupply()`
 4. decodes the results safely
 5. upserts `stark_token_metadata`
-6. refreshes security state for the same token contract
-7. if decimals were newly resolved, re-prices pending trades and rebuilds pending candles
+6. syncs the resolved token facts into the shared `tokens` table
+7. refreshes security state for the same token contract
+8. if decimals were newly resolved, re-prices pending trades and rebuilds pending candles
 
 Important detail:
 
 - verified ERC-20 tokens from the known-token cache are marked `is_verified = true`
 - metadata refresh now has a block-based TTL through `last_refreshed_block`
 - this means `total_supply` and contract security are refreshed periodically, not only once forever
+- token identity becomes reusable by the rest of the pipeline through the shared `tokens` table
 
 Important race-condition detail:
 

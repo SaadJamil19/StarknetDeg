@@ -1,7 +1,9 @@
 'use strict';
 
+const { DEFAULT_SCALE, integerAmountToScaled } = require('../../lib/cairo/fixed-point');
 const { normalizeAddress, parseU256FromArray } = require('../normalize');
 const { resolveTrustedToken } = require('../token-trust-cache');
+const { isStableSymbol } = require('../token-registry');
 const { buildActionKey, buildTransferKey, normalizeActionMetadata } = require('./shared');
 
 async function decodeEvent({ client, tx, event }) {
@@ -50,6 +52,10 @@ async function decodeEvent({ client, tx, event }) {
     verification_level: trustedToken.verificationLevel,
     verification_source: trustedToken.verificationSource,
   });
+  const amountHumanScaled = trustedToken.decimals === null || trustedToken.decimals === undefined
+    ? null
+    : integerAmountToScaled(amount, trustedToken.decimals, DEFAULT_SCALE);
+  const amountUsdScaled = isStableSymbol(trustedToken.symbol) ? amountHumanScaled : null;
 
   return {
     actions: [
@@ -75,12 +81,19 @@ async function decodeEvent({ client, tx, event }) {
     transfers: [
       {
         amount,
+        amountHumanScaled,
+        amountUsdScaled,
+        counterpartyType: 'unknown',
         fromAddress,
         metadata: actionMetadata,
         protocol: 'erc20',
         sourceEventIndex: event.receiptEventIndex,
+        tokenDecimals: trustedToken.decimals ?? null,
+        tokenName: trustedToken.name ?? null,
+        tokenSymbol: trustedToken.symbol ?? null,
         toAddress,
         tokenAddress,
+        transferType: 'standard_transfer',
         transferKey: buildTransferKey({
           lane: tx.lane,
           transactionHash: tx.transactionHash,

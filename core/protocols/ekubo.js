@@ -1,6 +1,9 @@
 'use strict';
 
-const { SELECTORS } = require('../../lib/registry/dex-registry');
+const {
+  SELECTORS,
+  getKnownLockerMatchByAddress,
+} = require('../../lib/registry/dex-registry');
 const {
   buildPoolKeyId,
   normalizeAddress,
@@ -21,6 +24,8 @@ const EXPECTED_LENGTHS = Object.freeze({
   SAVED_BALANCE: 4,
   SWAPPED: 21,
 });
+
+const WARNED_UNKNOWN_LOCKERS = new Set();
 
 function decodeEvent({ tx, event, receiptContext }) {
   const state = getEkuboState(receiptContext);
@@ -211,6 +216,10 @@ function decodeLoadedBalance(tx, event, state) {
 function buildSwapAction(tx, item, state, sequence) {
   const { payload } = item;
   const priceRatio = sqrtRatioToPriceRatio(payload.sqrtRatioAfter, 'ekubo.swap.sqrt_ratio_after');
+  const lockerResolution = resolveLockerRouting(payload.locker, {
+    sourceEventIndex: item.eventIndex,
+    transactionHash: tx.transactionHash,
+  });
 
   return {
     actionKey: buildActionKey({
@@ -226,10 +235,14 @@ function buildSwapAction(tx, item, state, sequence) {
     amount1: payload.delta.amount1,
     emitterAddress: payload.emitterAddress,
     executionProtocol: 'ekubo',
+    routerProtocol: lockerResolution.routerProtocol,
     metadata: normalizeActionMetadata({
       delta: payload.delta,
+      extension_address: payload.poolKey.extension,
+      fee_tier: payload.poolKey.fee,
       is_token1: payload.params.isToken1,
       liquidity_after: payload.liquidityAfter,
+      locker_address: payload.locker,
       lock_events_loaded_balance_count: state.loadedBalances.length,
       lock_events_saved_balance_count: state.savedBalances.length,
       price_ratio_denominator: priceRatio.denominator,
@@ -237,11 +250,14 @@ function buildSwapAction(tx, item, state, sequence) {
       raw_locker: payload.locker,
       receipt_context_id: tx.transactionHash,
       receipt_sequence: sequence,
+      router_protocol_source: lockerResolution.source,
       skip_ahead: payload.params.skipAhead,
       sqrt_ratio_after: payload.sqrtRatioAfter,
       sqrt_ratio_limit: payload.params.sqrtRatioLimit,
       supplied_amount: payload.params.amount,
       tick_after: payload.tickAfter,
+      tick_spacing: payload.poolKey.tickSpacing,
+      unknown_locker: lockerResolution.isUnknownLocker,
     }),
     poolId: buildPoolKeyId(payload.poolKey),
     protocol: 'ekubo',
@@ -253,6 +269,10 @@ function buildSwapAction(tx, item, state, sequence) {
 
 function buildPositionUpdateAction(tx, item, state, sequence) {
   const { payload } = item;
+  const lockerResolution = resolveLockerRouting(payload.locker, {
+    sourceEventIndex: item.eventIndex,
+    transactionHash: tx.transactionHash,
+  });
 
   return {
     actionKey: buildActionKey({
@@ -268,15 +288,22 @@ function buildPositionUpdateAction(tx, item, state, sequence) {
     amount1: payload.delta.amount1,
     emitterAddress: payload.emitterAddress,
     executionProtocol: 'ekubo',
+    routerProtocol: lockerResolution.routerProtocol,
     metadata: normalizeActionMetadata({
       bounds: payload.params.bounds,
       delta: payload.delta,
+      extension_address: payload.poolKey.extension,
+      fee_tier: payload.poolKey.fee,
+      locker_address: payload.locker,
       liquidity_delta: payload.params.liquidityDelta,
       position_fees_collected_seen: state.positionFeesCollected.length,
       raw_locker: payload.locker,
       receipt_context_id: tx.transactionHash,
       receipt_sequence: sequence,
+      router_protocol_source: lockerResolution.source,
       salt: payload.params.salt,
+      tick_spacing: payload.poolKey.tickSpacing,
+      unknown_locker: lockerResolution.isUnknownLocker,
     }),
     poolId: buildPoolKeyId(payload.poolKey),
     protocol: 'ekubo',
@@ -325,6 +352,38 @@ function clearReceiptContext({ receiptContext }) {
   delete receiptContext.poolInitializations;
   delete receiptContext.positionFeesCollected;
   delete receiptContext.savedBalances;
+}
+
+function resolveLockerRouting(lockerAddress, { sourceEventIndex, transactionHash }) {
+  if (!lockerAddress) {
+    return {
+      isUnknownLocker: false,
+      routerProtocol: null,
+      source: null,
+    };
+  }
+
+  const lockerMatch = getKnownLockerMatchByAddress(lockerAddress);
+  if (lockerMatch) {
+    return {
+      isUnknownLocker: false,
+      routerProtocol: lockerMatch.protocolKey ?? lockerMatch.protocol ?? null,
+      source: 'locker_registry',
+    };
+  }
+
+  if (!WARNED_UNKNOWN_LOCKERS.has(lockerAddress)) {
+    WARNED_UNKNOWN_LOCKERS.add(lockerAddress);
+    console.warn(
+      `[LOG_LEVEL_WARN] ekubo unknown locker_address=${lockerAddress} transaction_hash=${transactionHash} source_event_index=${sourceEventIndex}`,
+    );
+  }
+
+  return {
+    isUnknownLocker: true,
+    routerProtocol: `unknown_locker_${lockerAddress}`,
+    source: 'unknown_locker',
+  };
 }
 
 function decodePoolKey(values, offset, label) {

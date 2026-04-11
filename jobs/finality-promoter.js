@@ -8,6 +8,7 @@ const { setTimeout: sleep } = require('node:timers/promises');
 const { processAcceptedBlock } = require('../core/block-processor');
 const { assertFoundationTables, assertPhase2Tables, assertPhase3Tables, assertPhase4Tables, assertPhase6Tables, ensureIndexStateRows, getCheckpoint } = require('../core/checkpoint');
 const { FINALITY_LANES, normalizeFinalityStatus } = require('../core/finality');
+const { markTokenRegistryForReverification } = require('../core/token-registry');
 const { closePool, withClient, withTransaction } = require('../lib/db');
 const { StarknetRpcClient } = require('../lib/starknet-rpc');
 const { toNumericString } = require('../lib/cairo/bigint');
@@ -364,6 +365,7 @@ async function deleteReconciliationWindow(client, { fromBlockNumber, lane }) {
   await client.query(`DELETE FROM stark_token_concentration WHERE lane = $1`, [lane]);
   await client.query(`DELETE FROM stark_leaderboards WHERE lane = $1`, [lane]);
   await client.query(`DELETE FROM stark_whale_alert_candidates WHERE lane = $1`, [lane]);
+  await markTokenRegistryForReverification(client, { fromBlockNumber });
 }
 
 async function restoreLatestMaterializedState(client, { lane }) {

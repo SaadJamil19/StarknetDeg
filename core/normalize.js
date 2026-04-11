@@ -153,6 +153,25 @@ function buildPoolKeyId(poolKey) {
   ].join(':');
 }
 
+function parsePoolKeyId(poolKeyId, label = 'pool key id') {
+  if (poolKeyId === undefined || poolKeyId === null || String(poolKeyId).trim() === '') {
+    return null;
+  }
+
+  const parts = String(poolKeyId).split(':');
+  if (parts.length !== 5) {
+    throw new RangeError(`${label} must contain token0:token1:fee:tickSpacing:extension.`);
+  }
+
+  return {
+    extension: normalizeAddress(parts[4], `${label}.extension`),
+    fee: parseU128(parts[2], `${label}.fee`),
+    tickSpacing: parseU128(parts[3], `${label}.tickSpacing`),
+    token0: normalizeAddress(parts[0], `${label}.token0`),
+    token1: normalizeAddress(parts[1], `${label}.token1`),
+  };
+}
+
 function sqrtRatioToPriceRatio(value, label = 'sqrt ratio') {
   const sqrtRatio = toBigIntStrict(value, label);
   if (sqrtRatio < 0n) {
@@ -198,6 +217,7 @@ module.exports = {
   Q256,
   ZERO_ADDRESS,
   buildPoolKeyId,
+  parsePoolKeyId,
   isZeroAddress,
   normalizeAddress,
   normalizeBoolFromFelt,

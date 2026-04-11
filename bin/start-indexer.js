@@ -7,7 +7,16 @@ require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 const { setTimeout: sleep } = require('node:timers/promises');
 const { syncRegistryToDatabase } = require('../core/abi-registry');
 const { processAcceptedBlock } = require('../core/block-processor');
-const { assertFoundationTables, assertPhase2Tables, assertPhase3Tables, assertPhase4Tables, ensureIndexStateRows, getCheckpoint } = require('../core/checkpoint');
+const {
+  assertFoundationTables,
+  assertPhase2Tables,
+  assertPhase3Tables,
+  assertPhase4Tables,
+  assertSchemaEnhancementTables,
+  ensureIndexStateRows,
+  getCheckpoint,
+} = require('../core/checkpoint');
+const { seedKnownTokens } = require('../core/token-registry');
 const { FINALITY_LANES, normalizeFinalityStatus } = require('../core/finality');
 const { closePool, withClient, withTransaction } = require('../lib/db');
 const { closeRedis } = require('../lib/redis');
@@ -35,7 +44,9 @@ async function main() {
     await assertPhase2Tables(client);
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
+    await assertSchemaEnhancementTables(client);
     await syncRegistryToDatabase(client);
+    await seedKnownTokens(client);
     await ensureIndexStateRows(client, indexerKey);
   });
 

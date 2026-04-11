@@ -1,9 +1,9 @@
 'use strict';
 
 const { createTtlCache } = require('../lib/cache');
-const { toBigIntStrict } = require('../lib/cairo/bigint');
 const { knownErc20Cache } = require('./known-erc20-cache');
 const { normalizeAddress } = require('./normalize');
+const { loadTokenRegistryByAddress } = require('./token-registry');
 
 const tokenTrustCache = createTtlCache({
   defaultTtlMs: 60_000,
@@ -30,36 +30,25 @@ async function resolveTrustedToken({ client, tokenAddress }) {
   }
 
   return tokenTrustCache.getOrLoad(normalizedTokenAddress, async () => {
-    const result = await client.query(
-      `SELECT token_address,
-              name,
-              symbol,
-              decimals,
-              is_verified
-         FROM stark_token_metadata
-        WHERE token_address = $1
-        LIMIT 1`,
-      [normalizedTokenAddress],
-    );
-
-    if (result.rowCount === 0) {
+    const registryByAddress = await loadTokenRegistryByAddress(client, [normalizedTokenAddress]);
+    const tokenInfo = registryByAddress.get(normalizedTokenAddress);
+    if (!tokenInfo) {
       return null;
     }
 
-    const row = result.rows[0];
-    const hasUsableMetadata = row.decimals !== null && (row.symbol !== null || row.name !== null);
+    const hasUsableMetadata = tokenInfo.decimals !== null && (tokenInfo.symbol !== null || tokenInfo.name !== null);
     if (!hasUsableMetadata) {
       return null;
     }
 
     return {
-      decimals: Number(toBigIntStrict(row.decimals, 'trusted token decimals')),
-      name: row.name ?? null,
-      symbol: row.symbol ?? null,
-      tokenAddress: row.token_address,
-      verificationGate: 'stark_token_metadata',
-      verificationLevel: row.is_verified ? 'metadata_verified' : 'metadata_resolved',
-      verificationSource: row.is_verified ? 'stark_token_metadata_verified' : 'stark_token_metadata',
+      decimals: Number(tokenInfo.decimals),
+      name: tokenInfo.name ?? null,
+      symbol: tokenInfo.symbol ?? null,
+      tokenAddress: normalizedTokenAddress,
+      verificationGate: tokenInfo.isVerified ? 'tokens_registry_verified' : 'tokens_registry_resolved',
+      verificationLevel: tokenInfo.isVerified ? 'registry_verified' : 'registry_resolved',
+      verificationSource: tokenInfo.isVerified ? 'tokens_registry' : 'tokens_registry_enriched',
     };
   });
 }

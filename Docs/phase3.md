@@ -1,7 +1,7 @@
 # StarknetDeg Phase 3
 
-Date: April 4, 2026  
-Scope: Simple English explanation of the refined Phase 3 design, what changed in the code, why it was changed, and how price integrity works now.
+Date: April 10, 2026  
+Scope: Simple English explanation of the refined Phase 3 design, including the schema-enhancement pass that fixed AVNU route contamination, added a central token registry, and made price and OHLCV rows carry their own quality signals.
 
 ## 1. What Phase 3 Does
 
@@ -49,6 +49,13 @@ The refined Phase 3 now does five important things:
 4. USD price resolution can bridge up to 2 hops, but only across sufficiently liquid pools
 5. CoinMarketCap can provide a bounded fallback price for important anchor assets
 
+The latest bug-fix pass added four more important rules:
+
+1. a central `tokens` table is now the shared token source for decimals and stable-token identity
+2. AVNU multi-hop actions are grouped into route-aware trade materialization instead of being treated as random independent swaps
+3. price candidates carry `hops_from_stable`, `price_raw_execution`, and `price_deviation_pct`
+4. OHLCV and price tables now filter out unstable or aggregator-derived price rows unless explicitly allowed
+
 These are not cosmetic changes.  
 They change how safe the data is.
 
@@ -76,6 +83,19 @@ One important refinement in that flow:
 
 That prevents volume double counting without throwing away execution truth.
 
+The newer version is stricter than that.
+
+It does not only skip route legs.
+
+It also tries to group linked AVNU hops into one route summary using:
+
+- `is_multi_hop`
+- `hop_index`
+- `total_hops`
+- `route_group_key`
+
+That matters because the contamination bug came from letting route internals leak into user-facing trade and price tables.
+
 ## 5. Very Important Rules In The New Phase 3
 
 ### 5.1 BigInt First, SQL Numeric Later
@@ -94,6 +114,24 @@ If we ignored this:
 - prices would drift
 - trade sizes would be wrong
 - candle volume would become unreliable
+
+### 5.1.1 One Token Registry, Not Three Token Truths
+
+This is one of the most important schema changes in the refinement pass.
+
+We now have a shared `tokens` table.
+
+Why that matters:
+
+- transfer validation needs token trust
+- trade pricing needs decimals and stable-token identity
+- metadata refresh needs one place to sync enriched token facts
+
+Before this table existed, those answers were split across static caches and enrichment tables.
+
+That is exactly how alternate stable-token addresses can slip through and create absurd prices.
+
+Now the pricing path, transfer trust path, and metadata path all ask the same registry first.
 
 ### 5.2 Latest Tables Must Be Restorable
 
@@ -156,6 +194,12 @@ If we kept only the latest table:
 
 - `price_is_stale`
 - `price_updated_at_block`
+- `hops_from_stable`
+- `is_aggregator_derived`
+- `sell_amount_raw`
+- `buy_amount_raw`
+- `price_raw_execution`
+- `price_deviation_pct`
 
 This means every stored price tells us:
 
@@ -175,6 +219,30 @@ Now:
 - the derived price can be marked stale
 - downstream consumers can decide how much to trust it
 
+This is now part of a broader stability filter.
+
+The system does not only ask whether the anchor is fresh.
+
+It also asks:
+
+- how many hops away from a stable token this price is
+- whether the observation came from an aggregator-derived route summary
+- how far the raw execution price drifted from the final normalized price
+
+That is why the price tables now carry both freshness fields and execution-quality fields.
+
+One important detail changed in the latest refinement:
+
+- direct stable pricing is now counted as `0` hops
+- one intermediate bridge asset is `1` hop
+- two intermediate bridge assets are `2` hops
+
+Example:
+
+- `TOKEN -> ETH -> WBTC -> USDC` is stored as `2` hops from stable
+
+That matters because prices more than one intermediate bridge away from a stable anchor are now marked `low_confidence`.
+
 ### 5.5 Bridge Paths Must Respect Liquidity
 
 This is another important integrity rule.
@@ -183,6 +251,20 @@ The new price path resolver can bridge up to 2 hops, for example:
 
 - Token A -> STRK
 - Token A -> ETH -> USDC
+
+In the newer hop-distance language that becomes:
+
+- Token A -> STRK -> USDC = `1` hop from stable
+- Token A -> ETH -> WBTC -> USDC = `2` hops from stable
+
+If the resolved distance is greater than `1`, the stored price is flagged low confidence.
+
+The enhancement pass made the resolver return route quality too, not only the final valuation.
+
+So the caller now knows:
+
+- the resolved USD value
+- how many hops away from a stable anchor that value came from
 
 But it does **not** blindly trust every available bridge.
 
@@ -228,17 +310,20 @@ So we use it to improve coverage, not to replace on-chain market structure.
 These are the important files in the refined Phase 3:
 
 1. `sql/003_trading.sql`
-2. `core/trades.js`
-3. `core/pool-state.js`
-4. `core/prices.js`
-5. `core/ohlcv.js`
-6. `core/block-processor.js`
-7. `core/checkpoint.js`
-8. `core/known-erc20-cache.js`
-9. `lib/cairo/fixed-point.js`
-10. `lib/cmc.js`
-11. `bin/start-indexer.js`
-12. `.env`
+2. `sql/007_schema_enhancements.sql`
+3. `core/trades.js`
+4. `core/pool-state.js`
+5. `core/prices.js`
+6. `core/ohlcv.js`
+7. `core/token-registry.js`
+8. `core/token-trust-cache.js`
+9. `core/normalize.js`
+10. `core/block-processor.js`
+11. `core/checkpoint.js`
+12. `lib/cairo/fixed-point.js`
+13. `lib/cmc.js`
+14. `bin/start-indexer.js`
+15. `.env`
 
 ## 7. File-By-File Explanation
 
@@ -266,6 +351,23 @@ This migration now supports both:
 
 without requiring destructive reset.
 
+### 7.1.1 `sql/007_schema_enhancements.sql`
+
+This is the report-driven schema patch.
+
+It adds the columns that the older trading schema did not have:
+
+- Ekubo execution detail fields like `sqrt_ratio_after`, `tick_after`, `liquidity_after`, `fee_tier`, and `locker_address`
+- route-group fields like `is_multi_hop`, `hop_index`, `total_hops`, and `route_group_key`
+- price-quality fields like `price_raw_execution`, `price_deviation_pct`, and `hops_from_stable`
+- richer pool-state columns
+- richer transfer columns
+- the new shared `tokens` table
+
+This migration matters because the report did not only ask for code fixes.
+
+It asked for the schema to carry the evidence needed to explain and debug those fixes later.
+
 ### 7.2 `core/trades.js`
 
 This file is now much smarter than before.
@@ -275,16 +377,19 @@ It still turns normalized swaps into trades, but now it also builds a stronger p
 It now does these things:
 
 1. loads swap actions
-2. loads latest known price references
-3. seeds stable tokens as `$1`
-4. optionally fetches CMC prices for allowed anchor symbols
-5. loads bridgeable pool edges from `stark_pool_latest`
-6. resolves token USD value using:
+2. groups AVNU route hops when they clearly belong to one route
+3. loads latest known price references
+4. seeds stable tokens as `$1`
+5. loads token truth from the shared `tokens` table
+6. optionally fetches CMC prices for allowed anchor symbols
+7. loads bridgeable pool edges from `stark_pool_latest`
+8. resolves token USD value using:
    - direct stable price
    - liquid path resolution
    - CMC anchor fallback
-7. writes the trade row
-8. emits price candidates for the next pricing stage
+9. computes price-quality fields like raw execution price and price deviation
+10. writes the trade row
+11. emits price candidates for the next pricing stage
 
 Why this matters:
 
@@ -293,7 +398,28 @@ Earlier the pricing logic was mostly:
 - direct stable
 - or one simple latest-price bridge
 
-Now it is explicit, path-aware, and freshness-aware.
+Now it is explicit, path-aware, freshness-aware, and route-aware.
+
+This is also where the AVNU contamination fix really becomes visible.
+
+If we let every hop flow straight into `stark_trades`, one routed user intent can look like multiple unrelated trades.
+
+That can inflate:
+
+- trade count
+- volume
+- price candidate count
+- candle notional
+
+This file also now resolves human-readable router attribution from Ekubo locker addresses.
+
+That means if an Ekubo execution came through a known locker owned by:
+
+- AVNU
+- Haiko
+- Fibrous
+
+the final `stark_trades.router_protocol` row stores that readable router name instead of leaving only the raw locker address behind.
 
 ### 7.3 `core/pool-state.js`
 
@@ -323,7 +449,8 @@ This file now has three big improvements:
 
 1. it writes stale flags
 2. it writes `price_updated_at_block`
-3. it can restore `stark_prices` from `stark_price_ticks` when a current block is reset
+3. it writes route-quality fields like `hops_from_stable`, `price_raw_execution`, and `price_deviation_pct`
+4. it can restore `stark_prices` from `stark_price_ticks` when a current block is reset
 
 In simple words:
 
@@ -334,6 +461,17 @@ In simple words:
 Without this:
 
 - a replayed block could leave the latest price table in a misleading state
+
+It also now drops price candidates that fail the stability filter.
+
+That means:
+
+- aggregator-derived route summaries do not automatically become public price truth
+- prices that are too far from stable anchors can be kept out of price tables
+- prices more than one intermediate bridge away from stable are marked `low_confidence`
+- weak prices can stay in historical ticks for forensics without becoming the latest public price
+
+This is one of the direct fixes for the "billion-dollar price" problem from the report.
 
 ### 7.5 `core/ohlcv.js`
 
@@ -347,6 +485,7 @@ Now:
 
 - candles are updated incrementally by default
 - a full rebuild is only used when reconciliation is active
+- only candle-eligible trades are included
 
 That means:
 
@@ -358,6 +497,49 @@ This file also checks `stark_reconciliation_log` when the caller does not explic
 Why this matters:
 
 It improves performance without giving up rollback safety.
+
+It also now carries richer market detail on the candle rows:
+
+- `tick_open`
+- `tick_close`
+- `sqrt_ratio_open`
+- `sqrt_ratio_close`
+- `fee_tier_bps`
+- `tick_spacing`
+- `volume0_usd`
+- `volume1_usd`
+- `vwap`
+
+That means OHLCV is no longer only "price plus one volume number".
+
+It now preserves more of the market state needed to debug mismatches.
+
+This is important because the report's OHLCV discrepancy was not just a UI problem.
+
+It was a data-lineage problem.
+
+The fix is:
+
+- carry better trade detail forward
+- filter unstable trade rows out
+- store more candle evidence so later debugging is possible
+- rebuild candle volume from canonical signed `amount0_delta` and `amount1_delta`
+
+That last point is the important bug fix.
+
+The DAI/USDC mismatch in the report was a single-trade `incremental_new` candle, not an `incremental_append` problem.
+
+So the bug was not "we forgot one trade".
+
+The bug class was:
+
+- candle volume trusted cached trade volume fields
+- instead of recomputing candle volume from the canonical signed deltas that came from the decoded swap
+
+The newer `core/ohlcv.js` now uses canonical deltas in both:
+
+- the incremental path
+- the rebuild path
 
 ### 7.6 `core/block-processor.js`
 
@@ -372,7 +554,22 @@ It now also:
 
 That makes the Phase 3 reset path much safer.
 
-### 7.7 `core/checkpoint.js`
+### 7.7 `core/token-registry.js`
+
+This is the shared token-identity layer introduced by the enhancement pass.
+
+It seeds and reads the `tokens` table.
+
+That table now gives the rest of the pipeline one shared answer for:
+
+- symbol
+- decimals
+- stable-token status
+- verification status
+
+Without this file, pricing and transfer trust would still be using different ideas of what a token is.
+
+### 7.8 `core/checkpoint.js`
 
 This file now validates the new Phase 3 table set:
 
@@ -381,21 +578,13 @@ This file now validates the new Phase 3 table set:
 
 instead of only the older single pool-state table.
 
-### 7.8 `core/known-erc20-cache.js`
+### 7.9 `core/token-trust-cache.js`
 
-This file was expanded so price logic can do better token lookups.
+This file now uses the shared token registry when deciding whether a token should be trusted.
 
-It now supports:
+That matters because transfer promotion and later pricing must agree on whether a token is real and verified enough to use.
 
-- `getAllTokens()`
-- `findBySymbol(symbol)`
-
-That is useful for:
-
-- bridge symbol sets
-- CMC symbol selection
-
-### 7.9 `lib/cairo/fixed-point.js`
+### 7.10 `lib/cairo/fixed-point.js`
 
 This file is still the fixed-point math layer, but now it also contains the price path resolver.
 
@@ -408,7 +597,7 @@ That resolver:
 
 This is the main reason the refined price logic stayed clean instead of becoming random custom code inside `core/trades.js`.
 
-### 7.10 `lib/cmc.js`
+### 7.11 `lib/cmc.js`
 
 This is the new CoinMarketCap client.
 
@@ -425,7 +614,7 @@ CMC access should be isolated from the core pricing code.
 
 That keeps the on-chain path logic and the external fallback logic separate.
 
-### 7.11 `bin/start-indexer.js`
+### 7.12 `bin/start-indexer.js`
 
 This file now logs the refined Phase 3 counters too.
 
@@ -435,7 +624,7 @@ The commit log now has more useful detail, including:
 - pool history count
 - pool latest count
 
-### 7.12 `.env`
+### 7.13 `.env`
 
 The StarknetDeg `.env` file now includes Phase 3 pricing controls, for example:
 
@@ -502,7 +691,28 @@ Important columns:
 - `price_*`
 - `notional_usd`
 - `bucket_1m`
+- `locker_address`
+- `liquidity_after`
+- `sqrt_ratio_after`
+- `tick_after`
+- `tick_spacing`
+- `fee_tier`
+- `extension_address`
+- `is_multi_hop`
+- `hop_index`
+- `total_hops`
+- `route_group_key`
+- `price_raw_execution`
+- `price_deviation_pct`
+- `hops_from_stable`
+- `is_aggregator_derived`
 - `metadata`
+
+Important meaning changes:
+
+- `router_protocol` is now the human-readable router name when we can resolve the Ekubo locker, for example `AVNU`, `Haiko`, or `Fibrous`
+- `sqrt_ratio_after` is stored as high-precision numeric state, not float-like market data
+- `hops_from_stable` counts intermediate bridge assets, so direct stable is `0`, one bridge is `1`, and two bridges are `2`
 
 ### 9.2 `stark_pool_state_history`
 
@@ -533,6 +743,13 @@ Important columns:
 - `price_is_decimals_normalized`
 - `tvl_usd`
 - `snapshot_kind`
+- `tick_after`
+- `tick_spacing`
+- `fee_tier`
+- `extension_address`
+- `locker_address`
+- `amount0_delta`
+- `amount1_delta`
 - `metadata`
 
 This table exists so we do not lose intermediate states.
@@ -579,6 +796,17 @@ Two important new columns are:
 - `price_is_stale`
 - `price_updated_at_block`
 
+The enhancement pass also added:
+
+- `bucket_1m`
+- `hops_from_stable`
+- `is_aggregator_derived`
+- `sell_amount_raw`
+- `buy_amount_raw`
+- `price_raw_execution`
+- `price_deviation_pct`
+- `low_confidence`
+
 These tell us whether the price should still be trusted.
 
 ### 9.5 `stark_price_ticks`
@@ -606,6 +834,13 @@ Important columns:
 - `price_is_stale`
 - `price_updated_at_block`
 - `bucket_1m`
+- `hops_from_stable`
+- `is_aggregator_derived`
+- `sell_amount_raw`
+- `buy_amount_raw`
+- `price_raw_execution`
+- `price_deviation_pct`
+- `low_confidence`
 - `metadata`
 
 This is the durable history behind `stark_prices`.
@@ -640,9 +875,23 @@ Important columns:
 - `volume_usd`
 - `trade_count`
 - `seeded_from_previous_close`
+- `tick_open`
+- `tick_close`
+- `sqrt_ratio_open`
+- `sqrt_ratio_close`
+- `fee_tier_bps`
+- `tick_spacing`
+- `volume0_usd`
+- `volume1_usd`
+- `vwap`
 - `metadata`
 
 The table structure is similar, but the persistence strategy is better now.
+
+The important integrity rule is:
+
+- candle volume is now reconstructed from canonical signed swap deltas
+- not blindly reused from cached trade-volume fields
 
 ## 10. How Price Resolution Works Now
 
@@ -755,7 +1004,17 @@ The replay-style synthetic test confirmed:
 - latest price rows correctly restore from older price ticks
 - latest pool rows correctly restore from older pool-state history
 
-## 14. Final Summary
+## 14. Known Limitation
+
+The new AVNU route grouping is intentionally conservative.
+
+If a grouped AVNU route starts and ends in the same token, the grouped summary can become non-directional.
+
+In that case, the route is currently suppressed from `stark_trades` instead of being materialized as a normal trade row.
+
+This is safer than letting a route loop poison prices or volume, but it is still a limitation worth knowing.
+
+## 15. Final Summary
 
 The refined Phase 3 is stronger than the original version in three major ways:
 
