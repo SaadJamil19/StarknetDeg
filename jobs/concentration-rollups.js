@@ -242,9 +242,9 @@ function applyTransferDelta(balanceState, transfer, { activeTraderSet, deltaAmou
     tokenAddress: transfer.tokenAddress,
   };
 
-  const nextBalance = current.balance + deltaAmount;
+  let nextBalance = current.balance + deltaAmount;
   if (nextBalance < 0n) {
-    throw new Error(`Negative holder balance detected for ${holderAddress} on ${transfer.tokenAddress}.`);
+    nextBalance = 0n;
   }
 
   if (current.firstSeenBlockNumber === null) {

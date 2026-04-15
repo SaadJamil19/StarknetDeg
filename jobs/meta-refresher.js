@@ -382,8 +382,8 @@ async function upsertTokenMetadata(client, metadata) {
          updated_at = NOW()`,
     [
       metadata.tokenAddress,
-      metadata.name,
-      metadata.symbol,
+      metadata.name ? metadata.name.replace(/\x00/g, '') : null,
+      metadata.symbol ? metadata.symbol.replace(/\x00/g, '') : null,
       metadata.decimals === null ? null : toNumericString(metadata.decimals, 'token decimals'),
       metadata.totalSupply === null ? null : toNumericString(metadata.totalSupply, 'token total supply'),
       metadata.isVerified,
