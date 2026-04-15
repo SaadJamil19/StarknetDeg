@@ -1,0 +1,86 @@
+cd C:\Users\SAR\Desktop\Indexers\StarknetDeg
+npm run start:indexer
+
+
+
+
+@'
+const path = require('path');
+require('dotenv').config({ path: path.resolve(process.cwd(), '.env') });
+const { Client } = require('pg');
+
+(async () => {
+  const client = new Client({
+    host: process.env.PGHOST || '127.0.0.1',
+    port: Number(process.env.PGPORT || 5432),
+    user: process.env.PGUSER || 'postgres',
+    password: process.env.PGPASSWORD || 'postgres',
+    database: process.env.PGDATABASE || 'StarknetDeg',
+  });
+
+  try {
+    await client.connect();
+
+    const { rows } = await client.query(`
+      SELECT quote_ident(tablename) AS name
+      FROM pg_tables
+      WHERE schemaname = 'public'
+      ORDER BY tablename
+    `);
+
+    if (rows.length === 0) {
+      console.log('No tables found.');
+      return;
+    }
+
+    const sql = `TRUNCATE TABLE ${rows.map((r) => r.name).join(', ')} RESTART IDENTITY CASCADE;`;
+    await client.query(sql);
+
+    console.log('All public tables emptied successfully.');
+  } finally {
+    await client.end();
+  }
+})();
+'@ | node -
+
+
+
+
+
+
+cd C:\Users\SAR\Desktop\Indexers\StarknetDeg
+
+$latest = @'
+const path = require('path');
+require('dotenv').config({ path: path.resolve(process.cwd(), '.env') });
+const { StarknetRpcClient } = require('./lib/starknet-rpc');
+
+(async () => {
+  const client = new StarknetRpcClient();
+  const tip = await client.getBlockNumber();
+  console.log(tip.toString());
+})();
+'@ | node -
+
+$env:INDEXER_START_BLOCK = $latest
+npm run start:indexer
+
+
+
+
+
+
+
+
+
+
+
+
+npm run start:indexer
+
+npm run start:phase4
+
+
+npm run start:phase6
+
+
