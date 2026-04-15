@@ -85,7 +85,12 @@ async function refreshConcentrationRollups({
     await client.query(`DELETE FROM stark_holder_balance_deltas WHERE lane = $1`, [window.lane]);
     await client.query(`DELETE FROM stark_holder_balances WHERE lane = $1`, [window.lane]);
     await client.query(`DELETE FROM stark_token_concentration WHERE lane = $1`, [window.lane]);
-    await client.query(`DELETE FROM stark_whale_alert_candidates WHERE lane = $1`, [window.lane]);
+    await client.query(
+      `DELETE FROM stark_whale_alert_candidates
+        WHERE lane = $1
+          AND alert_type IN ('concentration_whale', 'bridge_flow_whale', 'bridge_then_trade_whale')`,
+      [window.lane],
+    );
 
     if (window.maxBlockNumber === null) {
       return {

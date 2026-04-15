@@ -5,7 +5,7 @@ const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 
 const { setTimeout: sleep } = require('node:timers/promises');
-const { assertFoundationTables, assertPhase2Tables, assertPhase3Tables, assertPhase4Tables, assertPhase6Tables } = require('../core/checkpoint');
+const { assertFoundationTables, assertPhase2Tables, assertPhase3Tables, assertPhase4Tables, assertPhase6Tables, assertL1Tables } = require('../core/checkpoint');
 const { FINALITY_LANES } = require('../core/finality');
 const { toJsonbString } = require('../core/protocols/shared');
 const { toBigIntStrict, toNumericString } = require('../lib/cairo/bigint');
@@ -34,6 +34,7 @@ async function main() {
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
     await assertPhase6Tables(client);
+    await assertL1Tables(client);
   });
 
   console.log(`[phase6] bridge-accounting starting run_once=${runOnce}`);
@@ -69,6 +70,7 @@ async function refreshBridgeAccounting({
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
     await assertPhase6Tables(client);
+    await assertL1Tables(client);
 
     const window = await resolveAnalyticsWindow(client, { indexerKey, lane, requireL1 });
 
@@ -140,6 +142,28 @@ async function refreshBridgeAccounting({
       row.priceIsStale = row.priceIsStale || Boolean(tokenInfo?.priceIsStale);
       row.priceSource = tokenInfo?.priceSource ?? row.priceSource;
       row.priceUpdatedAtBlock = tokenInfo?.priceUpdatedAtBlock ?? row.priceUpdatedAtBlock;
+      if (activity.l1MatchStatus === 'PENDING') {
+        row.pendingL1MatchCount += 1n;
+      }
+      if (activity.l1MatchStatus === 'MATCHED' && usdValueScaled !== null) {
+        if (activity.direction === 'bridge_in') {
+          row.l1VerifiedInflowUsdScaled += usdValueScaled;
+        } else {
+          row.l1VerifiedOutflowUsdScaled += usdValueScaled;
+        }
+      }
+      if (activity.l1MatchStatus === 'MATCHED' && activity.settlementSeconds !== null) {
+        row.settlementMatchCount += 1n;
+        row.minSettlementSeconds = row.minSettlementSeconds === null
+          ? activity.settlementSeconds
+          : Math.min(row.minSettlementSeconds, activity.settlementSeconds);
+        row.maxSettlementSeconds = row.maxSettlementSeconds === null
+          ? activity.settlementSeconds
+          : Math.max(row.maxSettlementSeconds, activity.settlementSeconds);
+        row.avgSettlementSeconds = row.avgSettlementSeconds === null
+          ? activity.settlementSeconds
+          : Math.round(((row.avgSettlementSeconds * Number(row.settlementMatchCount - 1n)) + activity.settlementSeconds) / Number(row.settlementMatchCount));
+      }
       row.metadata.classifications[activity.classification] = (row.metadata.classifications[activity.classification] ?? 0) + 1;
       row.metadata.directions[activity.direction] = (row.metadata.directions[activity.direction] ?? 0) + 1;
       flowRows.set(key, row);
@@ -168,7 +192,10 @@ async function loadBridgeActivities(client, { lane, maxBlockNumber }) {
             classification,
             l2_wallet_address,
             token_address,
-            amount
+            amount,
+            l1_match_status,
+            settlement_seconds,
+            eth_tx_hash
        FROM stark_bridge_activities
       WHERE lane = $1
         AND block_number <= $2
@@ -181,6 +208,9 @@ async function loadBridgeActivities(client, { lane, maxBlockNumber }) {
     blockNumber: toBigIntStrict(row.block_number, 'bridge block number'),
     classification: row.classification,
     direction: row.direction,
+    ethTxHash: row.eth_tx_hash,
+    l1MatchStatus: row.l1_match_status,
+    settlementSeconds: row.settlement_seconds === null ? null : Number.parseInt(String(row.settlement_seconds), 10),
     tokenAddress: row.token_address,
     transactionHash: row.transaction_hash,
     walletAddress: row.l2_wallet_address,
@@ -200,18 +230,25 @@ function ensureBridgeFlowRow(store, activity, lane) {
     bridgeOutAmount: 0n,
     bridgeOutCount: 0n,
     bridgeOutflowUsdScaled: 0n,
+    l1VerifiedInflowUsdScaled: 0n,
+    l1VerifiedOutflowUsdScaled: 0n,
     lane,
     lastBridgeBlockNumber: activity.blockNumber,
     lastBridgeTransactionHash: activity.transactionHash,
+    avgSettlementSeconds: null,
+    maxSettlementSeconds: null,
     metadata: {
       classifications: {},
       directions: {},
     },
+    minSettlementSeconds: null,
     netBridgeFlow: 0n,
     netBridgeFlowUsdScaled: 0n,
+    pendingL1MatchCount: 0n,
     priceIsStale: false,
     priceSource: null,
     priceUpdatedAtBlock: null,
+    settlementMatchCount: 0n,
     tokenAddress: activity.tokenAddress,
     unresolvedActivityCount: 0n,
     walletAddress: activity.walletAddress,
@@ -235,6 +272,12 @@ async function upsertWalletBridgeFlow(client, row, { requireL1 }) {
          bridge_in_count,
          bridge_out_count,
          unresolved_activity_count,
+         avg_settlement_seconds,
+         min_settlement_seconds,
+         max_settlement_seconds,
+         pending_l1_match_count,
+         l1_verified_inflow_usd,
+         l1_verified_outflow_usd,
          price_source,
          price_is_stale,
          price_updated_at_block,
@@ -245,7 +288,8 @@ async function upsertWalletBridgeFlow(client, row, { requireL1 }) {
          updated_at
      ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-         $11, $12, $13, $14, $15, $16, $17, $18::jsonb, NOW(), NOW()
+         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+         $23, $24, $25::jsonb, NOW(), NOW()
      )`,
     [
       row.lane,
@@ -260,6 +304,12 @@ async function upsertWalletBridgeFlow(client, row, { requireL1 }) {
       toNumericString(row.bridgeInCount, 'bridge in count'),
       toNumericString(row.bridgeOutCount, 'bridge out count'),
       toNumericString(row.unresolvedActivityCount, 'bridge unresolved activity count'),
+      row.avgSettlementSeconds,
+      row.minSettlementSeconds,
+      row.maxSettlementSeconds,
+      toNumericString(row.pendingL1MatchCount, 'bridge pending l1 match count'),
+      scaledOrNullToNumeric(row.l1VerifiedInflowUsdScaled),
+      scaledOrNullToNumeric(row.l1VerifiedOutflowUsdScaled),
       row.priceSource,
       row.priceIsStale,
       row.priceUpdatedAtBlock === null ? null : toNumericString(row.priceUpdatedAtBlock, 'bridge price updated at block'),
