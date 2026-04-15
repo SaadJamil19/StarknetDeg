@@ -1,7 +1,7 @@
 # StarknetDeg Master Roadmap
 
-Date: April 10, 2026  
-Scope: Updated end-to-end architecture and migration plan for building `StarknetDeg`, a Starknet-native DEX indexer that preserves Degenter's operating model while also incorporating the schema-enhancement pass for token-registry centralization, AVNU route grouping, price-stability filtering, and richer trade/pool evidence.
+Date: April 15, 2026  
+Scope: Updated end-to-end architecture and migration plan for building `StarknetDeg`, a Starknet-native DEX indexer that preserves Degenter's operating model while also incorporating token-registry centralization, AVNU route grouping, price-stability filtering, richer trade and pool evidence, and Ethereum L1 StarkGate integration for cross-chain bridge intelligence.
 
 ## 0. Context and Inputs
 
@@ -16,12 +16,17 @@ This roadmap is based on four inputs:
    - DipDup docs
    - Ekubo, JediSwap, and AVNU public repos
 
+This version also incorporates the L1 bridge specification:
+
+5. `L1 Ethereum Integration — Complete Technical Specification` from `l1_complete_spec.docx`
+
 This version specifically closes the following gaps:
 
 1. Ekubo lock/callback receipts require ordered, receipt-local processing.
 2. `ACCEPTED_ON_L2` is canonical for live analytics but is not irreversible until `ACCEPTED_ON_L1`.
 3. L1-originated actions must be captured via `L1HandlerTransaction`, not only via normal `INVOKE` flows.
 4. JavaScript `Number` is unsafe for Starknet felts, `u256` amounts, fees, and resource bounds.
+5. Ethereum-side StarkGate deposits and withdrawals were previously invisible to wallet attribution, settlement timing, and bridge-aware whale logic.
 
 ## 1. Degenter Operating Model to Preserve
 
@@ -254,9 +259,13 @@ StarknetDeg/
 |   |-- 004_metadata_and_security.sql
 |   |-- 005_realtime.sql
 |   |-- 006_analytics.sql
-|   `-- 007_schema_enhancements.sql
+|   |-- 007_schema_enhancements.sql
+|   |-- 008_preproduction_hardening.sql
+|   |-- 0010_l1_new_tables.sql
+|   `-- 0011_l1_alter_tables.sql
 |-- bin/
 |   |-- start-indexer.js
+|   |-- start-l1-starkgate-indexer.js
 |   |-- start-preconfirmed.js
 |   |-- start-jobs.js
 |   |-- start-alerts.js
@@ -292,6 +301,8 @@ StarknetDeg/
 |   |-- log.js
 |   |-- cache.js
 |   |-- batch.js
+|   |-- ethereum-rpc.js
+|   |-- l1-starkgate.js
 |   |-- starknet-rpc.js
 |   |-- registry/
 |   |   `-- dex-registry.js
@@ -308,12 +319,18 @@ StarknetDeg/
 |   |-- meta-refresher.js
 |   |-- security-scanner.js
 |   |-- eth-price-feed.js
+|   |-- l1-cross-chain-matcher.js
 |   |-- finality-promoter.js
 |   |-- bridge-accounting.js
 |   |-- wallet-rollups.js
 |   |-- matrix-rollups.js
 |   |-- leaderboards.js
 |   `-- concentration-rollups.js
+|-- src/
+|   |-- indexers/
+|   |   `-- l1-starkgate-indexer.ts
+|   `-- jobs/
+|       `-- l1-cross-chain-matcher.ts
 |-- api/
 |   |-- server.js
 |   |-- ws.js
@@ -355,6 +372,7 @@ Why these additions matter:
 3. `core/bridge.js` and `jobs/bridge-accounting.js` exist because L1-L2 activity is part of wallet truth.
 4. `lib/cairo/bigint.js` exists to ban accidental precision loss at the utility layer.
 5. `lib/registry/dex-registry.js` exists so DEX coverage grows by registry updates instead of router rewrites.
+6. `lib/ethereum-rpc.js`, `lib/l1-starkgate.js`, `src/indexers/l1-starkgate-indexer.ts`, and `src/jobs/l1-cross-chain-matcher.ts` exist so the indexer can connect Ethereum bridge events to Starknet bridge and trade activity instead of treating L1 capital flow as a blind spot.
 
 ### 4.2 ABI Versioning and Upgradeable Contracts
 
@@ -736,44 +754,56 @@ This is the StarknetDeg equivalent of Apibara invalidation plus DipDup rollback 
 4. Registry writes are auditable and append-only where possible.
 5. Metadata refresh updates the shared token registry so later phases do not drift on token identity.
 
-## Phase 5: Realtime API and WebSocket Layer
+## Phase 5: L1 Integration, Realtime API, and WebSocket Layer
 
 ### Core objectives
 
-1. Expose token, pool, trade, candle, holder, wallet, and bridge data over REST.
-2. Publish sub-second to low-second updates over Redis and WebSocket.
-3. Separate preview streams from canonical streams.
+1. Ingest Ethereum L1 StarkGate deposits and withdrawals into raw and decoded L1 tables.
+2. Match L1 deposits and withdrawals back to L2 bridge rows and downstream trades.
+3. Expose token, pool, trade, candle, holder, wallet, bridge, and settlement-aware cross-chain data over REST.
+4. Publish sub-second to low-second updates over Redis and WebSocket.
+5. Separate preview streams from canonical streams.
 
 ### Key files
 
 1. `sql/005_realtime.sql`
-2. `core/realtime.js`
-3. `api/server.js`
-4. `api/ws.js`
-5. `api/controllers.js`
-6. `api/serializers/starknet.js`
-7. `api/routes/tokens.js`
-8. `api/routes/pools.js`
-9. `api/routes/trades.js`
-10. `api/routes/holders.js`
-11. `api/routes/candles.js`
-12. `api/routes/wallet.js`
-13. `api/routes/bridge.js`
+2. `sql/0010_l1_new_tables.sql`
+3. `sql/0011_l1_alter_tables.sql`
+4. `lib/ethereum-rpc.js`
+5. `lib/l1-starkgate.js`
+6. `src/indexers/l1-starkgate-indexer.ts`
+7. `src/jobs/l1-cross-chain-matcher.ts`
+8. `core/realtime.js`
+9. `api/server.js`
+10. `api/ws.js`
+11. `api/controllers.js`
+12. `api/serializers/starknet.js`
+13. `api/routes/tokens.js`
+14. `api/routes/pools.js`
+15. `api/routes/trades.js`
+16. `api/routes/holders.js`
+17. `api/routes/candles.js`
+18. `api/routes/wallet.js`
+19. `api/routes/bridge.js`
 
 ### Security and integrity guardrails
 
-1. WebSocket rooms are namespaced by:
+1. L1 raw capture is preserved before any cross-chain matching, so matcher bugs cannot corrupt L1 raw truth.
+2. Cross-chain matching is atomic. L1 event rows, L2 bridge rows, wallet bridge rollups, wallet stats, and linked trades are updated in one DB transaction.
+3. L2 recipient addresses coming from Ethereum are normalized to the same `0x` + 64 lowercase hex format as Starknet wallet addresses.
+4. Unknown L1 tokens produce warnings instead of silent drops.
+5. WebSocket rooms are namespaced by:
    - chain
    - stream type
    - finality tier
-2. `PRE_CONFIRMED` events are explicitly labeled preview data.
-3. Canonical streams emit `ACCEPTED_ON_L2` rows only.
-4. Bridge endpoints distinguish:
+6. `PRE_CONFIRMED` events are explicitly labeled preview data.
+7. Canonical streams emit `ACCEPTED_ON_L2` rows only.
+8. Bridge endpoints distinguish:
    - `bridge_in`
    - `bridge_out`
    - `l1_pending`
    - `l1_anchored`
-5. All queries are parameterized.
+9. All queries are parameterized.
 
 ## Phase 6: Advanced Analytics
 
@@ -829,6 +859,16 @@ V1 accounting logic:
    - message hash when available
    - L2 block lineage
    - L1 correlation fields when sidecar is enabled
+5. `eth_starkgate_events` stores the Ethereum-side event truth and later records:
+   - `match_status`
+   - `match_strategy`
+   - `settlement_seconds`
+   - linked Starknet tx and block numbers
+6. `stark_trades` stores:
+   - `l1_deposit_tx_hash`
+   - `l1_wallet_address`
+   - `seconds_since_deposit`
+   - `is_post_bridge_trade`
 
 This is enough to keep whale and wallet analytics honest even when value enters from Ethereum instead of from a DEX trade.
 

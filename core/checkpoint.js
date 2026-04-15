@@ -48,6 +48,24 @@ const SCHEMA_ENHANCEMENT_TABLES = Object.freeze([
 const SCHEMA_ENHANCEMENT_VIEWS = Object.freeze([
   'view_unidentified_protocols',
 ]);
+const L1_TABLES = Object.freeze([
+  'eth_block_journal',
+  'eth_tx_raw',
+  'eth_event_raw',
+  'eth_starkgate_events',
+  'eth_index_state',
+]);
+const L1_COLUMNS = Object.freeze([
+  { table: 'stark_bridge_activities', column: 'eth_tx_hash' },
+  { table: 'stark_bridge_activities', column: 'l1_match_status' },
+  { table: 'stark_wallet_bridge_flows', column: 'pending_l1_match_count' },
+  { table: 'stark_wallet_bridge_flows', column: 'l1_verified_inflow_usd' },
+  { table: 'stark_wallet_stats', column: 'l1_wallet_address' },
+  { table: 'stark_message_l2_to_l1', column: 'message_status' },
+  { table: 'stark_trades', column: 'l1_deposit_tx_hash' },
+  { table: 'stark_trades', column: 'is_post_bridge_trade' },
+  { table: 'stark_whale_alert_candidates', column: 'eth_tx_hash' },
+]);
 const SCHEMA_ENHANCEMENT_COLUMNS = Object.freeze([
   { table: 'stark_trades', column: 'route_group_key' },
   { table: 'stark_trades', column: 'locker_address' },
@@ -77,6 +95,11 @@ async function assertPhase4Tables(client) {
 
 async function assertPhase6Tables(client) {
   await assertTablesExist(client, PHASE6_TABLES, 'Phase 6', 'sql/006_analytics.sql');
+}
+
+async function assertL1Tables(client) {
+  await assertTablesExist(client, L1_TABLES, 'L1 integration', 'sql/0010_l1_new_tables.sql');
+  await assertColumnsExist(client, L1_COLUMNS, 'L1 integration', 'sql/0011_l1_alter_tables.sql');
 }
 
 async function assertSchemaEnhancementTables(client) {
@@ -223,6 +246,7 @@ module.exports = {
   assertPhase3Tables,
   assertPhase4Tables,
   assertPhase6Tables,
+  assertL1Tables,
   assertSchemaEnhancementTables,
   assertSchemaEnhancementViews,
   advanceCheckpoint,

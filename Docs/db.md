@@ -109,6 +109,15 @@ This table stores bridge-like activities such as L1 handlers and L2-to-L1 messag
 - `metadata`: Extra parsing details for this bridge row.
 - `created_at`: Time when this row was inserted.
 - `updated_at`: Time when this row was last updated.
+- `eth_tx_hash`: Matched Ethereum transaction hash for this bridge row when we successfully link the L2 bridge to an L1 StarkGate event.
+- `eth_block_number`: Ethereum block number where the matched L1 event happened.
+- `eth_block_timestamp`: Ethereum timestamp for the matched L1 event.
+- `eth_log_index`: Log index of the matched L1 event inside the Ethereum transaction receipt.
+- `eth_event_key`: Internal key of the matched `eth_starkgate_events` row.
+- `l1_match_status`: Cross-chain match state for this bridge row, usually `PENDING`, `MATCHED`, or `UNMATCHED`.
+- `settlement_seconds`: Time gap in seconds between the L1 bridge event and the L2 bridge effect.
+- `settlement_blocks_l1`: Ethereum block distance observed when the match was recorded.
+- `settlement_blocks_l2`: Starknet block distance observed when the match was recorded.
 
 ## `stark_contract_registry`
 
@@ -253,6 +262,11 @@ This table stores raw L2-to-L1 messages from transaction receipts.
 - `raw_message`: Full original raw message payload.
 - `created_at`: Time when this row was inserted.
 - `updated_at`: Time when this row was last updated.
+- `l1_consumed_tx_hash`: Ethereum transaction hash that consumed or completed this L2-to-L1 message when we can match it.
+- `l1_consumed_block`: Ethereum block number where the message was consumed.
+- `l1_consumed_timestamp`: Ethereum timestamp when the message was consumed.
+- `message_status`: Current lifecycle status for the message, such as `SENT` or `CONSUMED`.
+- `settlement_seconds`: Time gap between L2 message emission and L1 consumption.
 
 ## `stark_ohlcv_1m`
 
@@ -594,6 +608,12 @@ This table stores normalized DEX trades.
 - `price_deviation_pct`: Deviation percentage between raw execution price and final stored price.
 - `hops_from_stable`: Number of intermediate bridge assets on the shortest cycle-free path between this trade and the stable anchor used for valuation, so direct stable is `0`, one bridge is `1`, and two bridges are `2`.
 - `is_aggregator_derived`: Flag showing whether the trade row came from an aggregator-derived route summary.
+- `l1_deposit_tx_hash`: Ethereum deposit transaction linked to this trade when the wallet traded after bridging.
+- `l1_deposit_block`: Ethereum block number of the linked deposit.
+- `l1_deposit_timestamp`: Ethereum timestamp of the linked deposit.
+- `l1_wallet_address`: Ethereum wallet that funded this trade path when known.
+- `seconds_since_deposit`: Number of seconds between the deposit and this trade.
+- `is_post_bridge_trade`: Flag showing whether this trade happened inside the configured rapid post-bridge window.
 
 ## `stark_transfers`
 
@@ -701,6 +721,12 @@ This table stores per-wallet bridge flow rollups.
 - `bridge_in_count`: Number of bridge-in activities.
 - `bridge_out_count`: Number of bridge-out activities.
 - `unresolved_activity_count`: Count of bridge rows we could not fully price or parse.
+- `avg_settlement_seconds`: Average bridge settlement time for matched L1-linked flows in this wallet/token pair.
+- `min_settlement_seconds`: Fastest matched bridge settlement time seen for this wallet/token pair.
+- `max_settlement_seconds`: Slowest matched bridge settlement time seen for this wallet/token pair.
+- `pending_l1_match_count`: Number of bridge rows for this wallet/token pair that are still waiting for L1 matching.
+- `l1_verified_inflow_usd`: USD value of inbound bridge flow that is now backed by a confirmed L1 match.
+- `l1_verified_outflow_usd`: USD value of outbound bridge flow that is now backed by a confirmed L1 match.
 - `price_source`: Price source used for this rollup.
 - `price_is_stale`: Flag showing whether the price source was stale.
 - `price_updated_at_block`: Block where the price source was last refreshed.
@@ -784,6 +810,12 @@ This table stores wallet-level summary analytics.
 - `bridge_inflow_usd`: Total inbound bridge flow in USD.
 - `bridge_outflow_usd`: Total outbound bridge flow in USD.
 - `net_bridge_flow_usd`: Net bridge flow in USD.
+- `l1_wallet_address`: Ethereum wallet address linked to this Starknet wallet when we successfully match StarkGate deposits.
+- `l1_bridge_inflow_usd`: Confirmed L1-backed inbound bridge value in USD.
+- `l1_bridge_outflow_usd`: Confirmed L1-backed outbound bridge value in USD.
+- `avg_bridge_settlement_s`: Average bridge settlement time in seconds for this wallet.
+- `first_l1_activity_block`: First Ethereum block where this wallet had a matched bridge event.
+- `last_l1_activity_block`: Latest Ethereum block where this wallet had a matched bridge event.
 - `bridge_activity_count`: Total number of bridge activities for this wallet.
 - `winning_trade_count`: Number of profitable trade exits.
 - `losing_trade_count`: Number of losing trade exits.
@@ -816,12 +848,138 @@ This table stores wallets and events that look whale-like and may deserve alerti
 - `created_at`: Time when this alert row was inserted.
 - `updated_at`: Time when this alert row was last updated.
 - `velocity_score`: Score showing how quickly the wallet bridged and then traded.
+- `eth_tx_hash`: Ethereum transaction hash that triggered this alert when the alert was driven by L1 bridge activity.
+- `eth_block_number`: Ethereum block number for the L1 trigger.
+- `l1_trigger_type`: Human-readable L1 trigger label such as `large_deposit`.
+- `l1_trigger_amount`: Raw L1 amount that triggered the alert.
+- `l1_trigger_usd`: USD value of the L1 trigger amount.
+- `l1_to_l2_seconds`: Time from the L1 trigger to the observed L2 response.
+
+## `eth_block_journal`
+
+This table stores raw Ethereum L1 block truth for the StarkGate indexer.
+
+- `block_number`: Ethereum block number.
+- `block_hash`: Block hash for this Ethereum block.
+- `parent_hash`: Parent block hash.
+- `block_timestamp`: Timestamp of the Ethereum block.
+- `transaction_count`: Number of transactions in the block.
+- `gas_used`: Total gas used by the block.
+- `base_fee_per_gas`: Base fee for the block.
+- `is_orphaned`: Flag showing whether this Ethereum block was orphaned or replaced.
+- `raw_block`: Full original Ethereum block payload.
+- `created_at`: Time when this row was inserted.
+- `updated_at`: Time when this row was last updated.
+
+## `eth_tx_raw`
+
+This table stores raw Ethereum transactions and receipts that contained StarkGate activity.
+
+- `transaction_hash`: Ethereum transaction hash.
+- `block_number`: Ethereum block number where the tx was included.
+- `block_hash`: Ethereum block hash for the tx.
+- `transaction_index`: Position of the tx inside the Ethereum block.
+- `from_address`: Ethereum sender address.
+- `to_address`: Ethereum target address.
+- `tx_type`: Internal high-level label such as deposit or withdrawal.
+- `status`: Processing state for this raw tx row, such as `PENDING`, `PROCESSED`, or `FAILED`.
+- `execution_status`: Ethereum execution result, usually success or reverted.
+- `gas_used`: Gas used by the tx.
+- `effective_gas_price`: Effective gas price used for the receipt.
+- `actual_fee_eth`: Exact fee paid on Ethereum in raw wei.
+- `log_count`: Number of receipt logs in this tx.
+- `raw_transaction`: Full original Ethereum transaction JSON.
+- `raw_receipt`: Full original Ethereum receipt JSON.
+- `processed_at`: Time when the tx decode finished.
+- `decode_error`: Decode failure message if processing failed.
+- `created_at`: Time when this row was inserted.
+- `updated_at`: Time when this row was last updated.
+
+## `eth_event_raw`
+
+This table stores raw Ethereum logs before business matching.
+
+- `block_number`: Ethereum block number for the log.
+- `transaction_hash`: Ethereum transaction hash that emitted the log.
+- `log_index`: Log position inside the Ethereum receipt.
+- `block_hash`: Ethereum block hash for the log.
+- `block_timestamp`: Timestamp of the Ethereum block.
+- `transaction_index`: Position of the tx inside the Ethereum block.
+- `emitter_address`: Contract address that emitted the log.
+- `topic0`: Primary event topic.
+- `topic1`: Second topic if present.
+- `topic2`: Third topic if present.
+- `topic3`: Fourth topic if present.
+- `data`: Raw non-indexed event data payload.
+- `event_type`: Decoded event type when recognized.
+- `normalized_status`: Decode state for this log row.
+- `decode_error`: Decode failure message when the log could not be processed.
+- `raw_log`: Full original Ethereum log JSON.
+- `processed_at`: Time when the log decode finished.
+- `created_at`: Time when this row was inserted.
+- `updated_at`: Time when this row was last updated.
+
+## `eth_starkgate_events`
+
+This table stores decoded L1 StarkGate business facts.
+
+- `event_key`: Internal unique id for the decoded L1 event.
+- `eth_block_number`: Ethereum block number where the event happened.
+- `eth_block_hash`: Ethereum block hash for the event.
+- `eth_block_timestamp`: Ethereum timestamp for the event.
+- `eth_transaction_hash`: Ethereum transaction hash that emitted the event.
+- `eth_log_index`: Log index inside the Ethereum receipt.
+- `emitter_contract`: StarkGate L1 contract that emitted the event.
+- `event_type`: Normalized event type such as `deposit_initiated` or `withdrawal_completed`.
+- `l1_sender`: Ethereum sender for inbound bridge activity when the event exposes it.
+- `l1_recipient`: Ethereum recipient for outbound bridge completion when the event exposes it.
+- `l2_recipient`: Starknet wallet that should receive bridged funds.
+- `l2_sender`: Starknet sender that originated the L2-to-L1 withdrawal when known.
+- `l1_token_address`: Ethereum token address for the bridge event.
+- `l2_token_address`: Starknet token address mapped from the L1 token when known.
+- `is_native_eth`: Flag showing whether the event represents native ETH rather than an ERC-20 token.
+- `token_symbol`: Symbol we resolved for the token when known.
+- `amount`: Raw bridge amount from Ethereum in exact integer form.
+- `amount_human`: Decimal-normalized human amount when token decimals are known.
+- `amount_usd`: USD value of the event when pricing is available.
+- `nonce`: StarkGate nonce when the event exposes it.
+- `stark_tx_hash`: Matched Starknet tx hash after cross-chain linking.
+- `stark_block_number`: Matched Starknet block number after linking.
+- `stark_bridge_key`: Matched `stark_bridge_activities.bridge_key`.
+- `matched_at`: Time when this row was linked to the Starknet side.
+- `match_status`: Cross-chain state for this event, such as `PENDING`, `MATCHED`, or `UNMATCHED`.
+- `match_strategy`: Strategy that produced the match, such as `nonce` or `amount_time`.
+- `settlement_seconds`: Seconds between the Ethereum event and the matched Starknet result.
+- `settlement_blocks_l1`: Ethereum block distance observed when the match was recorded.
+- `settlement_blocks_l2`: Starknet block distance observed when the match was recorded.
+- `metadata`: Extra decode and matching details.
+- `created_at`: Time when this row was inserted.
+- `updated_at`: Time when this row was last updated.
+
+## `eth_index_state`
+
+This table stores the L1 StarkGate indexer checkpoint.
+
+- `indexer_key`: Logical name of the Ethereum indexer state row.
+- `last_processed_block_number`: Latest Ethereum block number successfully processed.
+- `last_processed_block_hash`: Hash of the latest processed Ethereum block.
+- `last_processed_timestamp`: Timestamp of the latest processed Ethereum block.
+- `last_finalized_block_number`: Latest Ethereum block number we consider finalized for this indexer.
+- `last_error`: Last recorded runtime error for the Ethereum indexer.
+- `last_committed_at`: Time when the indexer last committed progress.
+- `created_at`: Time when this state row was created.
+- `updated_at`: Time when this state row was last updated.
 
 ## Keys Reference
 
 The live schema currently has primary keys on every table and no foreign key constraints.
 This section lists the keys for quick reference.
 
+- `eth_block_journal`: Primary key `(block_number, block_hash)`; foreign keys none.
+- `eth_event_raw`: Primary key `(block_number, transaction_hash, log_index)`; foreign keys none.
+- `eth_index_state`: Primary key `indexer_key`; foreign keys none.
+- `eth_starkgate_events`: Primary key `event_key`; foreign keys none.
+- `eth_tx_raw`: Primary key `(transaction_hash, block_number)`; foreign keys none.
 - `stark_action_norm`: Primary key `action_key`; foreign keys none.
 - `stark_block_journal`: Primary key `(lane, block_number, block_hash)`; foreign keys none.
 - `stark_block_state_updates`: Primary key `(lane, block_number, block_hash)`; foreign keys none.

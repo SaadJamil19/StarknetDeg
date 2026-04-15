@@ -5,7 +5,7 @@ const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 
 const { setTimeout: sleep } = require('node:timers/promises');
-const { assertFoundationTables, assertPhase2Tables, assertPhase3Tables, assertPhase4Tables, assertPhase6Tables } = require('../core/checkpoint');
+const { assertFoundationTables, assertPhase2Tables, assertPhase3Tables, assertPhase4Tables, assertPhase6Tables, assertL1Tables } = require('../core/checkpoint');
 const { FINALITY_LANES } = require('../core/finality');
 const { knownErc20Cache } = require('../core/known-erc20-cache');
 const { toJsonbString } = require('../core/protocols/shared');
@@ -50,6 +50,7 @@ async function main() {
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
     await assertPhase6Tables(client);
+    await assertL1Tables(client);
   });
 
   console.log(`[phase6] wallet-rollups starting run_once=${runOnce}`);
@@ -93,6 +94,7 @@ async function refreshWalletRollups({
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
     await assertPhase6Tables(client);
+    await assertL1Tables(client);
 
     const window = await resolveAnalyticsWindow(client, { indexerKey, lane, requireL1 });
 
@@ -208,6 +210,7 @@ async function repairPendingWalletPricing({
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
     await assertPhase6Tables(client);
+    await assertL1Tables(client);
 
     const window = await resolveAnalyticsWindow(client, { indexerKey, lane, requireL1 });
     if (window.maxBlockNumber === null) {
@@ -314,7 +317,7 @@ async function loadTrades(client, { lane, maxBlockNumber }) {
     amountOut: toBigIntStrict(row.amount_out, 'wallet trade amount out'),
     blockHash: row.block_hash,
     blockNumber: toBigIntStrict(row.block_number, 'wallet trade block number'),
-    blockTimestamp: row.block_timestamp,
+    blockTimestamp: starkTimestampToDate(row.block_timestamp),
     notionalUsdScaled: row.notional_usd === null ? null : decimalStringToScaled(row.notional_usd, DEFAULT_SCALE),
     pendingEnrichment: Boolean(row.pending_enrichment),
     sourceEventIndex: toBigIntStrict(row.source_event_index, 'wallet trade source event index'),
@@ -336,8 +339,12 @@ async function loadBridgeActivities(client, { lane, maxBlockNumber }) {
             activity.direction,
             activity.classification,
             activity.l2_wallet_address,
+            activity.l1_sender,
             activity.token_address,
             activity.amount,
+            activity.l1_match_status,
+            activity.settlement_seconds,
+            activity.eth_block_number,
             activity.source_event_index,
             activity.transaction_index,
             journal.block_timestamp
@@ -360,6 +367,10 @@ async function loadBridgeActivities(client, { lane, maxBlockNumber }) {
     bridgeKey: row.bridge_key,
     classification: row.classification,
     direction: row.direction,
+    ethBlockNumber: row.eth_block_number === null ? null : BigInt(row.eth_block_number),
+    l1MatchStatus: row.l1_match_status,
+    l1Sender: row.l1_sender,
+    settlementSeconds: row.settlement_seconds === null ? null : Number.parseInt(String(row.settlement_seconds), 10),
     sourceEventIndex: row.source_event_index === null ? 0n : toBigIntStrict(row.source_event_index, 'wallet bridge source event index'),
     tokenAddress: row.token_address,
     transactionHash: row.transaction_hash,
@@ -485,6 +496,23 @@ function processBridgeActivity({ activity, positions, tokenContext, walletStats 
 
   updateActivityMarkers(position, activity.blockNumber, activity.blockTimestamp);
   stats.bridgeActivityCount += 1n;
+  if (activity.l1Sender && stats.l1WalletAddress === null) {
+    stats.l1WalletAddress = activity.l1Sender;
+  }
+  if (activity.l1MatchStatus === 'MATCHED' && activity.ethBlockNumber !== null) {
+    stats.firstL1ActivityBlock = stats.firstL1ActivityBlock === null
+      ? activity.ethBlockNumber
+      : (activity.ethBlockNumber < stats.firstL1ActivityBlock ? activity.ethBlockNumber : stats.firstL1ActivityBlock);
+    stats.lastL1ActivityBlock = stats.lastL1ActivityBlock === null
+      ? activity.ethBlockNumber
+      : (activity.ethBlockNumber > stats.lastL1ActivityBlock ? activity.ethBlockNumber : stats.lastL1ActivityBlock);
+  }
+  if (activity.l1MatchStatus === 'MATCHED' && activity.settlementSeconds !== null) {
+    stats.bridgeSettlementCount = (stats.bridgeSettlementCount ?? 0n) + 1n;
+    stats.avgBridgeSettlementSeconds = stats.avgBridgeSettlementSeconds === null
+      ? activity.settlementSeconds
+      : Math.round(((stats.avgBridgeSettlementSeconds * Number(stats.bridgeSettlementCount - 1n)) + activity.settlementSeconds) / Number(stats.bridgeSettlementCount));
+  }
 
   if (activity.direction === 'bridge_in') {
     position.bridgeInCount += 1n;
@@ -493,6 +521,9 @@ function processBridgeActivity({ activity, positions, tokenContext, walletStats 
       if (usdValueScaled !== null) {
         position.externalCostBasisUsdScaled += usdValueScaled;
         stats.bridgeInflowUsdScaled += usdValueScaled;
+        if (activity.l1MatchStatus === 'MATCHED') {
+          stats.l1BridgeInflowUsdScaled += usdValueScaled;
+        }
       } else {
         position.pendingPricing = true;
         position.metadata.bridge_pricing_gaps += 1;
@@ -508,6 +539,9 @@ function processBridgeActivity({ activity, positions, tokenContext, walletStats 
       consumeInventoryWithoutPnl(position, activity.amount, stats);
       if (usdValueScaled !== null) {
         stats.bridgeOutflowUsdScaled += usdValueScaled;
+        if (activity.l1MatchStatus === 'MATCHED') {
+          stats.l1BridgeOutflowUsdScaled += usdValueScaled;
+        }
       } else {
         position.pendingPricing = true;
         position.metadata.bridge_pricing_gaps += 1;
@@ -788,6 +822,7 @@ function ensureWalletStats(walletStats, walletAddress) {
   }
 
   const stats = {
+    avgBridgeSettlementSeconds: null,
     bestTradeAtBlock: null,
     bestTradePnlUsdScaled: null,
     bestTradeTokenAddress: null,
@@ -795,8 +830,14 @@ function ensureWalletStats(walletStats, walletAddress) {
     bridgeActivityCount: 0n,
     bridgeInflowUsdScaled: 0n,
     bridgeOutflowUsdScaled: 0n,
+    bridgeSettlementCount: 0n,
+    firstL1ActivityBlock: null,
     firstTradeBlockNumber: null,
+    l1BridgeInflowUsdScaled: 0n,
+    l1BridgeOutflowUsdScaled: 0n,
+    l1WalletAddress: null,
     lastTradeBlockNumber: null,
+    lastL1ActivityBlock: null,
     losingTradeCount: 0n,
     metadata: {
       bridge_pricing_gaps: 0,
@@ -1044,6 +1085,12 @@ async function upsertWalletStats(client, row) {
          bridge_inflow_usd,
          bridge_outflow_usd,
          net_bridge_flow_usd,
+         l1_wallet_address,
+         l1_bridge_inflow_usd,
+         l1_bridge_outflow_usd,
+         avg_bridge_settlement_s,
+         first_l1_activity_block,
+         last_l1_activity_block,
          bridge_activity_count,
          winning_trade_count,
          losing_trade_count,
@@ -1058,7 +1105,7 @@ async function upsertWalletStats(client, row) {
      ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
          $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-         $21, $22::jsonb, NOW(), NOW()
+         $21, $22, $23, $24, $25, $26, $27, $28, $29::jsonb, NOW(), NOW()
      )`,
     [
       row.lane,
@@ -1074,6 +1121,12 @@ async function upsertWalletStats(client, row) {
       scaledToNumericString(row.bridgeInflowUsdScaled, DEFAULT_SCALE),
       scaledToNumericString(row.bridgeOutflowUsdScaled, DEFAULT_SCALE),
       scaledToNumericString(row.netBridgeFlowUsdScaled, DEFAULT_SCALE),
+      row.l1WalletAddress,
+      scaledToNumericString(row.l1BridgeInflowUsdScaled, DEFAULT_SCALE),
+      scaledToNumericString(row.l1BridgeOutflowUsdScaled, DEFAULT_SCALE),
+      row.avgBridgeSettlementSeconds,
+      row.firstL1ActivityBlock === null ? null : Number(row.firstL1ActivityBlock),
+      row.lastL1ActivityBlock === null ? null : Number(row.lastL1ActivityBlock),
       toNumericString(row.bridgeActivityCount, 'wallet stats bridge activity count'),
       toNumericString(row.winningTradeCount, 'wallet stats winning trades'),
       toNumericString(row.losingTradeCount, 'wallet stats losing trades'),
@@ -1154,6 +1207,18 @@ function installSignalHandlers() {
       console.log(`[phase6] wallet-rollups received ${signal}, stopping after current pass.`);
     });
   }
+}
+
+function starkTimestampToDate(value) {
+  if (value instanceof Date) {
+    return value;
+  }
+
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  return new Date(Number(toBigIntStrict(value, 'wallet bridge block timestamp')) * 1000);
 }
 
 if (require.main === module) {

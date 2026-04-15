@@ -124,3 +124,45 @@ This file lists the report-driven schema enhancement and bug-fix changes in simp
 - `view_unidentified_protocols` now counts `unknown_locker_[HEX]` rows so the team can see which lockers need registry coverage next.
 - Finalized the rebuild VWAP rule.
 - Full candle rebuilds now compute VWAP from `sum(amount_usd) / total_volume`, which gives the exact nightly truth instead of inheriting any incremental drift.
+
+## Changes4
+
+- Added full Ethereum L1 StarkGate ingestion support.
+- Created `sql/0010_l1_new_tables.sql` for `eth_block_journal`, `eth_tx_raw`, `eth_event_raw`, `eth_starkgate_events`, and `eth_index_state`.
+- Created `sql/0011_l1_alter_tables.sql` to add L1 settlement and match fields into `stark_bridge_activities`, `stark_wallet_bridge_flows`, `stark_wallet_stats`, `stark_message_l2_to_l1`, `stark_trades`, and `stark_whale_alert_candidates`.
+- Added `lib/ethereum-rpc.js` so StarknetDeg can talk to Ethereum JSON-RPC directly without mixing L1 calls into the Starknet RPC client.
+- Added `lib/l1-starkgate.js` to decode StarkGate L1 logs and normalize them into one internal shape before writing anything to the database.
+- Added `src/indexers/l1-starkgate-indexer.ts` to batch-read Ethereum blocks and logs, preserve raw tx and log JSON, decode StarkGate events, and advance `eth_index_state`.
+- Added `src/jobs/l1-cross-chain-matcher.ts` to match L1 deposits and L2 bridge-ins using two strategies:
+  - nonce-first when the L2 bridge row already carries the StarkGate nonce
+  - amount-and-time fallback when nonce is missing
+- Matching is wrapped in database transactions, so we do not get partial updates where `eth_starkgate_events` says `MATCHED` but `stark_bridge_activities` or `stark_trades` were not updated.
+- Implemented L2 address normalization for L1 deposits.
+- L1 recipient felt values are now normalized into the same `0x` + 64 lowercase hex format used by `stark_trades.trader_address` and `stark_bridge_activities.l2_wallet_address`.
+- This closes the address-padding mismatch class where the same wallet would look different on L1 and L2.
+- Added unknown-token warnings for L1 StarkGate decoding.
+- If an L1 bridge event contains a token that is not in our L1-to-L2 mapping, the decoder now emits a `LOG_LEVEL_WARN` message instead of failing silently.
+- Fixed a matcher propagation gap.
+- The matcher was originally only updating `stark_wallet_bridge_flows` and `stark_wallet_stats`.
+- If those rows did not already exist, nothing would be written.
+- The matcher now ensures those summary rows exist before applying L1 settlement updates.
+- Fixed a Starknet timestamp normalization bug in cross-chain matching.
+- `stark_block_journal.block_timestamp` is stored as epoch seconds, not as a ready-made SQL timestamp.
+- The matcher and wallet rollups now convert those numeric seconds into real JavaScript `Date` objects before computing settlement or activity windows.
+- This was required for correct `settlement_seconds` and post-bridge trade timing.
+- Fixed Postgres type-inference bugs in the new matcher SQL.
+- `jsonb_build_object(...)` parameters now use explicit casts, so match metadata updates do not fail at runtime.
+- Decimal USD parameters now cast to `NUMERIC`, so L1-verified inflow and outflow updates do not fail when the value is fractional.
+- Settlement averaging now casts the settlement parameter to `INTEGER`, so `avg_bridge_settlement_s` updates work reliably.
+- Added npm runtime entrypoints for the new L1 services:
+  - `npm run start:l1-indexer`
+  - `npm run start:l1-matcher`
+- Verification was completed with a controlled database fixture because the current `.env` does not yet define `ETH_RPC_URL`.
+- The controlled matcher proof produced these actual results:
+  - `depositsMatched = 1`
+  - `eth_starkgate_events.match_status = MATCHED`
+  - `eth_starkgate_events.match_strategy = nonce`
+  - `eth_starkgate_events.settlement_seconds = 300`
+  - `stark_bridge_activities.l1_match_status = MATCHED`
+  - `stark_trades.l1_deposit_tx_hash` populated correctly
+  - `stark_trades.is_post_bridge_trade = true`
