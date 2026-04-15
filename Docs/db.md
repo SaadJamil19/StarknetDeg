@@ -816,3 +816,41 @@ This table stores wallets and events that look whale-like and may deserve alerti
 - `created_at`: Time when this alert row was inserted.
 - `updated_at`: Time when this alert row was last updated.
 - `velocity_score`: Score showing how quickly the wallet bridged and then traded.
+
+## Keys Reference
+
+The live schema currently has primary keys on every table and no foreign key constraints.
+This section lists the keys for quick reference.
+
+- `stark_action_norm`: Primary key `action_key`; foreign keys none.
+- `stark_block_journal`: Primary key `(lane, block_number, block_hash)`; foreign keys none.
+- `stark_block_state_updates`: Primary key `(lane, block_number, block_hash)`; foreign keys none.
+- `stark_bridge_activities`: Primary key `bridge_key`; foreign keys none.
+- `stark_contract_registry`: Primary key `(contract_address, class_hash)`; foreign keys none.
+- `stark_contract_security`: Primary key `contract_address`; foreign keys none.
+- `stark_event_raw`: Primary key `(lane, block_number, transaction_hash, receipt_event_index)`; foreign keys none.
+- `stark_holder_balance_deltas`: Primary key `delta_key`; foreign keys none.
+- `stark_holder_balances`: Primary key `(lane, token_address, holder_address)`; foreign keys none.
+- `stark_index_state`: Primary key `(indexer_key, lane)`; foreign keys none.
+- `stark_leaderboards`: Primary key `(lane, leaderboard_name, entity_key)`; foreign keys none.
+- `stark_message_l2_to_l1`: Primary key `(lane, block_number, transaction_hash, message_index)`; foreign keys none.
+- `stark_ohlcv_1m`: Primary key `candle_key`; foreign keys none.
+- `stark_pool_latest`: Primary key `(lane, pool_id)`; foreign keys none.
+- `stark_pool_state`: Primary key `(lane, pool_id)`; foreign keys none.
+- `stark_pool_state_history`: Primary key `pool_state_key`; foreign keys none.
+- `stark_price_ticks`: Primary key `tick_key`; foreign keys none.
+- `stark_prices`: Primary key `(lane, token_address)`; foreign keys none.
+- `stark_reconciliation_log`: Primary key `reconciliation_id`; foreign keys none.
+- `stark_token_concentration`: Primary key `(lane, token_address, holder_address)`; foreign keys none.
+- `stark_token_metadata`: Primary key `token_address`; foreign keys none.
+- `stark_trades`: Primary key `trade_key`; foreign keys none.
+- `stark_transfers`: Primary key `transfer_key`; foreign keys none.
+- `stark_tx_raw`: Primary key `(lane, block_number, transaction_hash)`; foreign keys none.
+- `stark_unknown_event_audit`: Primary key `audit_id`; foreign keys none.
+- `stark_wallet_bridge_flows`: Primary key `(lane, wallet_address, token_address)`; foreign keys none.
+- `stark_wallet_pnl_events`: Primary key `pnl_event_key`; foreign keys none.
+- `stark_wallet_positions`: Primary key `(lane, wallet_address, token_address)`; foreign keys none.
+- `stark_wallet_stats`: Primary key `(lane, wallet_address)`; foreign keys none.
+- `stark_whale_alert_candidates`: Primary key `alert_key`; foreign keys none.
+- `tokens`: Primary key `address`; foreign keys none.
+- `view_unidentified_protocols`: View only, so it has no primary key or foreign keys.
