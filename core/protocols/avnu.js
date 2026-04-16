@@ -51,7 +51,7 @@ function decodeSwap({ contractMetadata, event, tx }) {
           transactionHash: tx.transactionHash,
         }),
         actionType: 'swap',
-        accountAddress: tx.senderAddress ?? takerAddress,
+        accountAddress: takerAddress ?? tx.senderAddress,
         amount0,
         amount1,
         emitterAddress: event.fromAddress,
@@ -135,7 +135,7 @@ function decodeSponsoredTransaction({ event, tx }) {
           transactionHash: tx.transactionHash,
         }),
         actionType: 'sponsored_transaction',
-        accountAddress: tx.senderAddress ?? userAddress,
+        accountAddress: userAddress ?? tx.senderAddress,
         emitterAddress: event.fromAddress,
         executionProtocol: 'avnu',
         metadata: normalizeActionMetadata({

@@ -133,10 +133,15 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
 
 function buildTransactionContext(tx) {
   const avnuSwapEvents = tx.events.filter((event) => isAggregatorSwapEvent(event));
+  
+  const internalAmmSwapCount = tx.events.filter((event) => 
+    isSwapSignal(event.selector) && !isAggregatorSwapEvent(event)
+  ).length;
 
   return {
     avnuSwapCount: avnuSwapEvents.length,
     hasAvnuSwap: avnuSwapEvents.length > 0,
+    internalAmmSwapCount,
   };
 }
 
@@ -161,9 +166,9 @@ function applyTransactionRoutingContext(bundle, { route, tx, txContext }) {
       metadata,
     };
 
-    if (nextAction.actionType === 'swap' && nextAction.protocol === 'avnu' && txContext.avnuSwapCount > 1) {
+    if (nextAction.actionType === 'swap' && nextAction.protocol === 'avnu' && txContext.internalAmmSwapCount > 1) {
       nextAction.metadata.is_multihop = true;
-      nextAction.metadata.total_hops = txContext.avnuSwapCount;
+      nextAction.metadata.total_hops = txContext.internalAmmSwapCount;
     }
 
     if (nextAction.actionType === 'swap' && txContext.hasAvnuSwap) {

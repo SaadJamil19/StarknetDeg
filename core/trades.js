@@ -383,7 +383,7 @@ function deriveTrade(action, context) {
   const blockPriceCandidateHops = parseNonNegativeBigInt(process.env.PHASE3_MAX_PRICE_TABLE_HOPS_FROM_STABLE, 1n);
   const allowAggregatorPrices = parseBoolean(process.env.PHASE3_ALLOW_AGGREGATOR_PRICE_TABLES, false);
   const excludeFromPriceTicks = isAggregatorDerived && !allowAggregatorPrices;
-  const excludeFromLatestPrices = excludeFromPriceTicks || (hopsFromStable !== null && hopsFromStable > blockPriceCandidateHops);
+  const excludeFromLatestPrices = (hopsFromStable !== null && hopsFromStable > blockPriceCandidateHops);
   const priceTablesRejectionReason = excludeFromPriceTicks
     ? 'aggregator_derived'
     : (excludeFromLatestPrices ? 'hops_from_stable' : null);
