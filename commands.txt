@@ -1,9 +1,8 @@
-cd C:\Users\SAR\Desktop\Indexers\StarknetDeg
-npm run start:indexer
 
 
 
 
+//Empty the db
 @'
 const path = require('path');
 require('dotenv').config({ path: path.resolve(process.cwd(), '.env') });
@@ -47,7 +46,7 @@ const { Client } = require('pg');
 
 
 
-
+//Start starknet from latest
 cd C:\Users\SAR\Desktop\Indexers\StarknetDeg
 
 $latest = @'
@@ -76,7 +75,7 @@ npm run start:indexer
 
 
 
-npm run start:indexer
+
 
 npm run start:phase4
 
@@ -84,3 +83,26 @@ npm run start:phase4
 npm run start:phase6
 
 
+
+
+
+
+
+$ethLatest = @'
+const path = require('path');
+require('dotenv').config({ path: path.resolve(process.cwd(), '.env') });
+const { EthereumRpcClient } = require('./lib/ethereum-rpc');
+
+(async () => {
+  const client = new EthereumRpcClient();
+  const tip = await client.getBlockNumber();
+  console.log(tip.toString());
+})();
+'@ | node -
+
+$env:ETH_INDEXER_START_BLOCK = $ethLatest
+
+
+
+npm run start:l1-indexer
+npm run start:l1-matcher
