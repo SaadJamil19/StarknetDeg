@@ -125,6 +125,12 @@ This file lists the report-driven schema enhancement and bug-fix changes in simp
 - Finalized the rebuild VWAP rule.
 - Full candle rebuilds now compute VWAP from `sum(amount_usd) / total_volume`, which gives the exact nightly truth instead of inheriting any incremental drift.
 
+<<<<<<< Updated upstream
+=======
+
+
+
+>>>>>>> Stashed changes
 ## Changes4
 
 - Added full Ethereum L1 StarkGate ingestion support.
@@ -166,3 +172,16 @@ This file lists the report-driven schema enhancement and bug-fix changes in simp
   - `stark_bridge_activities.l1_match_status = MATCHED`
   - `stark_trades.l1_deposit_tx_hash` populated correctly
   - `stark_trades.is_post_bridge_trade = true`
+
+## Changes5
+
+- Fixed generic HTTP 400 errors during L1 StarGate Indexing.
+- Updated `lib/ethereum-rpc.js` to explicitly parse and extract the `payload.error.message` on non-OK HTTP responses. This accurately surfaces restrictive RPC error messages (like Alchemy block limits) rather than masking them.
+- Fixed Alchemy Free Tier `eth_getLogs` 400 error.
+- Added `ETH_INDEXER_BATCH_SIZE=10` to `.env` enforcing Alchemy's 10-block strict limit.
+- Fixed Postgres `invalid byte sequence for encoding "UTF8": 0x00` crashes in Phase 4.
+- Updated `jobs/meta-refresher.js` to strip `\x00` characters using Regex from newly decoded Starknet contract token names and symbols before insertion.
+- Fixed `INSERT has more expressions than target columns` in Phase 6.
+- Edited `jobs/wallet-rollups.js` to delete a stray `$29::jsonb` mapping in the `stark_wallet_stats` logic that exceeded the declared column count by 1 parameter.
+- Fixed `Negative holder balance detected` exceptions blocking Phase 6 rollups.
+- Updated `jobs/concentration-rollups.js` to clamp missing-history or silent-fee-burn balance deductions at `0n` rather than throwing hard crash exceptions.
