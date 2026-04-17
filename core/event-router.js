@@ -160,15 +160,16 @@ function applyTransactionRoutingContext(bundle, { route, tx, txContext }) {
       ...(action.metadata ?? {}),
       transaction_sender_address: tx.senderAddress ?? null,
     });
+    const lockerAddress = metadata?.locker_address ?? metadata?.raw_locker ?? null;
     const nextAction = {
       ...action,
       accountAddress: action.accountAddress ?? tx.senderAddress ?? null,
       metadata,
     };
 
-    if (nextAction.actionType === 'swap' && nextAction.protocol === 'avnu' && txContext.internalAmmSwapCount > 1) {
-      nextAction.metadata.is_multihop = true;
-      nextAction.metadata.total_hops = txContext.internalAmmSwapCount;
+    if (nextAction.actionType === 'swap') {
+      nextAction.metadata.route_scan_signal = Boolean(lockerAddress);
+      nextAction.metadata.transaction_swap_count = txContext.internalAmmSwapCount;
     }
 
     if (nextAction.actionType === 'swap' && txContext.hasAvnuSwap) {
@@ -183,7 +184,6 @@ function applyTransactionRoutingContext(bundle, { route, tx, txContext }) {
     }
 
     if (!nextAction.routerProtocol) {
-      const lockerAddress = nextAction.metadata?.locker_address ?? nextAction.metadata?.raw_locker ?? null;
       const inferredRouterProtocol = inferRouterProtocolFromLocker(lockerAddress, nextAction.protocol);
       if (inferredRouterProtocol) {
         nextAction.routerProtocol = inferredRouterProtocol;

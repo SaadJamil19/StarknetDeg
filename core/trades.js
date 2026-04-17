@@ -16,6 +16,7 @@ const {
 } = require('../lib/cairo/fixed-point');
 const { toBigIntStrict, toNumericString } = require('../lib/cairo/bigint');
 const { knownErc20Cache } = require('./known-erc20-cache');
+const { enqueueTradeChainingTransactions } = require('./post-processor');
 const { parsePoolKeyId, sortTokenPair } = require('./normalize');
 const { toJsonbString } = require('./protocols/shared');
 const { getTokenRegistryInfo, isStableTokenInfo, loadTokenRegistryByAddress } = require('./token-registry');
@@ -100,6 +101,8 @@ async function persistTradesForBlock(client, { blockHash, blockNumber, blockTime
     }
   }
 
+  const queuedTransactions = await enqueueTradeChainingTransactions(client, trades);
+
   return {
     latestUsdByToken,
     priceCandidates,
@@ -107,6 +110,7 @@ async function persistTradesForBlock(client, { blockHash, blockNumber, blockTime
     summary: {
       priceCandidates: priceCandidates.length,
       pricedTrades: trades.filter((item) => item.notionalUsdScaled !== null).length,
+      queuedTransactions,
       trades: trades.length,
     },
     trades,
@@ -125,165 +129,41 @@ function collectTradeTokenAddresses(actions) {
 }
 
 function buildMaterializedTradeActions(actions) {
-  const actionsByTransaction = new Map();
+  const groupedByTransaction = new Map();
 
-  for (const action of actions) {
-    if (!actionsByTransaction.has(action.transactionHash)) {
-      actionsByTransaction.set(action.transactionHash, []);
+  for (const action of actions ?? []) {
+    if (!action?.transactionHash) {
+      continue;
     }
 
-    actionsByTransaction.get(action.transactionHash).push(action);
+    if (!groupedByTransaction.has(action.transactionHash)) {
+      groupedByTransaction.set(action.transactionHash, []);
+    }
+
+    groupedByTransaction.get(action.transactionHash).push(action);
   }
 
   const materialized = [];
 
-  for (const transactionActions of actionsByTransaction.values()) {
+  for (const transactionActions of groupedByTransaction.values()) {
     const ordered = [...transactionActions].sort(compareActionOrder);
-    const aggregatorActions = ordered.filter(isAggregatorTradeAction);
-    const nonAggregatorActions = ordered.filter((action) => !isAggregatorTradeAction(action));
+    const hasVenueSwapLegs = ordered.some((action) => !isAggregatorSummaryAction(action));
+    const selected = hasVenueSwapLegs
+      ? ordered.filter((action) => !isAggregatorSummaryAction(action))
+      : ordered;
 
-    materialized.push(...nonAggregatorActions);
-
-    if (aggregatorActions.length === 0) {
-      continue;
-    }
-
-    materialized.push(...groupAggregatorTradeActions(aggregatorActions));
+    materialized.push(...selected);
   }
 
   return materialized.sort(compareActionOrder);
 }
 
-function groupAggregatorTradeActions(actions) {
-  const ordered = [...actions].sort(compareActionOrder);
-  const grouped = [];
-  let currentGroup = [];
-
-  for (const action of ordered) {
-    if (currentGroup.length === 0) {
-      currentGroup.push(action);
-      continue;
-    }
-
-    const previous = currentGroup[currentGroup.length - 1];
-    if (canChainAggregatorHops(previous, action)) {
-      currentGroup.push(action);
-      continue;
-    }
-
-    grouped.push(materializeAggregatorGroup(currentGroup));
-    currentGroup = [action];
-  }
-
-  if (currentGroup.length > 0) {
-    grouped.push(materializeAggregatorGroup(currentGroup));
-  }
-
-  return grouped;
-}
-
-function materializeAggregatorGroup(group) {
-  if (group.length === 1) {
-    return annotateAggregatorAction(group[0], {
-      routeGroupKey: buildRouteGroupKey(group),
-      totalHops: 1n,
-    });
-  }
-
-  const first = group[0];
-  const firstDirection = determineTradeDirection(first.amount0Delta, first.amount1Delta);
-  const last = group[group.length - 1];
-  const lastDirection = determineTradeDirection(last.amount0Delta, last.amount1Delta);
-  if (!firstDirection || !lastDirection) {
-    return annotateAggregatorAction(first, {
-      routeGroupKey: buildRouteGroupKey(group),
-      totalHops: BigInt(group.length),
-    });
-  }
-
-  const tokenInAddress = firstDirection.tokenInIndex === 0 ? first.token0Address : first.token1Address;
-  const tokenOutAddress = lastDirection.tokenOutIndex === 0 ? last.token0Address : last.token1Address;
-  const amountIn = firstDirection.amountIn;
-  const amountOut = lastDirection.amountOut;
-  const [token0Address, token1Address] = sortTokenPair(tokenInAddress, tokenOutAddress, 'aggregated route token pair');
-  const routeGroupKey = buildRouteGroupKey(group);
-
-  return annotateAggregatorAction({
-    ...first,
-    amount0Delta: tokenInAddress === token0Address ? amountIn : -amountOut,
-    amount1Delta: tokenInAddress === token1Address ? amountIn : -amountOut,
-    metadata: {
-      ...(first.metadata ?? {}),
-      aggregated_buy_amount: amountOut,
-      aggregated_buy_token_address: tokenOutAddress,
-      aggregated_hops: group.map((item) => ({
-        amount0_delta: item.amount0Delta,
-        amount1_delta: item.amount1Delta,
-        source_event_index: item.sourceEventIndex,
-        token0_address: item.token0Address,
-        token1_address: item.token1Address,
-      })),
-      aggregated_sell_amount: amountIn,
-      aggregated_sell_token_address: tokenInAddress,
-      aggregated_source_event_indexes: group.map((item) => item.sourceEventIndex),
-    },
-    poolId: buildAggregatorRoutePoolId(tokenInAddress, tokenOutAddress),
-    token0Address,
-    token1Address,
-  }, {
-    routeGroupKey,
-    totalHops: BigInt(group.length),
-  });
-}
-
-function annotateAggregatorAction(action, { routeGroupKey, totalHops }) {
-  return {
-    ...action,
-    isMultiHop: totalHops > 1n,
-    metadata: {
-      ...(action.metadata ?? {}),
-      is_multi_hop: totalHops > 1n,
-      route_group_key: routeGroupKey,
-      total_hops: totalHops,
-    },
-    routeGroupKey,
-    totalHops,
-  };
-}
-
-function canChainAggregatorHops(previous, next) {
-  if (previous.transactionHash !== next.transactionHash) {
-    return false;
-  }
-
-  const previousDirection = determineTradeDirection(previous.amount0Delta, previous.amount1Delta);
-  const nextDirection = determineTradeDirection(next.amount0Delta, next.amount1Delta);
-  if (!previousDirection || !nextDirection) {
-    return false;
-  }
-
-  const previousOut = previousDirection.tokenOutIndex === 0 ? previous.token0Address : previous.token1Address;
-  const nextIn = nextDirection.tokenInIndex === 0 ? next.token0Address : next.token1Address;
-  return previousOut === nextIn;
-}
-
-function isAggregatorTradeAction(action) {
+function isAggregatorSummaryAction(action) {
   return Boolean(
-    action.protocol === 'avnu' ||
-    action.routerProtocol === 'avnu' ||
-    action.metadata?.is_aggregator_trade ||
-    action.metadata?.is_user_facing_aggregated_trade
+    action?.metadata?.is_aggregator_trade ||
+    action?.metadata?.is_user_facing_aggregated_trade ||
+    action?.protocol === 'avnu'
   );
-}
-
-function buildRouteGroupKey(group) {
-  const first = group[0];
-  const last = group[group.length - 1];
-  return `${first.transactionHash}:${first.sourceEventIndex.toString(10)}:${last.sourceEventIndex.toString(10)}`;
-}
-
-function buildAggregatorRoutePoolId(tokenInAddress, tokenOutAddress) {
-  return `avnu:${tokenInAddress}:${tokenOutAddress}`;
 }
 
 function compareActionOrder(left, right) {
@@ -437,6 +317,7 @@ function deriveTrade(action, context) {
     pool_id: action.poolId,
     price_source: priceBundle.priceSource,
     protocol: action.protocol,
+    sequence_id: action.sequenceId ?? null,
     route_group_key: action.routeGroupKey ?? null,
     route_rejection_reason: priceTablesRejectionReason,
     router_protocol_key: routerAttribution.protocolKey,
@@ -453,7 +334,9 @@ function deriveTrade(action, context) {
     amount0Delta: action.amount0Delta,
     amount1Delta: action.amount1Delta,
     amountIn: direction.amountIn,
+    amountInHumanScaled,
     amountOut: direction.amountOut,
+    amountOutHumanScaled,
     blockHash: context.blockHash,
     blockNumber: context.blockNumber,
     blockTimestampDate: context.blockTimestampDate,
@@ -483,6 +366,7 @@ function deriveTrade(action, context) {
     protocol: action.protocol,
     routeGroupKey: action.routeGroupKey ?? null,
     routerProtocol: routerAttribution.displayName,
+    sequenceId: action.sequenceId ?? null,
     sourceEventIndex: action.sourceEventIndex,
     sqrtRatioAfter: action.metadata?.sqrt_ratio_after === undefined ? null : toBigIntStrict(action.metadata.sqrt_ratio_after, 'trade sqrt ratio after'),
     pendingEnrichment,
@@ -1172,7 +1056,6 @@ async function loadSwapActions(client, { blockNumber, lane }) {
       WHERE lane = $1
         AND block_number = $2
         AND action_type = 'swap'
-        AND COALESCE((metadata->>'is_route_leg')::boolean, FALSE) = FALSE
       ORDER BY transaction_index ASC, source_event_index ASC, action_key ASC`,
     [lane, toNumericString(blockNumber, 'block number')],
   );
@@ -1212,6 +1095,7 @@ async function upsertTrade(client, trade) {
          execution_protocol,
          pool_id,
          route_group_key,
+         sequence_id,
          is_multi_hop,
          hop_index,
          total_hops,
@@ -1227,6 +1111,8 @@ async function upsertTrade(client, trade) {
          volume_token1,
          amount_in,
          amount_out,
+         amount_in_human,
+         amount_out_human,
          liquidity_after,
          sqrt_ratio_after,
          tick_after,
@@ -1254,7 +1140,7 @@ async function upsertTrade(client, trade) {
          $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
          $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
          $31, $32, $33, $34, $35, $36, $37, $38, $39, $40,
-         $41, $42, $43, $44, $45, $46, $47, $48::jsonb, NOW(), NOW()
+         $41, $42, $43, $44, $45, $46, $47, $48, $49, $50::jsonb, NOW(), NOW()
      )
      ON CONFLICT (transaction_hash, source_event_index)
      DO UPDATE SET
@@ -1269,6 +1155,7 @@ async function upsertTrade(client, trade) {
          execution_protocol = EXCLUDED.execution_protocol,
          pool_id = EXCLUDED.pool_id,
          route_group_key = EXCLUDED.route_group_key,
+         sequence_id = EXCLUDED.sequence_id,
          is_multi_hop = EXCLUDED.is_multi_hop,
          hop_index = EXCLUDED.hop_index,
          total_hops = EXCLUDED.total_hops,
@@ -1284,6 +1171,8 @@ async function upsertTrade(client, trade) {
          volume_token1 = EXCLUDED.volume_token1,
          amount_in = EXCLUDED.amount_in,
          amount_out = EXCLUDED.amount_out,
+         amount_in_human = EXCLUDED.amount_in_human,
+         amount_out_human = EXCLUDED.amount_out_human,
          liquidity_after = EXCLUDED.liquidity_after,
          sqrt_ratio_after = EXCLUDED.sqrt_ratio_after,
          tick_after = EXCLUDED.tick_after,
@@ -1319,6 +1208,7 @@ async function upsertTrade(client, trade) {
       trade.executionProtocol,
       trade.poolId,
       trade.routeGroupKey ?? null,
+      trade.sequenceId === null || trade.sequenceId === undefined ? null : toNumericString(trade.sequenceId, 'trade sequence id'),
       trade.isMultiHop,
       trade.hopIndex === null || trade.hopIndex === undefined ? null : toNumericString(trade.hopIndex, 'trade hop index'),
       trade.totalHops === null || trade.totalHops === undefined ? null : toNumericString(trade.totalHops, 'trade total hops'),
@@ -1334,6 +1224,8 @@ async function upsertTrade(client, trade) {
       toNumericString(trade.volumeToken1, 'trade volume token1'),
       toNumericString(trade.amountIn, 'trade amount in'),
       toNumericString(trade.amountOut, 'trade amount out'),
+      trade.amountInHumanScaled === null ? null : scaledToNumericString(trade.amountInHumanScaled, DEFAULT_SCALE),
+      trade.amountOutHumanScaled === null ? null : scaledToNumericString(trade.amountOutHumanScaled, DEFAULT_SCALE),
       trade.liquidityAfter === null ? null : toNumericString(trade.liquidityAfter, 'trade liquidity after'),
       trade.sqrtRatioAfter === null ? null : toNumericString(trade.sqrtRatioAfter, 'trade sqrt ratio after'),
       trade.tickAfter === null ? null : toNumericString(trade.tickAfter, 'trade tick after'),
@@ -1446,6 +1338,7 @@ async function loadPendingTradeInputs(client, tokenAddresses) {
             trade.source_event_index,
             trade.pool_id,
             trade.route_group_key,
+            trade.sequence_id,
             trade.is_multi_hop,
             trade.hop_index,
             trade.total_hops,
@@ -1494,6 +1387,7 @@ async function loadPendingTradeInputs(client, tokenAddresses) {
     protocol: row.protocol,
     routeGroupKey: row.route_group_key,
     routerProtocol: row.router_protocol,
+    sequenceId: row.sequence_id === null ? null : toBigIntStrict(row.sequence_id, 'pending trade sequence id'),
     sourceEventIndex: toBigIntStrict(row.source_event_index, 'pending trade source event index'),
     token0Address: row.token0_address,
     token1Address: row.token1_address,
@@ -1533,6 +1427,7 @@ function serializeRealtimeTrade(trade) {
     pendingEnrichment: trade.pendingEnrichment,
     poolId: trade.poolId,
     routeGroupKey: trade.routeGroupKey,
+    sequenceId: trade.sequenceId === null || trade.sequenceId === undefined ? null : trade.sequenceId.toString(10),
     priceSource: trade.priceSource,
     priceToken0PerToken1: scaledToNumericString(trade.priceToken0PerToken1Scaled, DEFAULT_SCALE),
     priceToken1PerToken0: scaledToNumericString(trade.priceToken1PerToken0Scaled, DEFAULT_SCALE),

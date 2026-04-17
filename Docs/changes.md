@@ -185,3 +185,113 @@ This file lists the report-driven schema enhancement and bug-fix changes in simp
 - Edited `jobs/wallet-rollups.js` to delete a stray `$29::jsonb` mapping in the `stark_wallet_stats` logic that exceeded the declared column count by 1 parameter.
 - Fixed `Negative holder balance detected` exceptions blocking Phase 6 rollups.
 - Updated `jobs/concentration-rollups.js` to clamp missing-history or silent-fee-burn balance deductions at `0n` rather than throwing hard crash exceptions.
+
+## Changes6
+
+- Reverted Starknet multi-hop handling back to the safer `materialization first` model.
+- `core/trades.js` no longer collapses multiple route legs into one user-facing synthetic trade before insertion.
+- Every real swap leg now stays as its own `stark_trades` row with its own `transaction_hash`, `source_event_index`, token pair, raw amounts, and execution venue.
+- This directly matches the Lead requirement that a route like `ETH -> STRK -> USDC` must produce two rows, not one merged row.
+
+- Removed the old count-based hop decision from the critical path.
+- The earlier branch was still relying on `internalAmmSwapCount` style logic to infer that `count > 1` means multi-hop.
+- That logic is not safe on Starknet because a single transaction can batch unrelated swaps.
+- `core/event-router.js` now only stores route-scan hints such as `route_scan_signal` and `transaction_swap_count`.
+- It no longer decides the final `is_multi_hop` truth during decode time.
+
+- Refined materialization so internal venue swaps are preserved but redundant aggregator summary rows are not double-counted.
+- `core/trades.js` now loads all swap actions, including rows previously marked as `is_route_leg`.
+- Then it applies one narrow suppression rule:
+  - if a transaction already contains real venue swap legs, the outer AVNU-style summary swap is not materialized into `stark_trades`
+  - if no venue legs exist, the aggregator summary row is still allowed through as a fallback instead of losing the trade entirely
+- This keeps storage faithful while avoiding a false extra row for the outer route summary.
+
+- Added a late-binding forensic chaining engine in `core/post-processor.js`.
+- This module groups rows by `transaction_hash`, sorts them by `transaction_index` and `source_event_index`, and then applies the value-flow rule.
+- The rule is:
+  - `token_out[i] == token_in[i+1]`
+  - `amount_out[i] ~= amount_in[i+1]` within `0.01%` jitter
+- The chaining engine does not merge rows.
+- It only enriches them by assigning:
+  - shared `route_group_key`
+  - `sequence_id = 1, 2, 3...`
+  - `hop_index = 0, 1, 2...`
+  - `total_hops = X`
+  - `is_multi_hop = true`
+
+- Added a dedicated enrichment queue instead of re-scanning the whole table blindly.
+- New migration file: `sql/009_trade_chaining.sql`
+- It adds:
+  - `stark_trades.sequence_id`
+  - `stark_trades.amount_in_human`
+  - `stark_trades.amount_out_human`
+  - new queue table `stark_trade_enrichment_queue`
+- The queue lets the indexer insert trades fast first, and then lets a worker process unthreaded transactions afterwards in a controlled way.
+
+- Added the new worker `jobs/trade-chaining.js`.
+- This worker:
+  - claims pending queue rows with `FOR UPDATE SKIP LOCKED`
+  - loads all `stark_trades` rows for one `transaction_hash`
+  - runs the forensic chaining logic
+  - updates all linked rows in one database transaction
+  - marks the queue row as `processed` or `failed`
+- This avoids partial metadata writes and directly addresses the `re-processing stuck` problem.
+
+- Fixed the broken `amount_human` write path.
+- Root cause was not BigInt integer division.
+- The code was already computing scaled human values in `core/trades.js`, but this branch was dropping them before insertion.
+- Specifically:
+  - `deriveTrade(...)` computed `amountInHumanScaled` and `amountOutHumanScaled`
+  - but those values were not being returned consistently into the final trade payload on this branch
+  - and the SQL write path on this branch had drifted away from those columns
+- Result: the database columns existed, but live trade rows ended up `NULL` or effectively unusable.
+
+- The amount scaling fix is now explicit and precise.
+- `core/trades.js` now persists `amount_in_human` and `amount_out_human` using `scaledToNumericString(...)`.
+- The DB columns are stored as `NUMERIC(78,30)`, so tiny dust-sized amounts keep full decimal detail without scientific notation or float drift.
+- `sql/009_trade_chaining.sql` also backfills historical rows using exact SQL numeric division with token decimals.
+- This makes the fix visible immediately in the live database instead of only on future inserts.
+
+- Repricing now preserves the late-bound chain metadata.
+- `core/trades.js` was updated so pending-enrichment re-materialization continues to carry:
+  - `route_group_key`
+  - `sequence_id`
+  - `hop_index`
+  - `total_hops`
+- This prevents the repricer from accidentally wiping the route-threading metadata after decimals or prices are refreshed.
+
+- Startup validation was tightened.
+- `core/checkpoint.js` and `bin/start-indexer.js` now assert that the trade-chaining migration is present before the indexer starts.
+- This means startup will fail fast if:
+  - `stark_trade_enrichment_queue` is missing
+  - `stark_trades.sequence_id` is missing
+  - `stark_trades.amount_in_human` or `amount_out_human` is missing
+
+- Added the runtime entrypoint `npm run start:trade-chaining`.
+- `package.json` and `check:syntax` were updated so the new worker and `core/post-processor.js` are part of normal repo validation.
+
+- Verified the PDF chaining case in code, without collapsing rows.
+- The `Verification 8` amount-chaining pattern was replayed through `buildTradeChainAnnotations(...)`.
+- Using the PDF values:
+  - Event 1 output `167733208005356219132` matched Event 2 input
+  - Event 2 output `5848788` matched Event 3 input
+  - Event 3 output `5849340` matched Event 5 input
+- Result:
+  - the rows stay separate
+  - all four rows receive the same `route_group_key`
+  - `sequence_id` becomes `1, 2, 3, 4`
+  - `total_hops = 4`
+  - `is_multi_hop = true`
+
+- Verified the live database after the migration and worker run.
+- `009_trade_chaining.sql` was applied successfully.
+- The queue backfill seeded `231` transaction hashes.
+- The new worker processed all `231` queue rows successfully.
+- Live DB verification after processing showed:
+  - `399` total trade rows
+  - `399` rows with non-zero `amount_in_human`
+  - `399` rows with non-zero `amount_out_human`
+  - `399` rows with non-null `sequence_id`
+  - `203` rows marked `is_multi_hop = true`
+  - `80` distinct `route_group_key` chains
+- This confirms the system is now storing every swap row independently first, then linking the true chains afterwards.

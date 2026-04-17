@@ -14,6 +14,7 @@ const {
   assertPhase4Tables,
   assertSchemaEnhancementTables,
   assertSchemaEnhancementViews,
+  assertTradeChainingTables,
   ensureIndexStateRows,
   getCheckpoint,
 } = require('../core/checkpoint');
@@ -47,6 +48,7 @@ async function main() {
     await assertPhase4Tables(client);
     await assertSchemaEnhancementTables(client);
     await assertSchemaEnhancementViews(client);
+    await assertTradeChainingTables(client);
     await syncRegistryToDatabase(client);
     await seedKnownTokens(client);
     await ensureIndexStateRows(client, indexerKey);

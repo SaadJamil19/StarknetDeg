@@ -48,6 +48,9 @@ const SCHEMA_ENHANCEMENT_TABLES = Object.freeze([
 const SCHEMA_ENHANCEMENT_VIEWS = Object.freeze([
   'view_unidentified_protocols',
 ]);
+const TRADE_CHAINING_TABLES = Object.freeze([
+  'stark_trade_enrichment_queue',
+]);
 const L1_TABLES = Object.freeze([
   'eth_block_journal',
   'eth_tx_raw',
@@ -75,6 +78,11 @@ const SCHEMA_ENHANCEMENT_COLUMNS = Object.freeze([
   { table: 'stark_pool_latest', column: 'tick_after' },
   { table: 'stark_ohlcv_1m', column: 'vwap' },
   { table: 'stark_transfers', column: 'amount_human' },
+]);
+const TRADE_CHAINING_COLUMNS = Object.freeze([
+  { table: 'stark_trades', column: 'sequence_id' },
+  { table: 'stark_trades', column: 'amount_in_human' },
+  { table: 'stark_trades', column: 'amount_out_human' },
 ]);
 
 async function assertFoundationTables(client) {
@@ -109,6 +117,11 @@ async function assertSchemaEnhancementTables(client) {
 
 async function assertSchemaEnhancementViews(client) {
   await assertViewsExist(client, SCHEMA_ENHANCEMENT_VIEWS, 'Schema enhancement', 'sql/008_preproduction_hardening.sql');
+}
+
+async function assertTradeChainingTables(client) {
+  await assertTablesExist(client, TRADE_CHAINING_TABLES, 'Trade chaining', 'sql/009_trade_chaining.sql');
+  await assertColumnsExist(client, TRADE_CHAINING_COLUMNS, 'Trade chaining', 'sql/009_trade_chaining.sql');
 }
 
 async function assertTablesExist(client, tableNames, label, migrationFile) {
@@ -249,6 +262,7 @@ module.exports = {
   assertL1Tables,
   assertSchemaEnhancementTables,
   assertSchemaEnhancementViews,
+  assertTradeChainingTables,
   advanceCheckpoint,
   ensureIndexStateRows,
   getCheckpoint,
