@@ -188,11 +188,11 @@ Both tables now include:
 Why this exists:
 
 - sometimes a trade arrives before token decimals are known
-- we still materialize the trade and candle using a safe fallback of `18`
+- we still materialize the raw trade and defer the human-readable math
 - but we explicitly mark the row as pending enrichment
-- later, when decimals are fetched, the metadata refresher re-prices the trade and rebuilds the affected candles
+- later, when decimals are fetched, the metadata workers re-price the trade and rebuild the affected candles
 
-If we did not track this state explicitly, rows would look final even when they were built with a temporary decimal assumption.
+If we did not track this state explicitly, rows would look final even when their decimal resolution was still incomplete.
 
 ## 4. Files Added Or Updated In Phase 4
 
@@ -236,9 +236,11 @@ This file now handles the metadata race condition directly.
 What changed:
 
 - trade materialization now loads token truth through the shared `tokens` table, which is itself fed by `stark_token_metadata`
-- if decimals are missing, it uses a default of `18`
-- the trade is still written
-- but `pending_enrichment = true` is set on the row
+- if decimals are missing, it does not guess `18`
+- the raw trade is still written
+- `amount_in_human` and `amount_out_human` stay unresolved until metadata lands
+- `pending_enrichment = true` is set on the row
+- the missing token addresses are pushed into `stark_token_metadata_refresh_queue`
 - the trade metadata also records which token addresses were missing decimals
 
 Why this matters:
@@ -249,7 +251,7 @@ Why this matters:
 If we did not do this, we would have two bad options:
 
 - drop the trade entirely
-- or write a silent best-guess row with no way to know it needs correction later
+- or write a mathematically wrong best-guess row with no way to know it needs correction later
 
 ## 4.3 `core/abi-registry.js`
 
@@ -360,7 +362,7 @@ Why this matters:
 
 ## 4.8 `jobs/meta-refresher.js`
 
-This job fills `stark_token_metadata` and also repairs rows that were written before metadata was ready.
+This job still handles broad token refresh and periodic metadata maintenance.
 
 What it does:
 
@@ -388,18 +390,40 @@ Important detail:
 - this means `total_supply` and contract security are refreshed periodically, not only once forever
 - token identity becomes reusable by the rest of the pipeline through the shared `tokens` table
 
-Important race-condition detail:
-
-- when a trade arrives before decimals do, Phase 3 writes the trade using fallback decimals `18`
-- `jobs/meta-refresher.js` later sees the real decimals
-- it reprocesses the affected pending rows from canonical lineage data
-
 Important decode-failure detail:
 
 - if `name()` or `symbol()` cannot be decoded, the refresher stores the raw hex and marks `decode_failed`
 - this is much better than leaving the field empty, because the row is now auditable and retryable
 
 If we did not build this job, every token would stay as a raw address forever.
+
+## 4.8A `jobs/metadata-syncer.js`
+
+This is the new queue-driven metadata repair and transfer-enrichment worker.
+
+What it does:
+
+1. seeds `stark_token_metadata_refresh_queue` from unresolved live rows
+2. claims queue items with `FOR UPDATE SKIP LOCKED`
+3. resolves metadata in tiers:
+   - static core registry
+   - `stark_token_metadata`
+   - on-chain RPC
+   - Voyager authority fallback
+4. upserts the resolved metadata
+5. syncs the shared `tokens` table
+6. re-prices pending trades and rebuilds pending candles when decimals are newly resolved
+7. recalculates transfer amounts and token identity fields for the affected token
+8. upgrades transfer rows from `standard_transfer` to `routing_transfer` when they match a multi-hop `route_group_key`
+9. upgrades transfer `counterparty_type` from `unknown` to `router` or `contract` when same-transaction flow proves an intermediary contract is involved
+
+Important detail:
+
+- this worker is the place where unresolved decimals keep retrying
+- it no longer relies on fallback `18` math
+- partial metadata can still be stored, but queue items stay retryable until decimals are actually resolved
+- Voyager authority calls now respect a small cooldown between requests and use exponential backoff on `HTTP 429`, so a burst of new tokens does not immediately hammer the fallback API
+- transfer-to-route matching no longer requires exact raw-amount equality; it now accepts the same `1 bps` (`0.01%`) dust tolerance already used by the trade-chaining engine
 
 ## 4.9 `jobs/abi-refresh.js`
 
@@ -545,8 +569,10 @@ These are the rules that matter:
 3. ABI refresh is tied to observed class-hash changes, not manual guesses.
 4. The router can use the DB registry, so refreshed metadata actually affects live routing.
 5. Caching is used to reduce redundant RPC pressure, not to invent missing facts.
-6. Trades and candles created with fallback decimals are marked `pending_enrichment` until they are reprocessed.
+6. Trades and candles created before decimals are resolved are marked `pending_enrichment` until they are reprocessed.
 7. Unreadable metadata is stored as raw hex with `decode_failed`, not silently dropped.
+8. Off-chain Voyager fallback is rate-limited locally with cooldown and exponential backoff instead of being fired as fast as the queue can loop.
+9. Transfer route enrichment tolerates `1 bps` dust, so routers that retain a few wei do not silently drop legitimate `routing_transfer` labels.
 
 ## 9. What Phase 4 Does Not Try To Solve Yet
 

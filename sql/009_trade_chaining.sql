@@ -73,14 +73,20 @@ DO UPDATE SET
     updated_at = NOW();
 
 UPDATE stark_trades AS trade
-   SET amount_in_human = trade.amount_in::NUMERIC / power(
-           10::NUMERIC,
-           GREATEST(COALESCE(token_in.decimals, 18)::INTEGER, 0)
-       ),
-       amount_out_human = trade.amount_out::NUMERIC / power(
-           10::NUMERIC,
-           GREATEST(COALESCE(token_out.decimals, 18)::INTEGER, 0)
-       ),
+   SET amount_in_human = CASE
+           WHEN token_in.decimals IS NULL THEN NULL
+           ELSE trade.amount_in::NUMERIC / power(
+               10::NUMERIC,
+               GREATEST(token_in.decimals::INTEGER, 0)
+           )
+       END,
+       amount_out_human = CASE
+           WHEN token_out.decimals IS NULL THEN NULL
+           ELSE trade.amount_out::NUMERIC / power(
+               10::NUMERIC,
+               GREATEST(token_out.decimals::INTEGER, 0)
+           )
+       END,
        updated_at = NOW()
   FROM stark_token_metadata AS token_in,
        stark_token_metadata AS token_out

@@ -17,8 +17,10 @@ const {
   assertFoundationTables,
   assertPhase2Tables,
   assertPhase3Tables,
+  assertPoolTaxonomyTables,
   assertTradeChainingTables,
 } = require('../core/checkpoint');
+const { loadPoolRegistryByPoolKeys } = require('../core/pool-discovery');
 const { closePool, withClient, withTransaction } = require('../lib/db');
 
 let shuttingDown = false;
@@ -36,6 +38,7 @@ async function main() {
     await assertFoundationTables(client);
     await assertPhase2Tables(client);
     await assertPhase3Tables(client);
+    await assertPoolTaxonomyTables(client);
     await assertTradeChainingTables(client);
   });
 
@@ -70,20 +73,24 @@ async function main() {
               lane: item.lane,
               transactionHash: item.transactionHash,
             });
+            const poolRegistryByPoolKey = await loadRegistryForTradePools(client, item, trades);
 
             const { annotations, summary } = buildTradeChainAnnotations(trades, {
               maxJitterBps,
             });
+            const enrichedAnnotations = attachPoolTaxonomyToAnnotations(annotations, trades, poolRegistryByPoolKey);
+            const poolTaxonomy = buildPoolTaxonomySummary(item, trades, poolRegistryByPoolKey);
 
             await applyTradeChainAnnotations(client, {
               lane: item.lane,
               transactionHash: item.transactionHash,
-              annotations,
+              annotations: enrichedAnnotations,
             });
             await markTradeChainQueueProcessed(client, item.queueKey, {
               chains_detected: summary.chainsDetected,
               linked_rows: summary.linkedRows,
               max_chain_length: summary.maxChainLength,
+              pool_taxonomy: poolTaxonomy,
               scan_mode: 'value_flow_late_binding',
               transactions_scanned: summary.transactionsScanned,
             });
@@ -116,6 +123,136 @@ async function main() {
   } while (!shuttingDown);
 
   await closePool();
+}
+
+async function loadRegistryForTradePools(client, item, trades) {
+  const poolKeys = collectPoolKeys(item, trades);
+  if (poolKeys.length === 0) {
+    return new Map();
+  }
+
+  return loadPoolRegistryByPoolKeys(client, poolKeys);
+}
+
+function collectPoolKeys(item, trades) {
+  const poolKeys = new Set();
+
+  for (const poolId of item.metadata?.pool_ids ?? []) {
+    if (poolId) {
+      poolKeys.add(String(poolId));
+    }
+  }
+
+  for (const trade of trades ?? []) {
+    if (trade.poolId) {
+      poolKeys.add(String(trade.poolId));
+    }
+  }
+
+  return Array.from(poolKeys).sort();
+}
+
+function buildPoolTaxonomySummary(item, trades, registryByPoolKey) {
+  const poolKeys = collectPoolKeys(item, trades);
+  if (poolKeys.length === 0) {
+    return {
+      confidenceLevels: [],
+      families: [],
+      models: [],
+      poolKeys: [],
+      protocols: [],
+      unresolvedPoolKeys: [],
+    };
+  }
+
+  const protocols = new Set();
+  const families = new Set();
+  const models = new Set();
+  const confidenceLevels = new Set();
+  const unresolvedPoolKeys = [];
+
+  for (const poolKey of poolKeys) {
+    const entry = registryByPoolKey.get(poolKey) ?? null;
+    if (!entry) {
+      unresolvedPoolKeys.push(poolKey);
+      continue;
+    }
+
+    if (entry.protocol) {
+      protocols.add(entry.protocol);
+    }
+    if (entry.poolFamily) {
+      families.add(entry.poolFamily);
+    }
+    if (entry.poolModel) {
+      models.add(entry.poolModel);
+    }
+    if (entry.confidenceLevel) {
+      confidenceLevels.add(entry.confidenceLevel);
+    }
+    if (!entry.poolFamily || !entry.poolModel) {
+      unresolvedPoolKeys.push(poolKey);
+    }
+  }
+
+  return {
+    confidenceLevels: Array.from(confidenceLevels).sort(),
+    families: Array.from(families).sort(),
+    models: Array.from(models).sort(),
+    poolKeys,
+    protocols: Array.from(protocols).sort(),
+    unresolvedPoolKeys: Array.from(new Set(unresolvedPoolKeys)).sort(),
+  };
+}
+
+function attachPoolTaxonomyToAnnotations(annotations, trades, registryByPoolKey) {
+  const tradeBySourceEventIndex = new Map(
+    (trades ?? []).map((trade) => [trade.sourceEventIndex.toString(10), trade]),
+  );
+
+  return (annotations ?? []).map((annotation) => {
+    const trade = tradeBySourceEventIndex.get(annotation.sourceEventIndex.toString(10));
+    if (!trade) {
+      return annotation;
+    }
+
+    const registryEntry = trade.poolId ? registryByPoolKey.get(String(trade.poolId)) ?? null : null;
+    const poolMetadata = buildPoolMetadataPatch(trade, registryEntry);
+    if (!poolMetadata) {
+      return annotation;
+    }
+
+    return {
+      ...annotation,
+      metadata: {
+        ...(annotation.metadata ?? {}),
+        ...poolMetadata,
+      },
+    };
+  });
+}
+
+function buildPoolMetadataPatch(trade, registryEntry) {
+  const metadata = {};
+  const poolProtocol = registryEntry?.protocol ?? trade.protocol ?? null;
+  const poolFamily = registryEntry?.poolFamily ?? null;
+  const poolModel = registryEntry?.poolModel ?? trade.metadata?.pool_model ?? null;
+  const poolConfidenceLevel = registryEntry?.confidenceLevel ?? null;
+
+  if (poolProtocol) {
+    metadata.pool_protocol = poolProtocol;
+  }
+  if (poolFamily) {
+    metadata.pool_family = poolFamily;
+  }
+  if (poolModel) {
+    metadata.pool_model = poolModel;
+  }
+  if (poolConfidenceLevel) {
+    metadata.pool_confidence_level = poolConfidenceLevel;
+  }
+
+  return Object.keys(metadata).length > 0 ? metadata : null;
 }
 
 function parsePositiveInteger(value, fallbackValue) {

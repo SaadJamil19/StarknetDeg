@@ -1,6 +1,7 @@
 'use strict';
 
 const { createTtlCache } = require('../lib/cache');
+const { getStaticCoreToken } = require('./constants/tokens');
 const { knownErc20Cache } = require('./known-erc20-cache');
 const { normalizeAddress } = require('./normalize');
 const { loadTokenRegistryByAddress } = require('./token-registry');
@@ -12,6 +13,19 @@ const tokenTrustCache = createTtlCache({
 
 async function resolveTrustedToken({ client, tokenAddress }) {
   const normalizedTokenAddress = normalizeAddress(tokenAddress, 'trusted token address');
+  const staticCoreToken = getStaticCoreToken(normalizedTokenAddress);
+  if (staticCoreToken) {
+    return {
+      decimals: staticCoreToken.decimals,
+      name: staticCoreToken.name,
+      symbol: staticCoreToken.symbol,
+      tokenAddress: normalizedTokenAddress,
+      verificationGate: 'static_core_registry',
+      verificationLevel: 'static_verified',
+      verificationSource: staticCoreToken.verificationSource ?? 'static_core_registry',
+    };
+  }
+
   const staticToken = knownErc20Cache.getToken(normalizedTokenAddress);
   if (staticToken) {
     return {

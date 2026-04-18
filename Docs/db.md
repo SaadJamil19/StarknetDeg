@@ -517,16 +517,40 @@ This table stores holder concentration metrics per token.
 This table stores token metadata and token-level enrichment.
 
 - `token_address`: Token contract address.
-- `name`: Token name fetched or resolved by the metadata job.
-- `symbol`: Token symbol fetched or resolved by the metadata job.
-- `decimals`: Token decimals used for human-readable conversion.
+- `name`: Token name fetched or resolved by the metadata jobs.
+- `symbol`: Token symbol fetched or resolved by the metadata jobs.
+- `decimals`: Token decimals used for human-readable conversion. This is now treated as authoritative only when actually resolved, not guessed.
 - `total_supply`: Total supply fetched from chain when available.
 - `is_verified`: Flag showing whether this token is treated as verified.
 - `last_refreshed_block`: Last block number when metadata was refreshed.
-- `last_refreshed_at`: Last time the metadata refresher updated this row.
-- `metadata`: Extra metadata fields, fallbacks, and decode details.
+- `last_refreshed_at`: Last time a metadata worker updated this row.
+- `metadata`: Extra metadata fields, including which tier resolved each field and whether off-chain authority fallback was used.
 - `created_at`: Time when this token metadata row was inserted.
 - `updated_at`: Time when this row was last updated.
+
+Important strategy:
+- Tier 1 is now a static core-token registry inside `core/constants/tokens.js` for hot-path tokens such as `ETH`, `USDC`, `USDT`, `STRK`, `DAI`, and `WBTC`.
+- Tier 2 is `stark_token_metadata`, which works as the persistent cache before any new RPC call is attempted.
+- Tier 3 is live on-chain lookup through `name()`, `symbol()`, `decimals()`, and `totalSupply()`.
+- Tier 4 is an explorer authority fallback, currently wired around Voyager's documented API surface.
+
+## `stark_token_metadata_refresh_queue`
+
+This table stores retryable metadata work items for unresolved token decimals and late token enrichment.
+
+- `queue_key`: Queue primary key. We use the normalized token address itself.
+- `token_address`: Token contract address to resolve.
+- `first_seen_block`: Earliest block where the token was seen in unresolved data.
+- `latest_seen_block`: Latest block where the token was seen in unresolved data.
+- `status`: Queue status such as `pending`, `processing`, `processed`, or `failed`.
+- `attempts`: Retry counter for the metadata worker.
+- `enqueued_at`: When the token was first or last re-enqueued.
+- `processing_started_at`: When the active processing attempt began.
+- `processed_at`: When the latest successful attempt finished.
+- `last_error`: Last worker error when resolution still failed.
+- `metadata`: Queue context such as source tables, retry reason, and sync notes.
+- `created_at`: Time when the queue row was created.
+- `updated_at`: Time when the queue row was last updated.
 
 ## `tokens`
 
@@ -592,7 +616,7 @@ This table stores normalized DEX trades.
 - `metadata`: Extra trade details such as price path or enrichment flags.
 - `created_at`: Time when this trade row was inserted.
 - `updated_at`: Time when this trade row was last updated.
-- `pending_enrichment`: Flag showing whether this trade needs recalculation after metadata improves.
+- `pending_enrichment`: Flag showing whether this trade needs recalculation after metadata improves. When token decimals are unresolved, raw amounts are still stored but `amount_in_human` and `amount_out_human` stay `NULL` until the metadata sync worker repairs them.
 - `locker_address`: Locker or router-like address that delivered the flow into the execution venue when known.
 - `liquidity_after`: Liquidity value after the trade when the protocol reports it.
 - `sqrt_ratio_after`: Sqrt-ratio after the trade when the protocol reports it, stored in high-precision numeric form so it can be reconstructed without float loss.
@@ -639,9 +663,9 @@ This table stores canonical token transfer facts.
 - `token_symbol`: Token symbol copied into the transfer row for later analytics and APIs.
 - `token_name`: Token name copied into the transfer row for later analytics and APIs.
 - `token_decimals`: Decimals value used to derive `amount_human`.
-- `transfer_type`: Internal classification such as `standard_transfer`.
+- `transfer_type`: Internal classification such as `standard_transfer` or `routing_transfer` when the transfer can be tied back to a multi-hop `route_group_key`. Route matching now uses token identity plus raw-amount matching within `1 bps` (`0.01%`) tolerance so router dust does not cause false negatives.
 - `is_internal`: Flag showing whether the transfer is considered internal movement rather than external flow.
-- `counterparty_type`: Lightweight counterparty label used by later analytics.
+- `counterparty_type`: Lightweight counterparty label used by later analytics. Current enrichment upgrades unknown rows to `router` or `contract` when same-transaction transfer flow and swap evidence support that conclusion.
 
 ## `stark_tx_raw`
 
@@ -1001,6 +1025,7 @@ This section lists the keys for quick reference.
 - `stark_reconciliation_log`: Primary key `reconciliation_id`; foreign keys none.
 - `stark_token_concentration`: Primary key `(lane, token_address, holder_address)`; foreign keys none.
 - `stark_token_metadata`: Primary key `token_address`; foreign keys none.
+- `stark_token_metadata_refresh_queue`: Primary key `queue_key`; foreign keys none.
 - `stark_trades`: Primary key `trade_key`; foreign keys none.
 - `stark_transfers`: Primary key `transfer_key`; foreign keys none.
 - `stark_tx_raw`: Primary key `(lane, block_number, transaction_hash)`; foreign keys none.
@@ -1012,3 +1037,42 @@ This section lists the keys for quick reference.
 - `stark_whale_alert_candidates`: Primary key `alert_key`; foreign keys none.
 - `tokens`: Primary key `address`; foreign keys none.
 - `view_unidentified_protocols`: View only, so it has no primary key or foreign keys.
+## Pool Taxonomy Registry
+
+Pool taxonomy is now stored canonically in `stark_pool_registry`.
+
+Purpose:
+
+- separate venue identity from raw contract-address assumptions
+- support singleton pool identities like Ekubo
+- materialize a stable `protocol` / `pool_family` / `pool_model` taxonomy into serving tables
+
+Core columns:
+
+- `pool_key` primary key
+- `protocol`
+- `contract_address`
+- `pool_id`
+- `class_hash`
+- `factory_address`
+- `token0_address`
+- `token1_address`
+- `pool_family`
+- `pool_model`
+- `stable_flag`
+- `confidence_level`
+- `first_seen_block`
+- `metadata`
+
+`stark_pool_state_history` and `stark_pool_latest` now also carry nullable `pool_family` and `pool_model` columns. These are synchronized from the registry by the pool taxonomy worker.
+
+Important identity rule:
+
+- normal pair/pool contracts can use contract address as `pool_id`
+- singleton designs cannot
+- Ekubo uses the normalized pool-key string `token0:token1:fee:tickSpacing:extension`
+
+Operational rule:
+
+- AVNU and Fibrous must not be inserted into `stark_pool_registry` as pools
+- they remain router / aggregator entities only

@@ -6,7 +6,16 @@ require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 
 const { setTimeout: sleep } = require('node:timers/promises');
 const { processAcceptedBlock } = require('../core/block-processor');
-const { assertFoundationTables, assertPhase2Tables, assertPhase3Tables, assertPhase4Tables, assertPhase6Tables, ensureIndexStateRows, getCheckpoint } = require('../core/checkpoint');
+const {
+  assertFoundationTables,
+  assertPhase2Tables,
+  assertPhase3Tables,
+  assertPhase4Tables,
+  assertPhase6Tables,
+  assertPoolTaxonomyTables,
+  ensureIndexStateRows,
+  getCheckpoint,
+} = require('../core/checkpoint');
 const { FINALITY_LANES, normalizeFinalityStatus } = require('../core/finality');
 const { markTokenRegistryForReverification } = require('../core/token-registry');
 const { closePool, withClient, withTransaction } = require('../lib/db');
@@ -33,6 +42,7 @@ async function main() {
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
     await assertPhase6Tables(client);
+    await assertPoolTaxonomyTables(client);
     await ensureIndexStateRows(client, indexerKey);
   });
 
@@ -374,6 +384,8 @@ async function restoreLatestMaterializedState(client, { lane }) {
          lane,
          pool_id,
          protocol,
+         pool_family,
+         pool_model,
          token0_address,
          token1_address,
          block_number,
@@ -399,6 +411,8 @@ async function restoreLatestMaterializedState(client, { lane }) {
             lane,
             pool_id,
             protocol,
+            pool_family,
+            pool_model,
             token0_address,
             token1_address,
             block_number,

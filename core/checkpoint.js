@@ -51,6 +51,12 @@ const SCHEMA_ENHANCEMENT_VIEWS = Object.freeze([
 const TRADE_CHAINING_TABLES = Object.freeze([
   'stark_trade_enrichment_queue',
 ]);
+const METADATA_SYNC_TABLES = Object.freeze([
+  'stark_token_metadata_refresh_queue',
+]);
+const POOL_TAXONOMY_TABLES = Object.freeze([
+  'stark_pool_registry',
+]);
 const L1_TABLES = Object.freeze([
   'eth_block_journal',
   'eth_tx_raw',
@@ -83,6 +89,12 @@ const TRADE_CHAINING_COLUMNS = Object.freeze([
   { table: 'stark_trades', column: 'sequence_id' },
   { table: 'stark_trades', column: 'amount_in_human' },
   { table: 'stark_trades', column: 'amount_out_human' },
+]);
+const POOL_TAXONOMY_COLUMNS = Object.freeze([
+  { table: 'stark_pool_state_history', column: 'pool_family' },
+  { table: 'stark_pool_state_history', column: 'pool_model' },
+  { table: 'stark_pool_latest', column: 'pool_family' },
+  { table: 'stark_pool_latest', column: 'pool_model' },
 ]);
 
 async function assertFoundationTables(client) {
@@ -122,6 +134,15 @@ async function assertSchemaEnhancementViews(client) {
 async function assertTradeChainingTables(client) {
   await assertTablesExist(client, TRADE_CHAINING_TABLES, 'Trade chaining', 'sql/009_trade_chaining.sql');
   await assertColumnsExist(client, TRADE_CHAINING_COLUMNS, 'Trade chaining', 'sql/009_trade_chaining.sql');
+}
+
+async function assertMetadataSyncTables(client) {
+  await assertTablesExist(client, METADATA_SYNC_TABLES, 'Metadata sync', 'sql/0012_metadata_sync_and_transfer_enrichment.sql');
+}
+
+async function assertPoolTaxonomyTables(client) {
+  await assertTablesExist(client, POOL_TAXONOMY_TABLES, 'Pool taxonomy', 'sql/0013_pool_taxonomy_registry.sql');
+  await assertColumnsExist(client, POOL_TAXONOMY_COLUMNS, 'Pool taxonomy', 'sql/0013_pool_taxonomy_registry.sql');
 }
 
 async function assertTablesExist(client, tableNames, label, migrationFile) {
@@ -262,6 +283,8 @@ module.exports = {
   assertL1Tables,
   assertSchemaEnhancementTables,
   assertSchemaEnhancementViews,
+  assertMetadataSyncTables,
+  assertPoolTaxonomyTables,
   assertTradeChainingTables,
   advanceCheckpoint,
   ensureIndexStateRows,

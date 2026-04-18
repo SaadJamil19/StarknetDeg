@@ -125,12 +125,6 @@ This file lists the report-driven schema enhancement and bug-fix changes in simp
 - Finalized the rebuild VWAP rule.
 - Full candle rebuilds now compute VWAP from `sum(amount_usd) / total_volume`, which gives the exact nightly truth instead of inheriting any incremental drift.
 
-<<<<<<< Updated upstream
-=======
-
-
-
->>>>>>> Stashed changes
 ## Changes4
 
 - Added full Ethereum L1 StarkGate ingestion support.
@@ -295,3 +289,226 @@ This file lists the report-driven schema enhancement and bug-fix changes in simp
   - `203` rows marked `is_multi_hop = true`
   - `80` distinct `route_group_key` chains
 - This confirms the system is now storing every swap row independently first, then linking the true chains afterwards.
+
+## CHANGES 7    2026-04-18 Metadata Sync And Transfer QA Hardening
+
+- Added a static core-token registry in `core/constants/tokens.js`.
+- The registry hardcodes the hot-path Starknet mainnet tokens needed for deterministic decimal resolution:
+  - `ETH`
+  - `USDC`
+  - `USDT`
+  - `STRK`
+  - `DAI`
+  - `WBTC`
+  - plus the legacy `DAI_V0` address that the repo already carried in seeds
+- `core/token-registry.js` and `core/token-trust-cache.js` now consult this static registry before slower lookup paths.
+- Result:
+  - the most important token decimals no longer depend on RPC
+  - the token registry can seed these rows immediately and consistently
+
+- Added `core/token-metadata.js` as the shared metadata-resolution module.
+- This module centralizes:
+  - queue enqueue/claim/mark helpers for token metadata retries
+  - tiered metadata resolution
+  - on-chain metadata calls
+  - Voyager authority fallback
+  - `stark_token_metadata` upsert logic
+- The resolution order is now:
+  - Tier 1: static core registry
+  - Tier 2: `stark_token_metadata`
+  - Tier 3: on-chain RPC
+  - Tier 4: Voyager authority fallback
+
+- Removed the unsafe "unknown token => 18 decimals" behavior from the live trade path.
+- `core/trades.js` no longer injects fallback decimals for unresolved tokens.
+- Instead:
+  - the raw trade is still materialized
+  - `pending_enrichment = true` stays explicit
+  - `amount_in_human` / `amount_out_human` remain unresolved until metadata is real
+  - the missing token addresses are queued into `stark_token_metadata_refresh_queue`
+- `deriveTradePrice(...)` was also updated so decimal normalization only happens when both token decimals are actually known.
+- This prevents mathematically wrong normalized prices from being written just because the decimals were missing.
+
+- Added the new retry queue migration in `sql/0012_metadata_sync_and_transfer_enrichment.sql`.
+- This migration adds:
+  - `stark_token_metadata_refresh_queue`
+  - transfer/action transaction lookup indexes used by the enrichment worker
+- It also repairs old rows by:
+  - recomputing `stark_trades.amount_in_human` and `amount_out_human` from actual known decimals only
+  - clearing those human values back to `NULL` when decimals are still unresolved
+  - backfilling the new metadata queue from unresolved `stark_trades` and `stark_transfers`
+
+- Added `jobs/metadata-syncer.js`.
+- This worker is queue-driven and handles the professional retry flow that QA asked for.
+- It:
+  - seeds the queue from unresolved live rows
+  - claims queue work with `FOR UPDATE SKIP LOCKED`
+  - resolves metadata through the four-tier pipeline
+  - syncs resolved token truth into `tokens`
+  - reprices pending trades
+  - rebuilds pending candles
+  - recalculates transfer human amounts and token identity columns
+  - enriches transfers for routing/counterparty QA improvements
+
+- Updated `core/protocols/erc20.js`.
+- When an ERC-20 transfer comes from a token that still fails the trust gate, the decoder now enqueues metadata discovery work instead of only auditing and walking away.
+- This does not force unsafe trust promotion.
+- It simply ensures the token goes into the retry pipeline immediately.
+
+- Updated `core/event-router.js` transfer metadata handling.
+- Transfers now inherit same-transaction routing context in metadata, including:
+  - transaction sender
+  - swap presence in the transaction
+  - swap count
+  - whether AVNU aggregator context was present
+- That context is later used by the metadata sync worker to do smarter transfer enrichment.
+
+- Implemented smart counterparty classification inside `jobs/metadata-syncer.js`.
+- The worker now inspects transfers within the same `transaction_hash`.
+- If an address is a transfer recipient in one row and a sender in another row in a transaction that also contains swap activity:
+  - it becomes a routing intermediary candidate
+  - `starknet_getClassHashAt` is used to confirm code exists at that address
+  - if the address also matches locker/router evidence, `counterparty_type` is upgraded to `router`
+  - otherwise it is upgraded to `contract`
+- This upgrades the old blanket `unknown` labeling into something analytically useful without pretending every intermediary is a user wallet.
+
+- Implemented transfer-type precision for multi-hop routes.
+- The metadata sync worker now matches `stark_transfers` rows back to multi-hop `stark_trades.route_group_key` chains using:
+  - token address
+  - raw amount within `1 bps` (`0.01%`) tolerance
+  - trader/intermediary endpoint evidence
+- Matching rows are upgraded from:
+  - `standard_transfer`
+  - to `routing_transfer`
+- This connects the transfer table to the already-late-bound trade route model instead of leaving the route visible only in `stark_trades`.
+
+- Updated startup/runtime integration.
+- `core/checkpoint.js` now asserts the new metadata-sync queue migration.
+- `bin/start-indexer.js` fails fast if that migration is missing.
+- `package.json` now includes `start:metadata-syncer`.
+- `tools/run-group.js` now starts `metadata-syncer` inside the Phase 4 grouped launcher.
+- `check:syntax` now validates:
+  - `jobs/metadata-syncer.js`
+  - `core/token-metadata.js`
+  - `core/constants/tokens.js`
+  - `core/token-trust-cache.js`
+
+- Removed the old fallback-18 SQL backfill behavior from `sql/009_trade_chaining.sql`.
+- A fresh schema bootstrap now leaves unresolved trade human amounts as `NULL` instead of silently normalizing with `18`.
+- This keeps fresh environments aligned with the corrected live runtime behavior.
+
+## CHANGES 8    2026-04-18 Metadata Sync Voyager Backoff And Dust Tolerance
+
+- Hardened the Tier 4 Voyager authority fallback in `core/token-metadata.js`.
+- Voyager calls now go through a shared request gate instead of firing as fast as the queue can loop.
+- The new gate adds:
+  - a small configurable cooldown between Voyager requests
+  - `Retry-After` handling when Voyager returns it
+  - exponential backoff when Voyager answers with `HTTP 429`
+  - a capped wait window so retry delay does not grow forever
+- This keeps `jobs/metadata-syncer.js` from turning a burst of unresolved tokens into a self-inflicted Voyager rate-limit storm.
+
+- Preserved the existing queue semantics instead of inventing a new side channel.
+- If Voyager still rate-limits after the backoff gate, the affected queue item is marked failed and remains retryable in the normal metadata-refresh queue.
+- This means the worker stays operational under pressure without silently promoting incomplete metadata.
+
+- Fixed a real Postgres bug in `sql/0012_metadata_sync_and_transfer_enrichment.sql`.
+- The original trade backfill statement used `UPDATE ... FROM ... LEFT JOIN ... ON token_out.address = trade.token_out_address`, which Postgres rejects because the target table alias cannot be referenced from that join branch.
+- The migration now uses a CTE keyed by `trade_key` to resolve `token_in_decimals` and `token_out_decimals` first, then performs the `UPDATE` against that resolved set.
+- After this fix, `0012_metadata_sync_and_transfer_enrichment.sql` applied successfully on the current database.
+
+- Hardened transfer route matching in `jobs/metadata-syncer.js`.
+- The first implementation required exact raw-amount equality between:
+  - `stark_transfers.amount`
+  - and the matching `stark_trades.amount_in` / `amount_out`
+- That was too strict for routers that retain a tiny dust amount as fee.
+- The matcher now uses the same `1 bps` (`0.01%`) jitter rule already used by `core/post-processor.js` for trade chaining.
+- Result:
+  - legitimate multi-hop routing transfers are less likely to be missed
+  - transfer enrichment stays aligned with the existing trade-chain tolerance model
+
+- Updated the Phase 4 documentation to reflect both protections.
+- `Docs/phase4_metadata.md` now explains:
+  - Voyager cooldown and exponential backoff
+  - `1 bps` transfer-match tolerance for dust
+- `Docs/db.md` now clarifies that `routing_transfer` classification is tolerant to small raw-amount dust.
+- `Docs/roadmap.md` now lists both behaviors as active Phase 4 guardrails.
+
+## CHANGES 9    2026-04-18 Pool Anatomy And Dynamic Discovery
+
+- Added `sql/0013_pool_taxonomy_registry.sql`.
+- This migration creates the canonical `stark_pool_registry` table and adds nullable `pool_family` and `pool_model` columns to:
+  - `stark_pool_state_history`
+  - `stark_pool_latest`
+
+- Added `core/pool-discovery.js`.
+- This module is the pool taxonomy resolver and registry helper.
+- It handles:
+  - candidate normalization
+  - static registry resolution from `lib/registry/dex-registry.js`
+  - class-hash matching
+  - RPC interface fingerprinting
+  - registry upserts with confidence ordering
+  - state-table synchronization
+  - validation queries
+
+- Implemented the requested resolver precedence.
+- The live resolver now works in this order:
+  - static registry by address
+  - static registry by class hash
+  - RPC probing
+  - history hints
+  - unresolved candidate
+
+- Added the Golden Standard mappings into the resolver path.
+- Current hardcoded taxonomy includes:
+  - JediSwap V1 -> `xyk` / `xyk`
+  - 10KSwap -> `xyk` / `xyk`
+  - JediSwap V2 -> `clmm` / `clmm`
+  - Ekubo -> `clmm` / `singleton_clmm`
+  - SithSwap -> `solidly` / `solidly_stable` or `solidly_volatile`
+  - Haiko -> `market_manager` / `haiko`
+
+- Implemented interface fingerprinting for unknown pool candidates.
+- The resolver now uses lightweight Starknet RPC calls such as:
+  - `getClassHashAt`
+  - `factory`
+  - `stable` / `is_stable`
+  - `get_reserves` / `getReserves`
+  - `get_pool` for Ekubo-style singleton keys
+- This lets the system classify new pools without blocking the indexer on a full ABI-sync pass.
+
+- Preserved the candidate-first runtime model in `core/pool-state.js`.
+- When a pool snapshot is written:
+  - the pool row gets the best available taxonomy hint immediately
+  - unresolved pools are inserted into `stark_pool_registry` as `candidate` or `history_hint`
+  - indexing keeps moving
+  - the taxonomy worker resolves them asynchronously later
+
+- Added the requested backfill worker `jobs/backfill-pool-taxonomy.js`.
+- This worker:
+  - seeds registry candidates from `stark_pool_latest` and `stark_action_norm`
+  - resolves unresolved rows through RPC and static hints
+  - synchronizes resolved taxonomy into the pool state tables
+  - validates null counts, aggregator leaks, and CLMM trade joins
+
+- Preserved the correct singleton identity model.
+- Ekubo pools do not use only the contract address as identity.
+- The system stores the normalized `pool_key = pool_id = token0:token1:fee:tickSpacing:extension`.
+- This prevents all Ekubo pools from collapsing onto the same core address.
+
+- Hardened runtime persistence around reconciliation.
+- `jobs/finality-promoter.js` now preserves `pool_family` and `pool_model` when rebuilding `stark_pool_latest` from `stark_pool_state_history`.
+- Without this, a reorg replay could silently erase pool taxonomy from the latest serving table even though the registry was correct.
+
+- Updated trade-chain enrichment to include pool metadata.
+- `jobs/trade-chaining.js` now loads the pool registry for the transaction's pool keys and stamps these fields into each trade row's metadata during annotation:
+  - `pool_protocol`
+  - `pool_family`
+  - `pool_model`
+  - `pool_confidence_level`
+- The queue summary now also carries the observed confidence levels for the processed route.
+
+- Added the dedicated design doc `Docs/pool_taxonomy.md`.
+- Updated `Docs/db.md` with the new canonical registry and materialized taxonomy columns.
+- Updated `Docs/roadmap.md` so the architecture roadmap includes dynamic pool discovery as a delivered capability.

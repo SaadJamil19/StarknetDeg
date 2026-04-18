@@ -1,6 +1,7 @@
 'use strict';
 
 const { createTtlCache } = require('../lib/cache');
+const { getStaticCoreToken, listStaticCoreTokens } = require('./constants/tokens');
 const { knownErc20Cache } = require('./known-erc20-cache');
 const { normalizeAddress } = require('./normalize');
 
@@ -12,21 +13,74 @@ const TOKEN_CACHE = createTtlCache({
 const STABLE_SYMBOLS = new Set(['USDC', 'USDT', 'DAI', 'CASH']);
 
 function buildKnownTokenSeeds() {
-  return knownErc20Cache.getAllTokens().map((token) => ({
-    address: normalizeAddress(token.l2TokenAddress, 'known token registry address'),
-    decimals: token.decimals === undefined || token.decimals === null ? null : Number(token.decimals),
-    isStable: isStableSymbol(token.symbol),
-    isVerified: true,
-    metadata: {
-      comment: token.comment ?? null,
-      l1_bridge_address: token.l1BridgeAddress ?? null,
-      l1_token_address: token.l1TokenAddress ?? null,
-      verification_source: token.verificationSource ?? 'known_erc20_cache',
-    },
-    name: token.name ?? null,
-    symbol: token.symbol ?? null,
-    tokenType: 'ERC20',
-    verificationSource: token.verificationSource ?? 'known_erc20_cache',
+  const seedsByAddress = new Map();
+
+  for (const token of listStaticCoreTokens()) {
+    seedsByAddress.set(token.address, {
+      address: token.address,
+      decimals: Number(token.decimals),
+      isStable: Boolean(token.isStable),
+      isVerified: true,
+      metadata: {
+        is_legacy: Boolean(token.isLegacy),
+        static_core_registry: true,
+        verification_source: token.verificationSource,
+      },
+      name: token.name ?? null,
+      symbol: token.symbol ?? null,
+      tokenType: 'ERC20',
+      verificationSource: token.verificationSource,
+    });
+  }
+
+  for (const token of knownErc20Cache.getAllTokens()) {
+    const address = normalizeAddress(token.l2TokenAddress, 'known token registry address');
+    const existing = seedsByAddress.get(address) ?? null;
+    const next = {
+      address,
+      decimals: token.decimals === undefined || token.decimals === null ? null : Number(token.decimals),
+      isStable: isStableSymbol(token.symbol),
+      isVerified: true,
+      metadata: {
+        comment: token.comment ?? null,
+        l1_bridge_address: token.l1BridgeAddress ?? null,
+        l1_token_address: token.l1TokenAddress ?? null,
+        verification_source: token.verificationSource ?? 'known_erc20_cache',
+      },
+      name: token.name ?? null,
+      symbol: token.symbol ?? null,
+      tokenType: 'ERC20',
+      verificationSource: token.verificationSource ?? 'known_erc20_cache',
+    };
+
+    seedsByAddress.set(address, existing ? {
+      address,
+      decimals: existing.decimals ?? next.decimals,
+      isStable: Boolean(existing.isStable || next.isStable),
+      isVerified: Boolean(existing.isVerified || next.isVerified),
+      metadata: {
+        ...(next.metadata ?? {}),
+        ...(existing.metadata ?? {}),
+      },
+      name: existing.name ?? next.name ?? null,
+      symbol: existing.symbol ?? next.symbol ?? null,
+      tokenType: existing.tokenType ?? next.tokenType ?? 'ERC20',
+      verificationSource: existing.verificationSource ?? next.verificationSource ?? null,
+      verifiedAtBlock: existing.verifiedAtBlock ?? next.verifiedAtBlock ?? null,
+    } : next);
+  }
+
+  return Array.from(seedsByAddress.values()).map((token) => ({
+    address: token.address,
+    decimals: token.decimals,
+    isStable: token.isStable,
+    isVerified: token.isVerified,
+    metadata: token.metadata,
+    name: token.name,
+    symbol: token.symbol,
+    tokenType: token.tokenType ?? 'ERC20',
+    verificationSource: token.verificationSource ?? null,
+    verifiedAtBlock: token.verifiedAtBlock ?? null,
   }));
 }
 
@@ -134,22 +188,44 @@ async function loadTokenRegistryByAddress(client, tokenAddresses) {
   const registryByAddress = new Map();
 
   for (const address of normalizedAddresses) {
-    const knownToken = knownErc20Cache.getToken(address);
-    if (knownToken) {
+    const staticCoreToken = getStaticCoreToken(address);
+    if (staticCoreToken) {
       registryByAddress.set(address, normalizeRegistryRow({
         address,
-        decimals: knownToken.decimals ?? null,
-        is_stable: isStableSymbol(knownToken.symbol),
+        decimals: staticCoreToken.decimals,
+        is_stable: staticCoreToken.isStable,
         is_verified: true,
         metadata: {
-          comment: knownToken.comment ?? null,
-          source: 'known_erc20_cache',
-          verification_source: knownToken.verificationSource ?? 'known_erc20_cache',
+          is_legacy: Boolean(staticCoreToken.isLegacy),
+          source: 'static_core_registry',
         },
-        name: knownToken.name ?? null,
-        symbol: knownToken.symbol ?? null,
+        name: staticCoreToken.name ?? null,
+        symbol: staticCoreToken.symbol ?? null,
         token_type: 'ERC20',
+        verification_source: staticCoreToken.verificationSource,
       }));
+    }
+
+    const knownToken = knownErc20Cache.getToken(address);
+    if (knownToken) {
+      registryByAddress.set(address, mergeRegistryRow(
+        registryByAddress.get(address) ?? null,
+        normalizeRegistryRow({
+          address,
+          decimals: knownToken.decimals ?? null,
+          is_stable: isStableSymbol(knownToken.symbol),
+          is_verified: true,
+          metadata: {
+            comment: knownToken.comment ?? null,
+            source: 'known_erc20_cache',
+            verification_source: knownToken.verificationSource ?? 'known_erc20_cache',
+          },
+          name: knownToken.name ?? null,
+          symbol: knownToken.symbol ?? null,
+          token_type: 'ERC20',
+          verification_source: knownToken.verificationSource ?? 'known_erc20_cache',
+        }),
+      ));
     }
   }
 

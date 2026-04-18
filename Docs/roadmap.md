@@ -317,6 +317,7 @@ StarknetDeg/
 |-- jobs/
 |   |-- abi-refresh.js
 |   |-- meta-refresher.js
+|   |-- metadata-syncer.js
 |   |-- security-scanner.js
 |   |-- eth-price-feed.js
 |   |-- l1-cross-chain-matcher.js
@@ -740,11 +741,12 @@ This is the StarknetDeg equivalent of Apibara invalidation plus DipDup rollback 
 1. `sql/004_metadata_and_security.sql`
 2. `jobs/abi-refresh.js`
 3. `jobs/meta-refresher.js`
-4. `jobs/security-scanner.js`
-5. `jobs/eth-price-feed.js`
-6. `data/registry/contracts.json`
-7. `tools/verify-abis.js`
-8. `core/token-registry.js`
+4. `jobs/metadata-syncer.js`
+5. `jobs/security-scanner.js`
+6. `jobs/eth-price-feed.js`
+7. `data/registry/contracts.json`
+8. `tools/verify-abis.js`
+9. `core/token-registry.js`
 
 ### Security and integrity guardrails
 
@@ -753,6 +755,8 @@ This is the StarknetDeg equivalent of Apibara invalidation plus DipDup rollback 
 3. ABI refresh is triggered by detected class replacement, not only manual registry edits.
 4. Registry writes are auditable and append-only where possible.
 5. Metadata refresh updates the shared token registry so later phases do not drift on token identity.
+6. Voyager authority fallback is locally rate-limited with cooldown and exponential backoff so bursty metadata repair does not self-trigger `429` storms.
+7. Transfer route enrichment accepts `1 bps` raw-amount jitter, so routers that retain dust fees do not lose `routing_transfer` classification.
 
 ## Phase 5: L1 Integration, Realtime API, and WebSocket Layer
 
@@ -991,3 +995,37 @@ Official and primary external sources:
 11. Ekubo contracts: https://github.com/EkuboProtocol/starknet-contracts
 12. JediSwap contracts: https://github.com/jediswaplabs/JediSwap
 13. AVNU contracts v2: https://github.com/avnu-labs/avnu-contracts-v2
+## Pool Anatomy And Dynamic Discovery
+
+Status: implemented and migration-backed.
+
+Delivered pieces:
+
+- canonical `stark_pool_registry`
+- materialized `pool_family` and `pool_model` on pool state tables
+- static registry matching from `lib/registry/dex-registry.js`
+- class-hash probing
+- lightweight interface fingerprinting
+- candidate-first live discovery from pool-state writes
+- backfill worker for historical pools
+- validation checks for null taxonomy rows, aggregator leaks, and CLMM trade joins
+
+Design rule:
+
+- `protocol` answers "which venue is this"
+- `pool_family` answers "what broad pool class is this"
+- `pool_model` answers "what exact mechanism is this"
+
+Examples:
+
+- `jediswap_v1` -> `xyk` / `xyk`
+- `jediswap_v2` -> `clmm` / `clmm`
+- `ekubo` -> `clmm` / `singleton_clmm`
+- `sithswap` -> `solidly` / `solidly_stable` or `solidly_volatile`
+- `haiko` -> `market_manager` / `haiko`
+
+Remaining future work, if needed:
+
+- stronger reorg pruning for pool-registry candidates seeded from orphaned blocks
+- broader protocol coverage for unverified Starknet venues
+- optional propagation of pool taxonomy into more analytics tables when query pressure justifies it

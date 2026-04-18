@@ -12,8 +12,10 @@ const {
   assertPhase2Tables,
   assertPhase3Tables,
   assertPhase4Tables,
+  assertMetadataSyncTables,
   assertSchemaEnhancementTables,
   assertSchemaEnhancementViews,
+  assertPoolTaxonomyTables,
   assertTradeChainingTables,
   ensureIndexStateRows,
   getCheckpoint,
@@ -46,8 +48,10 @@ async function main() {
     await assertPhase2Tables(client);
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
+    await assertMetadataSyncTables(client);
     await assertSchemaEnhancementTables(client);
     await assertSchemaEnhancementViews(client);
+    await assertPoolTaxonomyTables(client);
     await assertTradeChainingTables(client);
     await syncRegistryToDatabase(client);
     await seedKnownTokens(client);

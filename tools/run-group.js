@@ -10,6 +10,8 @@ const phase = String(process.argv[2] || '').trim().toLowerCase();
 const GROUPS = Object.freeze({
   phase4: [
     { name: 'meta-refresher', script: 'jobs/meta-refresher.js' },
+    { name: 'metadata-syncer', script: 'jobs/metadata-syncer.js' },
+    { name: 'pool-taxonomy', script: 'jobs/backfill-pool-taxonomy.js' },
     { name: 'abi-refresh', script: 'jobs/abi-refresh.js' },
     { name: 'security-scanner', script: 'jobs/security-scanner.js' },
   ],

@@ -384,8 +384,9 @@ But it does not blindly trust any contract that emits `Transfer`.
 It promotes a transfer when the token passes the trust gate.
 
 The trust gate is:
-- first check the static `known_erc20_cache`
-- if that misses, check `stark_token_metadata`
+- first check the static core-token registry and `known_erc20_cache`
+- if that misses, check the shared token metadata tables
+- if the token still cannot be resolved safely, enqueue metadata retry work instead of inventing decimals
 
 If the token still cannot be trusted, it goes to audit as `TRANSFER_UNVERIFIED`.
 
@@ -401,6 +402,7 @@ It can carry forward:
 - token name
 - token decimals
 - transfer type
+- counterparty classification updates later applied by the metadata sync worker
 
 That means Phase 6 does not have to keep rebuilding those basic facts from scratch for every holder or bridge query.
 

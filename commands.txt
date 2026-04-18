@@ -105,4 +105,8 @@ $env:ETH_INDEXER_START_BLOCK = $ethLatest
 
 
 npm run start:l1-indexer
+<<<<<<< ours
 npm run start:l1-matcher
+=======
+npm run start:l1-matcher
+>>>>>>> theirs

@@ -1,6 +1,7 @@
 'use strict';
 
 const { DEFAULT_SCALE, integerAmountToScaled } = require('../../lib/cairo/fixed-point');
+const { enqueueTokenMetadataRefresh } = require('../token-metadata');
 const { normalizeAddress, parseU256FromArray } = require('../normalize');
 const { resolveTrustedToken } = require('../token-trust-cache');
 const { isStableSymbol } = require('../token-registry');
@@ -25,6 +26,18 @@ async function decodeEvent({ client, tx, event }) {
   const trustedToken = await resolveTrustedToken({ client, tokenAddress });
 
   if (!trustedToken) {
+    await enqueueTokenMetadataRefresh(client, {
+      blockNumber: tx.blockNumber,
+      metadata: {
+        protocol: 'erc20',
+        source_event_index: event.receiptEventIndex,
+        transaction_hash: tx.transactionHash,
+      },
+      reason: 'erc20_transfer_unknown_token',
+      sourceTable: 'stark_transfers',
+      tokenAddresses: [tokenAddress],
+    });
+
     return {
       actions: [],
       audits: [buildAuditEntry(tx, event, 'TRANSFER_UNVERIFIED', {

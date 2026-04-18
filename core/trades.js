@@ -19,11 +19,11 @@ const { knownErc20Cache } = require('./known-erc20-cache');
 const { enqueueTradeChainingTransactions } = require('./post-processor');
 const { parsePoolKeyId, sortTokenPair } = require('./normalize');
 const { toJsonbString } = require('./protocols/shared');
+const { enqueueTokenMetadataRefresh } = require('./token-metadata');
 const { getTokenRegistryInfo, isStableTokenInfo, loadTokenRegistryByAddress } = require('./token-registry');
 
 const DEFAULT_BRIDGE_SYMBOLS = ['STRK', 'ETH', 'WBTC', 'USDC', 'USDT', 'DAI'];
 const DEFAULT_CMC_ALLOWLIST = ['STRK', 'ETH', 'WBTC', 'WSTETH', 'EKUBO'];
-const DEFAULT_PENDING_DECIMALS = 18;
 const USD_ONE_SCALED = decimalStringToScaled('1', DEFAULT_SCALE);
 const HUNDRED_SCALED = decimalStringToScaled('100', DEFAULT_SCALE);
 
@@ -68,6 +68,7 @@ async function persistTradesForBlock(client, { blockHash, blockNumber, blockTime
 
   const trades = [];
   const priceCandidates = [...cmcResult.externalPriceCandidates];
+  const pendingMetadataTokenAddresses = new Set();
 
   for (const action of actions) {
     const trade = deriveTrade(action, {
@@ -89,6 +90,16 @@ async function persistTradesForBlock(client, { blockHash, blockNumber, blockTime
     await upsertTrade(client, trade);
     trades.push(trade);
 
+    if (trade.pendingEnrichment) {
+      if (trade.token0Decimals === null || trade.token0Decimals === undefined) {
+        pendingMetadataTokenAddresses.add(trade.token0Address);
+      }
+
+      if (trade.token1Decimals === null || trade.token1Decimals === undefined) {
+        pendingMetadataTokenAddresses.add(trade.token1Address);
+      }
+    }
+
     for (const candidate of trade.priceCandidates) {
       priceContext.set(candidate.tokenAddress, {
         priceIsStale: candidate.priceIsStale,
@@ -99,6 +110,18 @@ async function persistTradesForBlock(client, { blockHash, blockNumber, blockTime
       latestUsdByToken.set(candidate.tokenAddress, candidate.priceUsdScaled);
       priceCandidates.push(candidate);
     }
+  }
+
+  if (pendingMetadataTokenAddresses.size > 0) {
+    await enqueueTokenMetadataRefresh(client, {
+      blockNumber,
+      metadata: {
+        lane,
+      },
+      reason: 'missing_trade_decimals',
+      sourceTable: 'stark_trades',
+      tokenAddresses: Array.from(pendingMetadataTokenAddresses),
+    });
   }
 
   const queuedTransactions = await enqueueTradeChainingTransactions(client, trades);
@@ -297,7 +320,7 @@ function deriveTrade(action, context) {
     amount0_delta: action.amount0Delta,
     amount1_delta: action.amount1Delta,
     decimals_known: priceBundle.priceIsDecimalsNormalized,
-    default_decimals_applied: pendingEnrichment ? DEFAULT_PENDING_DECIMALS : null,
+    decimal_resolution_state: pendingEnrichment ? 'pending_metadata' : 'resolved',
     exclude_from_latest_prices: excludeFromLatestPrices,
     exclude_from_price_ticks: excludeFromPriceTicks,
     extension_address: poolKeyParts?.extension ?? action.metadata?.extension_address ?? null,
@@ -370,6 +393,8 @@ function deriveTrade(action, context) {
     sourceEventIndex: action.sourceEventIndex,
     sqrtRatioAfter: action.metadata?.sqrt_ratio_after === undefined ? null : toBigIntStrict(action.metadata.sqrt_ratio_after, 'trade sqrt ratio after'),
     pendingEnrichment,
+    token0Decimals: decimals0,
+    token1Decimals: decimals1,
     tickAfter: action.metadata?.tick_after === undefined ? null : toBigIntStrict(action.metadata.tick_after, 'trade tick after'),
     tickSpacing: poolKeyParts?.tickSpacing ?? action.metadata?.tick_spacing ?? null,
     token0Address: action.token0Address,
@@ -481,15 +506,24 @@ function deriveTradePrice(action, { decimals0, decimals1, decimalsConfirmed }) {
 
   const priceRawToken1PerToken0Scaled = scaledRatio(rawNumerator, rawDenominator, 0, DEFAULT_SCALE);
   const priceRawToken0PerToken1Scaled = scaledRatio(rawDenominator, rawNumerator, 0, DEFAULT_SCALE);
-  const decimalExponent = decimals0 - decimals1;
-  const inverseDecimalExponent = decimals1 - decimals0;
-  const priceToken1PerToken0Scaled = scaledRatio(rawNumerator, rawDenominator, decimalExponent, DEFAULT_SCALE);
-  const priceToken0PerToken1Scaled = scaledRatio(rawDenominator, rawNumerator, inverseDecimalExponent, DEFAULT_SCALE);
-  const priceRawExecutionToken1PerToken0Scaled = scaledRatio(absBigInt(action.amount1Delta), absBigInt(action.amount0Delta), decimalExponent, DEFAULT_SCALE);
-  const priceRawExecutionToken0PerToken1Scaled = scaledRatio(absBigInt(action.amount0Delta), absBigInt(action.amount1Delta), inverseDecimalExponent, DEFAULT_SCALE);
+  const canNormalizeDecimals = Number.isInteger(decimals0) && Number.isInteger(decimals1);
+  const decimalExponent = canNormalizeDecimals ? decimals0 - decimals1 : 0;
+  const inverseDecimalExponent = canNormalizeDecimals ? decimals1 - decimals0 : 0;
+  const priceToken1PerToken0Scaled = canNormalizeDecimals
+    ? scaledRatio(rawNumerator, rawDenominator, decimalExponent, DEFAULT_SCALE)
+    : priceRawToken1PerToken0Scaled;
+  const priceToken0PerToken1Scaled = canNormalizeDecimals
+    ? scaledRatio(rawDenominator, rawNumerator, inverseDecimalExponent, DEFAULT_SCALE)
+    : priceRawToken0PerToken1Scaled;
+  const priceRawExecutionToken1PerToken0Scaled = canNormalizeDecimals
+    ? scaledRatio(absBigInt(action.amount1Delta), absBigInt(action.amount0Delta), decimalExponent, DEFAULT_SCALE)
+    : scaledRatio(absBigInt(action.amount1Delta), absBigInt(action.amount0Delta), 0, DEFAULT_SCALE);
+  const priceRawExecutionToken0PerToken1Scaled = canNormalizeDecimals
+    ? scaledRatio(absBigInt(action.amount0Delta), absBigInt(action.amount1Delta), inverseDecimalExponent, DEFAULT_SCALE)
+    : scaledRatio(absBigInt(action.amount0Delta), absBigInt(action.amount1Delta), 0, DEFAULT_SCALE);
 
   return {
-    priceIsDecimalsNormalized: Boolean(decimalsConfirmed),
+    priceIsDecimalsNormalized: Boolean(decimalsConfirmed && canNormalizeDecimals),
     priceDeviationPctScaled: computeDeviationPct(priceToken1PerToken0Scaled, priceRawExecutionToken1PerToken0Scaled),
     priceRawExecutionToken0PerToken1Scaled,
     priceRawExecutionToken1PerToken0Scaled,
@@ -989,7 +1023,7 @@ function resolveTokenDecimals(tokenInfo) {
 
   return {
     confirmed: false,
-    value: DEFAULT_PENDING_DECIMALS,
+    value: null,
   };
 }
 
@@ -1140,7 +1174,7 @@ async function upsertTrade(client, trade) {
          $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
          $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
          $31, $32, $33, $34, $35, $36, $37, $38, $39, $40,
-         $41, $42, $43, $44, $45, $46, $47, $48, $49, $50::jsonb, NOW(), NOW()
+         $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51::jsonb, NOW(), NOW()
      )
      ON CONFLICT (transaction_hash, source_event_index)
      DO UPDATE SET

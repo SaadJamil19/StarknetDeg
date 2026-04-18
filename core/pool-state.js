@@ -1,6 +1,11 @@
 'use strict';
 
 const { parsePoolKeyId } = require('./normalize');
+const {
+  derivePoolTaxonomyHint,
+  loadPoolRegistryByPoolKeys,
+  queuePoolDiscoveryCandidates,
+} = require('./pool-discovery');
 const { toJsonbString } = require('./protocols/shared');
 const { toBigIntStrict, toNumericString } = require('../lib/cairo/bigint');
 const { getTokenRegistryInfo, loadTokenRegistryByAddress } = require('./token-registry');
@@ -27,8 +32,10 @@ async function persistPoolStateForBlock(client, { blockNumber, blockTimestampDat
   }
 
   const tokenRegistryByAddress = await loadTokenRegistryByAddress(client, collectPoolTokenAddresses(actions));
+  const poolRegistryByPoolKey = await loadPoolRegistryByPoolKeys(client, actions.map((action) => action.poolId));
   const snapshots = [];
   const latestByPool = new Map();
+  const poolDiscoveryCandidates = new Map();
 
   for (const action of actions) {
     action.blockTimestampDate = blockTimestampDate;
@@ -37,9 +44,19 @@ async function persistPoolStateForBlock(client, { blockNumber, blockTimestampDat
       continue;
     }
 
+    const registryEntry = poolRegistryByPoolKey.get(snapshot.poolId) ?? null;
+    applyPoolTaxonomyToSnapshot(snapshot, registryEntry, action);
+    if (shouldQueuePoolDiscovery(registryEntry)) {
+      poolDiscoveryCandidates.set(snapshot.poolId, buildPoolDiscoveryCandidate(action, snapshot));
+    }
+
     snapshots.push(snapshot);
     latestByPool.set(`${snapshot.lane}:${snapshot.poolId}`, snapshot);
     await insertPoolStateHistory(client, snapshot);
+  }
+
+  if (poolDiscoveryCandidates.size > 0) {
+    await queuePoolDiscoveryCandidates(client, Array.from(poolDiscoveryCandidates.values()));
   }
 
   const latestRows = Array.from(latestByPool.values()).sort(compareSnapshots);
@@ -49,11 +66,12 @@ async function persistPoolStateForBlock(client, { blockNumber, blockTimestampDat
 
   return {
     realtimePoolState: latestRows.map(serializeRealtimePoolState),
-    summary: {
-      poolHistoryRows: snapshots.length,
-      poolLatestRows: latestRows.length,
-    },
-  };
+      summary: {
+        poolHistoryRows: snapshots.length,
+        poolLatestRows: latestRows.length,
+        queuedPoolCandidates: poolDiscoveryCandidates.size,
+      },
+    };
 }
 
 async function resetPoolStateForBlock(client, { blockNumber, lane }) {
@@ -117,6 +135,8 @@ async function loadLatestHistorySnapshot(client, { lane, poolId }) {
             protocol,
             token0_address,
             token1_address,
+            pool_family,
+            pool_model,
             block_number,
             block_hash,
             block_timestamp,
@@ -397,6 +417,70 @@ function safeParsePoolKeyId(poolId) {
   }
 }
 
+function applyPoolTaxonomyToSnapshot(snapshot, registryEntry, action) {
+  const candidate = buildPoolDiscoveryCandidate(action, snapshot);
+  const hint = registryEntry ?? derivePoolTaxonomyHint(candidate);
+
+  snapshot.poolFamily = hint?.poolFamily ?? null;
+  snapshot.poolModel = hint?.poolModel ?? null;
+  snapshot.metadata = {
+    ...(snapshot.metadata ?? {}),
+    pool_confidence_level: hint?.confidenceLevel ?? null,
+    pool_family: snapshot.poolFamily,
+    pool_model: snapshot.poolModel,
+  };
+}
+
+function shouldQueuePoolDiscovery(registryEntry) {
+  if (!registryEntry) {
+    return true;
+  }
+
+  if (!registryEntry.poolFamily || !registryEntry.poolModel) {
+    return true;
+  }
+
+  return ['candidate', 'history_hint'].includes(registryEntry.confidenceLevel ?? 'candidate');
+}
+
+function buildPoolDiscoveryCandidate(action, snapshot) {
+  const stableFlag = action.metadata?.stable;
+
+  return {
+    contractAddress: action.emitterAddress ?? inferPoolContractAddress(snapshot.poolId),
+    firstSeenBlock: snapshot.blockNumber,
+    metadata: {
+      ...(action.metadata ?? {}),
+      ...(snapshot.metadata ?? {}),
+      pool_snapshot_kind: snapshot.snapshotKind,
+    },
+    poolFamily: snapshot.poolFamily,
+    poolId: snapshot.poolId,
+    poolModel: snapshot.poolModel,
+    protocol: snapshot.protocol,
+    stableFlag: typeof stableFlag === 'boolean' ? stableFlag : null,
+    token0Address: snapshot.token0Address,
+    token1Address: snapshot.token1Address,
+  };
+}
+
+function inferPoolContractAddress(poolId) {
+  if (typeof poolId !== 'string' || poolId.trim() === '') {
+    return null;
+  }
+
+  if (/^0x[0-9a-fA-F]+$/.test(poolId)) {
+    return poolId;
+  }
+
+  const myswapParts = poolId.split(':');
+  if (myswapParts.length === 2 && /^0x[0-9a-fA-F]+$/.test(myswapParts[0])) {
+    return myswapParts[0];
+  }
+
+  return null;
+}
+
 async function loadPoolStateActions(client, { blockNumber, lane }) {
   const result = await client.query(
     `SELECT lane,
@@ -406,6 +490,7 @@ async function loadPoolStateActions(client, { blockNumber, lane }) {
             transaction_index,
             source_event_index,
             protocol,
+            emitter_address,
             action_type,
             pool_id,
             token0_address,
@@ -432,6 +517,7 @@ async function loadPoolStateActions(client, { blockNumber, lane }) {
     blockHash: row.block_hash,
     blockNumber: toBigIntStrict(row.block_number, 'pool state row block number'),
     blockTimestampDate: null,
+    emitterAddress: row.emitter_address,
     lane: row.lane,
     metadata: row.metadata ?? {},
     poolId: row.pool_id,
@@ -451,6 +537,8 @@ async function insertPoolStateHistory(client, snapshot) {
          lane,
          pool_id,
          protocol,
+         pool_family,
+         pool_model,
          token0_address,
          token1_address,
          block_number,
@@ -479,12 +567,14 @@ async function insertPoolStateHistory(client, snapshot) {
          created_at,
          updated_at
      ) VALUES (
-         $1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, NOW()), $10,
-         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-         $21, $22, $23, $24, $25, $26, $27, $28, $29::jsonb, NOW(), NOW()
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, NOW()), $12,
+         $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+         $23, $24, $25, $26, $27, $28, $29, $30, $31::jsonb, NOW(), NOW()
      )
      ON CONFLICT (pool_state_key)
      DO UPDATE SET
+         pool_family = EXCLUDED.pool_family,
+         pool_model = EXCLUDED.pool_model,
          reserve0 = EXCLUDED.reserve0,
          reserve1 = EXCLUDED.reserve1,
          liquidity = EXCLUDED.liquidity,
@@ -508,6 +598,8 @@ async function insertPoolStateHistory(client, snapshot) {
       snapshot.lane,
       snapshot.poolId,
       snapshot.protocol,
+      snapshot.poolFamily ?? null,
+      snapshot.poolModel ?? null,
       snapshot.token0Address,
       snapshot.token1Address,
       toNumericString(snapshot.blockNumber, 'pool history block number'),
@@ -543,6 +635,8 @@ async function upsertPoolLatest(client, snapshot) {
          lane,
          pool_id,
          protocol,
+         pool_family,
+         pool_model,
          token0_address,
          token1_address,
          block_number,
@@ -571,13 +665,15 @@ async function upsertPoolLatest(client, snapshot) {
          created_at,
          updated_at
      ) VALUES (
-         $1, $2, $3, $4, $5, $6, $7, COALESCE($8, NOW()), $9, $10,
-         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-         $21, $22, $23, $24, $25, $26, $27, $28::jsonb, NOW(), NOW()
+         $1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, NOW()), $10, $11,
+         $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
+         $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb, NOW(), NOW()
      )
      ON CONFLICT (lane, pool_id)
      DO UPDATE SET
          protocol = EXCLUDED.protocol,
+         pool_family = EXCLUDED.pool_family,
+         pool_model = EXCLUDED.pool_model,
          token0_address = EXCLUDED.token0_address,
          token1_address = EXCLUDED.token1_address,
          block_number = EXCLUDED.block_number,
@@ -617,6 +713,8 @@ async function upsertPoolLatest(client, snapshot) {
       snapshot.lane,
       snapshot.poolId,
       snapshot.protocol,
+      snapshot.poolFamily ?? null,
+      snapshot.poolModel ?? null,
       snapshot.token0Address,
       snapshot.token1Address,
       toNumericString(snapshot.blockNumber, 'pool latest block number'),
@@ -659,7 +757,9 @@ function mapHistoryRowToSnapshot(row) {
     liquidity: row.liquidity === null ? null : toBigIntStrict(row.liquidity, 'latest history liquidity'),
     lockerAddress: row.locker_address ?? null,
     metadata: row.metadata ?? {},
+    poolFamily: row.pool_family ?? null,
     poolId: row.pool_id,
+    poolModel: row.pool_model ?? null,
     poolStateKey: `${row.lane}:${row.pool_id}:${row.transaction_hash}:${row.source_event_index}`,
     priceIsDecimalsNormalized: row.price_is_decimals_normalized,
     priceToken0PerToken1Scaled: row.price_token0_per_token1 === null ? null : decimalStringToScaled(row.price_token0_per_token1, DEFAULT_SCALE),
@@ -691,7 +791,9 @@ function serializeRealtimePoolState(snapshot) {
     poolId: snapshot.poolId,
     priceToken0PerToken1: snapshot.priceToken0PerToken1Scaled === null ? null : scaledToNumericString(snapshot.priceToken0PerToken1Scaled, DEFAULT_SCALE),
     priceToken1PerToken0: snapshot.priceToken1PerToken0Scaled === null ? null : scaledToNumericString(snapshot.priceToken1PerToken0Scaled, DEFAULT_SCALE),
+    poolFamily: snapshot.poolFamily ?? null,
     protocol: snapshot.protocol,
+    poolModel: snapshot.poolModel ?? null,
     reserve0: snapshot.reserve0 === null ? null : snapshot.reserve0.toString(10),
     reserve1: snapshot.reserve1 === null ? null : snapshot.reserve1.toString(10),
     snapshotKind: snapshot.snapshotKind,

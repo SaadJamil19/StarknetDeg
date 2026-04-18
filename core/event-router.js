@@ -200,12 +200,22 @@ function applyTransactionRoutingContext(bundle, { route, tx, txContext }) {
 
     return nextAction;
   });
+  const transfers = normalized.transfers.map((transfer) => ({
+    ...transfer,
+    metadata: normalizeActionMetadata({
+      ...(transfer.metadata ?? {}),
+      has_swap_in_transaction: Boolean(txContext.internalAmmSwapCount > 0 || txContext.hasAvnuSwap),
+      transaction_sender_address: tx.senderAddress ?? null,
+      transaction_swap_count: txContext.internalAmmSwapCount,
+      via_aggregator: txContext.hasAvnuSwap ? 'avnu' : null,
+    }),
+  }));
 
   return {
     actions,
     audits: normalized.audits,
     bridges: normalized.bridges,
-    transfers: normalized.transfers,
+    transfers,
   };
 }
 
