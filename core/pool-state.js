@@ -665,7 +665,7 @@ async function upsertPoolLatest(client, snapshot) {
          created_at,
          updated_at
      ) VALUES (
-         $1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, NOW()), $10, $11,
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, NOW()), $11,
          $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
          $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb, NOW(), NOW()
      )
