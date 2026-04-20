@@ -567,3 +567,26 @@ This file lists the report-driven schema enhancement and bug-fix changes in simp
 - `tvl_usd` is expected to be `NULL` for the current Ekubo CLMM swap snapshots because this indexer only derives TVL from reserve-based snapshots when token decimals and USD prices are available.
 - `factory_address` and `stable_flag` are expected to be `NULL` for current Ekubo registry rows because singleton CLMM pools do not have per-pool factory addresses or stable/volatile flags.
 - Updated `Docs/db.md`, `Docs/phase1.md`, `Docs/phase3.md`, `Docs/phase4_metadata.md`, `Docs/phase5.md`, and `Docs/pool_taxonomy.md` with the corrected nullable-column semantics.
+
+- Audited price, transfer, transaction, queue, and token deployment columns.
+- `stark_price_ticks.price_usd = 1` and `stark_prices.price_usd = 1` are expected for stable anchors such as USDC, USDT, DAI, and CASH.
+- Fixed stable-token registry drift where stable symbols could remain `tokens.is_stable = false` if metadata explicitly passed `false`.
+- Updated `core/token-registry.js` so stable-symbol allowlist detection wins over a false metadata value.
+- Backfilled the current database:
+  - `2` token rows were corrected to `is_stable = true`
+  - affected symbols were `USDC` and `CASH`
+- `is_aggregator_derived = false` in price tables is expected by default because aggregator-derived price candidates are excluded from price tables unless explicitly enabled.
+- `hops_from_stable = 0` means direct stable-anchor valuation. It is a pricing-path metric, not the same thing as trade `hop_index` or `total_hops`.
+- `price_is_stale = false` is expected for fresh direct observations; stale rows only appear when the latest usable source is outside the freshness window.
+- `processing_started_at` in enrichment queues is a transient worker-lock timestamp and is expected to be `NULL` after rows are processed.
+- Fixed transfer internal classification.
+- Root cause: the metadata syncer upgraded `transfer_type` and `counterparty_type`, but did not also set `is_internal`.
+- Updated `jobs/metadata-syncer.js` so `routing_transfer`, `router`, and `contract` counterparty rows are marked `is_internal = true`.
+- Backfilled the current database:
+  - `210` transfer rows were marked internal
+  - `18` of those are `routing_transfer`
+  - the rest have router or contract counterparty evidence
+- `counterparty_type = unknown` is still expected for ordinary transfers where no same-transaction router/contract evidence exists.
+- `stark_tx_raw.contract_address` is expected to be `NULL` for normal `INVOKE` rows; those use `sender_address`. It is populated for `L1_HANDLER` and `DEPLOY_ACCOUNT` rows in the current database.
+- `stark_tx_raw.l1_sender_address` is expected to be `NULL` for non-`L1_HANDLER` rows. Current `13` L1 handler rows have it populated.
+- `tokens.deploy_tx_hash` and `tokens.deployed_at` remain `NULL` for the current token rows because none of the token addresses in `tokens` appear in the indexed `deployed_contracts` state-diff evidence. Their deployments happened outside the indexed window or were learned from static/on-chain metadata instead of an observed deploy transaction.

@@ -378,8 +378,16 @@ async function enrichTransfersForTransaction(client, rpcClient, { lane, transact
       ? 'routing_transfer'
       : (transfer.transferType ?? 'standard_transfer');
     const nextCounterpartyType = resolveCounterpartyType(transfer, addressRoles);
+    const nextIsInternal = isInternalTransfer({
+      counterpartyType: nextCounterpartyType,
+      transferType: nextTransferType,
+    });
 
-    if (nextTransferType === (transfer.transferType ?? 'standard_transfer') && nextCounterpartyType === transfer.counterpartyType) {
+    if (
+      nextTransferType === (transfer.transferType ?? 'standard_transfer') &&
+      nextCounterpartyType === transfer.counterpartyType &&
+      nextIsInternal === transfer.isInternal
+    ) {
       continue;
     }
 
@@ -387,13 +395,15 @@ async function enrichTransfersForTransaction(client, rpcClient, { lane, transact
       `UPDATE stark_transfers
           SET transfer_type = $2,
               counterparty_type = $3,
-              metadata = COALESCE(metadata, '{}'::jsonb) || $4::jsonb,
+              is_internal = $4,
+              metadata = COALESCE(metadata, '{}'::jsonb) || $5::jsonb,
               updated_at = NOW()
         WHERE transfer_key = $1`,
       [
         transfer.transferKey,
         nextTransferType,
         nextCounterpartyType,
+        nextIsInternal,
         JSON.stringify({
           route_group_keys: routeGroupKeys,
           transfer_match_jitter_bps: routeMatchJitterBps.toString(10),
@@ -417,6 +427,7 @@ async function loadTransfersForTransaction(client, { lane, transactionHash }) {
             to_address,
             amount,
             transfer_type,
+            is_internal,
             counterparty_type,
             metadata
        FROM stark_transfers
@@ -435,6 +446,7 @@ async function loadTransfersForTransaction(client, { lane, transactionHash }) {
     tokenAddress: row.token_address,
     transferKey: row.transfer_key,
     transferType: row.transfer_type ?? 'standard_transfer',
+    isInternal: Boolean(row.is_internal),
   }));
 }
 
@@ -558,6 +570,14 @@ function resolveCounterpartyType(transfer, addressRoles) {
   }
 
   return transfer.counterpartyType ?? 'unknown';
+}
+
+function isInternalTransfer({ counterpartyType, transferType }) {
+  if (transferType === 'routing_transfer') {
+    return true;
+  }
+
+  return ['router', 'contract'].includes(counterpartyType);
 }
 
 async function safeGetLatestBlockNumber(rpcClient) {

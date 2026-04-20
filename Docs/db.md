@@ -423,16 +423,16 @@ This table stores high-frequency token price updates.
 - `source_pool_id`: Pool that was used to derive the price.
 - `quote_token_address`: Token used as the quote side for this price.
 - `price_quote`: Raw quoted price before USD resolution.
-- `price_usd`: USD price stored for the token.
+- `price_usd`: USD price stored for the token. Stable anchors such as USDC, USDT, DAI, and CASH are intentionally stored as `1`.
 - `price_source`: Source label for the price, like on-chain ratio or CMC.
 - `bucket_1m`: Minute bucket that this tick belongs to.
 - `metadata`: Extra price derivation details.
 - `created_at`: Time when this row was inserted.
 - `updated_at`: Time when this row was last updated.
-- `price_is_stale`: Flag showing whether the price source is stale.
+- `price_is_stale`: Flag showing whether the price source is stale. It is normally `false` for fresh direct observations and becomes `true` only when the latest usable source is outside the configured freshness window.
 - `price_updated_at_block`: Block where the underlying price source was last refreshed.
-- `hops_from_stable`: Number of intermediate bridge assets on the shortest cycle-free path between this token and the stable anchor used for pricing, so direct stable is `0`, one bridge is `1`, and two bridges are `2`.
-- `is_aggregator_derived`: Flag showing whether this price came from an aggregator-derived trade rather than a direct venue observation.
+- `hops_from_stable`: Number of intermediate bridge assets on the shortest cycle-free path between this token and the stable anchor used for pricing, so direct stable is `0`, one bridge is `1`, and two bridges are `2`. External market-data ticks such as CMC anchors can leave this `NULL` because they do not use an on-chain stable path.
+- `is_aggregator_derived`: Flag showing whether this price came from an aggregator-derived trade rather than a direct venue observation. Aggregator-derived prices are excluded from price tables by default unless explicitly enabled, so normal rows are usually `false`.
 - `sell_amount_raw`: Raw sold-side amount that backed this price observation.
 - `buy_amount_raw`: Raw bought-side amount that backed this price observation.
 - `price_raw_execution`: Raw execution price before later normalization or smoothing.
@@ -454,16 +454,16 @@ This table stores the latest price per token.
 - `source_pool_id`: Pool used for the last price update.
 - `quote_token_address`: Quote token used in the last price derivation.
 - `price_quote`: Raw quote-side price before USD resolution.
-- `price_usd`: Latest USD price for the token.
+- `price_usd`: Latest USD price for the token. Stable anchors are expected to show `1`.
 - `price_source`: Source label for this latest price.
 - `metadata`: Extra details about how the latest price was derived.
 - `created_at`: Time when the row was inserted.
 - `updated_at`: Time when the row was last updated.
-- `price_is_stale`: Flag showing whether the latest price is stale.
+- `price_is_stale`: Flag showing whether the latest price is stale. It is normally `false` for fresh direct observations.
 - `price_updated_at_block`: Block where the price source was last refreshed.
 - `bucket_1m`: Minute bucket where the latest contributing observation belongs.
 - `hops_from_stable`: Number of intermediate bridge assets on the shortest cycle-free path between this token and the stable anchor used for pricing, so direct stable is `0`, one bridge is `1`, and two bridges are `2`.
-- `is_aggregator_derived`: Flag showing whether the latest price came from an aggregator-derived observation.
+- `is_aggregator_derived`: Flag showing whether the latest price came from an aggregator-derived observation. This is normally `false` because aggregator-derived price candidates are filtered out by default.
 - `sell_amount_raw`: Raw sold-side amount that backed the latest price.
 - `buy_amount_raw`: Raw bought-side amount that backed the latest price.
 - `price_raw_execution`: Raw execution price before later normalization or smoothing.
@@ -545,7 +545,7 @@ This table stores retryable metadata work items for unresolved token decimals an
 - `status`: Queue status such as `pending`, `processing`, `processed`, or `failed`.
 - `attempts`: Retry counter for the metadata worker.
 - `enqueued_at`: When the token was first or last re-enqueued.
-- `processing_started_at`: When the active processing attempt began.
+- `processing_started_at`: When the active processing attempt began. This is a transient worker-lock timestamp and is expected to return to `NULL` after a row is processed or failed.
 - `processed_at`: When the latest successful attempt finished.
 - `last_error`: Last worker error when resolution still failed.
 - `metadata`: Queue context such as source tables, retry reason, and sync notes.
@@ -561,14 +561,14 @@ This is the shared token registry table used by transfer trust, pricing, and enr
 - `name`: Shared token name that the rest of the pipeline can reuse.
 - `decimals`: Canonical decimals value used by pricing and transfer normalization.
 - `token_type`: Internal token classification such as `erc20` or another registry label.
-- `is_stable`: Flag showing whether this token should be treated as a stable anchor for price logic.
+- `is_stable`: Flag showing whether this token should be treated as a stable anchor for price logic. Known stable symbols in the allowlist are forced to `true` even if an upstream metadata payload omitted or denied the flag.
 - `is_verified`: Flag showing whether this token is trusted enough for shared pipeline use.
 - `verified_at_block`: Block number when this token row was last verified from live indexed metadata instead of only seed truth.
 - `verification_source`: Source that most recently verified this token row, such as the metadata refresher or the static seed registry.
 - `coingecko_id`: Optional external market-data identifier for enrichment or UI mapping.
 - `logo_url`: Optional logo URL for downstream display layers.
-- `deploy_tx_hash`: Transaction hash that deployed the token contract when known.
-- `deployed_at`: Deployment timestamp when known.
+- `deploy_tx_hash`: Transaction hash that deployed the token contract when known. This stays `NULL` when the token deployment happened before the indexed block window or when no deploy transaction for that token was observed.
+- `deployed_at`: Deployment timestamp when known. This stays `NULL` when the deployment was not present in indexed state updates.
 - `metadata`: Extra token-registry details, including sync notes from enrichment jobs.
 - `created_at`: Time when this token-registry row was inserted.
 - `updated_at`: Time when this token-registry row was last updated.
@@ -630,8 +630,8 @@ This table stores normalized DEX trades.
 - `route_group_key`: Shared key used to tie multiple route hops back to one route group.
 - `price_raw_execution`: Raw execution price captured before the stability filter and later normalization layers.
 - `price_deviation_pct`: Deviation percentage between raw execution price and final stored price.
-- `hops_from_stable`: Number of intermediate bridge assets on the shortest cycle-free path between this trade and the stable anchor used for valuation, so direct stable is `0`, one bridge is `1`, and two bridges are `2`.
-- `is_aggregator_derived`: Flag showing whether the trade row came from an aggregator-derived route summary.
+- `hops_from_stable`: Number of intermediate bridge assets on the shortest cycle-free path between this trade and the stable anchor used for valuation, so direct stable is `0`, one bridge is `1`, and two bridges are `2`. This is a pricing-path value, not the same thing as `hop_index` or `total_hops`; a multi-hop route can still have `hops_from_stable = 0` if valuation touched a stable directly.
+- `is_aggregator_derived`: Flag showing whether the trade row came from an aggregator-derived route summary. Direct venue legs stay `false`; AVNU-style summary rows are `true`.
 - `l1_deposit_tx_hash`: Ethereum deposit transaction linked to this trade when the wallet traded after bridging.
 - `l1_deposit_block`: Ethereum block number of the linked deposit.
 - `l1_deposit_timestamp`: Ethereum timestamp of the linked deposit.
@@ -664,8 +664,8 @@ This table stores canonical token transfer facts.
 - `token_name`: Token name copied into the transfer row for later analytics and APIs.
 - `token_decimals`: Decimals value used to derive `amount_human`.
 - `transfer_type`: Internal classification such as `standard_transfer` or `routing_transfer` when the transfer can be tied back to a multi-hop `route_group_key`. Route matching now uses token identity plus raw-amount matching within `1 bps` (`0.01%`) tolerance so router dust does not cause false negatives.
-- `is_internal`: Flag showing whether the transfer is considered internal movement rather than external flow.
-- `counterparty_type`: Lightweight counterparty label used by later analytics. Current enrichment upgrades unknown rows to `router` or `contract` when same-transaction transfer flow and swap evidence support that conclusion.
+- `is_internal`: Flag showing whether the transfer is considered internal movement rather than external flow. Routing transfers and rows whose counterparty is proven as `router` or `contract` are internal.
+- `counterparty_type`: Lightweight counterparty label used by later analytics. Current enrichment upgrades unknown rows to `router` or `contract` when same-transaction transfer flow and swap evidence support that conclusion; otherwise it stays `unknown`.
 
 ## `stark_tx_raw`
 
@@ -680,8 +680,8 @@ This table stores raw transaction and receipt data before high-level decoding.
 - `finality_status`: Finality status of the transaction’s block.
 - `execution_status`: Execution result of the transaction.
 - `sender_address`: Sender or account address for the transaction.
-- `contract_address`: Contract address for transaction types that target a contract directly.
-- `l1_sender_address`: Parsed L1 sender for L1 handler transactions.
+- `contract_address`: Contract address for transaction types that target a contract directly, such as `L1_HANDLER` and `DEPLOY_ACCOUNT`. Normal `INVOKE` rows usually use `sender_address` instead and can leave this `NULL`.
+- `l1_sender_address`: Parsed L1 sender for L1 handler transactions. This is expected to be `NULL` for non-`L1_HANDLER` transaction types.
 - `nonce`: Transaction nonce.
 - `actual_fee_amount`: Actual fee amount charged by Starknet.
 - `actual_fee_unit`: Fee unit, usually `WEI` or `FRI`.

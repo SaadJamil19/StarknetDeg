@@ -425,6 +425,7 @@ What it does:
 7. recalculates transfer amounts and token identity fields for the affected token
 8. upgrades transfer rows from `standard_transfer` to `routing_transfer` when they match a multi-hop `route_group_key`
 9. upgrades transfer `counterparty_type` from `unknown` to `router` or `contract` when same-transaction flow proves an intermediary contract is involved
+10. marks routing transfers and proven router/contract counterparty transfers as `is_internal = true`
 
 Important detail:
 
@@ -433,6 +434,7 @@ Important detail:
 - partial metadata can still be stored, but queue items stay retryable until decimals are actually resolved
 - Voyager authority calls now respect a small cooldown between requests and use exponential backoff on `HTTP 429`, so a burst of new tokens does not immediately hammer the fallback API
 - transfer-to-route matching no longer requires exact raw-amount equality; it now accepts the same `1 bps` (`0.01%`) dust tolerance already used by the trade-chaining engine
+- `counterparty_type = unknown` is still expected for ordinary transfers where there is no same-transaction swap/router evidence
 
 ## 4.9 `jobs/abi-refresh.js`
 

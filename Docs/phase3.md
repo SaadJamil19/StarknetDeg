@@ -713,6 +713,8 @@ Important meaning changes:
 - `router_protocol` is now the human-readable router name when we can resolve the Ekubo locker, for example `AVNU`, `Haiko`, or `Fibrous`
 - `sqrt_ratio_after` is stored as high-precision numeric state, not float-like market data
 - `hops_from_stable` counts intermediate bridge assets, so direct stable is `0`, one bridge is `1`, and two bridges are `2`
+- `hops_from_stable` is a pricing-path metric, not the same thing as route `hop_index` or `total_hops`; a multi-hop route can still have `hops_from_stable = 0` when valuation is directly anchored to a stable token
+- `is_aggregator_derived` is true for aggregator summary rows, while direct venue legs stay false
 
 ### 9.2 `stark_pool_state_history`
 
@@ -815,6 +817,13 @@ The enhancement pass also added:
 
 These tell us whether the price should still be trusted.
 
+Operational interpretation:
+
+- stable-token rows are intentionally stored at `price_usd = 1`
+- `hops_from_stable = 0` means direct stable-anchor valuation
+- aggregator-derived price candidates are filtered from price tables by default, so `is_aggregator_derived` is normally `false` in `stark_prices`
+- CMC/external anchor rows can have `hops_from_stable = NULL` because they did not use an on-chain stable path
+
 ### 9.5 `stark_price_ticks`
 
 This is the historical price table.
@@ -850,6 +859,8 @@ Important columns:
 - `metadata`
 
 This is the durable history behind `stark_prices`.
+
+The same price-quality interpretation applies here. Most on-chain direct-stable ticks have `hops_from_stable = 0`; only stale or externally anchored rows should differ.
 
 ### 9.6 `stark_ohlcv_1m`
 

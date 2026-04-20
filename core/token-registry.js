@@ -196,7 +196,7 @@ async function syncTokenRegistryFromMetadata(client, metadata) {
       ?? metadata.registryMetadata?.deployed_at
       ?? metadata.metadata?.deployed_at
       ?? null,
-    isStable: metadata.isStable ?? isStableSymbol(metadata.symbol),
+    isStable: Boolean(metadata.isStable) || isStableSymbol(metadata.symbol),
     isVerified: Boolean(metadata.isVerified),
     logoUrl: metadata.logoUrl
       ?? metadata.logo_url
@@ -471,7 +471,7 @@ async function upsertTokenRegistryRow(client, token) {
       token.name ?? null,
       token.decimals === undefined || token.decimals === null ? null : Number(token.decimals),
       token.tokenType ?? 'ERC20',
-      Boolean(token.isStable ?? isStableSymbol(token.symbol)),
+      Boolean(token.isStable) || isStableSymbol(token.symbol),
       Boolean(token.isVerified),
       token.verifiedAtBlock === undefined || token.verifiedAtBlock === null ? null : token.verifiedAtBlock.toString(10),
       token.verificationSource ?? null,
