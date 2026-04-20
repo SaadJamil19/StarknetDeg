@@ -512,3 +512,18 @@ This file lists the report-driven schema enhancement and bug-fix changes in simp
 - Added the dedicated design doc `Docs/pool_taxonomy.md`.
 - Updated `Docs/db.md` with the new canonical registry and materialized taxonomy columns.
 - Updated `Docs/roadmap.md` so the architecture roadmap includes dynamic pool discovery as a delivered capability.
+
+## db column chnages
+
+- Fixed `eth_event_raw.event_type` staying `NULL` for current StarkGate ETH bridge logs.
+- Root cause: the L1 decoder only recognized older or mismatched StarkGate event signatures, while live rows were using:
+  - `Deposit(address,address,uint256,uint256,uint256,uint256)`
+  - `Withdrawal(address,address,uint256)`
+- Added those topics in `lib/l1-starkgate.js`.
+- `eth_event_raw.normalized_status` now becomes `PROCESSED` for those logs instead of `UNKNOWN_EVENT`.
+- Backfilled the current database rows:
+  - `5` `eth_event_raw` rows were re-decoded
+  - `4` rows became `withdrawal_completed`
+  - `1` row became `deposit_initiated`
+  - `5` matching rows were written into `eth_starkgate_events`
+- Updated `Docs/db.md` and `Docs/phase5.md` to document the supported L1 StarkGate event signatures and the meaning of `UNKNOWN_EVENT`.

@@ -935,8 +935,8 @@ This table stores raw Ethereum logs before business matching.
 - `topic2`: Third topic if present.
 - `topic3`: Fourth topic if present.
 - `data`: Raw non-indexed event data payload.
-- `event_type`: Decoded event type when recognized.
-- `normalized_status`: Decode state for this log row.
+- `event_type`: Decoded event type when recognized. Current StarkGate decoding recognizes both the current ETH bridge topics (`Deposit(address,address,uint256,uint256,uint256,uint256)` and `Withdrawal(address,address,uint256)`) and the older StarkGate topics already handled by the L1 decoder.
+- `normalized_status`: Decode state for this log row. `PROCESSED` means the log was decoded into `eth_starkgate_events`; `UNKNOWN_EVENT` means the emitter was indexed but the topic is not currently a supported StarkGate business event; `FAILED` means decoding threw an error.
 - `decode_error`: Decode failure message when the log could not be processed.
 - `raw_log`: Full original Ethereum log JSON.
 - `processed_at`: Time when the log decode finished.

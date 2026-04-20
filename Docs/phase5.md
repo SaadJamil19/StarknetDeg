@@ -85,9 +85,13 @@ Files:
 
 The L1 decoder handles:
 
+- `Deposit(address,address,uint256,uint256,uint256,uint256)`
+- `Withdrawal(address,address,uint256)`
 - `DepositWithMessage(...)`
 - `Deposit(...)`
 - `WithdrawalInitiated(...)`
+
+The first two are the current StarkGate ETH bridge topics seen in live `eth_event_raw` rows. If those signatures are missing, `event_type` stays `NULL` and the raw row is marked `UNKNOWN_EVENT` even though the log came from the StarkGate bridge.
 
 Important decoding rule:
 
