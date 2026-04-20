@@ -62,6 +62,12 @@ Ekubo is the reason `pool_key` exists. The core contract address alone is not en
 
 These columns are materialized copies from `stark_pool_registry`. The registry is the source of truth. The pool state tables are serving tables.
 
+Nullable taxonomy fields:
+
+- `factory_address` applies to factory-created pair or pool contracts. It is normally `NULL` for singleton pool systems like Ekubo.
+- `stable_flag` applies to stable/volatile AMM families. It is normally `NULL` for Ekubo CLMM pools because the model is not a stable-vs-volatile pair contract.
+- Ekubo state rows should use `liquidity`, `sqrt_ratio`, `tick_after`, `tick_spacing`, and `fee_tier`; `reserve0` and `reserve1` are for reserve-based pool snapshots.
+
 ## Resolver Precedence
 
 `core/pool-discovery.js` resolves taxonomy in this order:

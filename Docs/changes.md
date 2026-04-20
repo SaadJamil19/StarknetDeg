@@ -527,3 +527,43 @@ This file lists the report-driven schema enhancement and bug-fix changes in simp
   - `1` row became `deposit_initiated`
   - `5` matching rows were written into `eth_starkgate_events`
 - Updated `Docs/db.md` and `Docs/phase5.md` to document the supported L1 StarkGate event signatures and the meaning of `UNKNOWN_EVENT`.
+
+- Fixed `stark_block_journal.event_count` and `stark_block_journal.state_diff_length`.
+- Root cause: `event_count` was defaulting to `0` instead of using receipt events, and `state_diff_length` was reading only a missing RPC shortcut field even though the state-update table had the computed value.
+- Updated `core/finality.js` so block summaries include total receipt events.
+- Updated `core/block-processor.js` so new journal rows store:
+  - receipt-derived `event_count`
+  - `resolveStateDiffLength(...)` output for `state_diff_length`
+- Backfilled the current database:
+  - `4,850` `stark_block_journal` rows were updated
+  - `4,850` rows now have non-null `event_count`
+  - `4,850` rows now have non-null `state_diff_length`
+- `is_orphaned = false` and `orphaned_at = NULL` were confirmed as expected for the current canonical range because no conflicting/orphaned blocks were present.
+
+- Fixed the static registry validity window.
+- Updated `core/abi-registry.js` so static seed rows now write `valid_from_block = 0` instead of `NULL`.
+- Re-synced the current database registry:
+  - `18` active registry rows now have non-null `valid_from_block`
+- `valid_to_block = NULL` is still expected for active rows.
+- `abi_json` and `abi_refreshed_at_block` are still expected to stay `NULL` until the ABI refresh worker observes a known contract deployment or class replacement and fetches ABI evidence.
+- `abi_version` can stay `NULL` for static selector-based rows that do not need a cached ABI version tag.
+
+- Fixed an L1 matcher SQL timestamp bug.
+- Root cause: `stark_block_journal.block_timestamp` is stored as numeric Starknet epoch seconds, but the amount-and-time deposit matcher and withdrawal matcher were comparing that numeric value directly to Ethereum timestamps.
+- Updated `src/jobs/l1-cross-chain-matcher.ts` to use `to_timestamp(journal.block_timestamp::double precision)` in those SQL comparisons.
+- Verified `npm run start:l1-matcher` with `L1_MATCHER_RUN_ONCE=true` no longer fails with `operator does not exist: numeric + interval`.
+- The current matcher pass found no safe L1/L2 matches:
+  - `deposits_matched = 0`
+  - `withdrawals_matched = 0`
+  - `stale_unmatched = 13`
+- Because there were no safe matches, the L1 settlement columns in `stark_bridge_activities` and the L1 consumed columns in `stark_message_l2_to_l1` remain `NULL` by design.
+
+- Audited pool reserve columns.
+- Current pool rows are Ekubo CLMM snapshots:
+  - `stark_pool_latest`: `96` Ekubo rows
+  - `stark_pool_state_history`: `1,952` Ekubo rows
+  - `stark_pool_registry`: `98` Ekubo rows
+- `reserve0` and `reserve1` are expected to be `NULL` for these rows because Ekubo swap snapshots use CLMM state fields like `liquidity`, `sqrt_ratio`, `tick_after`, `tick_spacing`, and `fee_tier`, not XYK reserve snapshots.
+- `tvl_usd` is expected to be `NULL` for the current Ekubo CLMM swap snapshots because this indexer only derives TVL from reserve-based snapshots when token decimals and USD prices are available.
+- `factory_address` and `stable_flag` are expected to be `NULL` for current Ekubo registry rows because singleton CLMM pools do not have per-pool factory addresses or stable/volatile flags.
+- Updated `Docs/db.md`, `Docs/phase1.md`, `Docs/phase3.md`, `Docs/phase4_metadata.md`, `Docs/phase5.md`, and `Docs/pool_taxonomy.md` with the corrected nullable-column semantics.

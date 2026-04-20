@@ -185,6 +185,8 @@ This table now stores the L1 side of the match:
 This means the bridge row is no longer only “an L2 bridge-like activity”.
 It can now become a fully linked cross-chain bridge record.
 
+These L1 columns are match output columns. They stay `NULL` while `l1_match_status` is `PENDING` or `UNMATCHED`. A row needs enough L2 evidence, usually token, amount, wallet, nonce, and timing, before the matcher can safely attach an Ethereum log.
+
 ### `stark_trades`
 
 Trade rows now store whether they happened after a matched deposit:
@@ -233,12 +235,15 @@ L2-to-L1 messages can now be marked as completed on Ethereum:
 - `message_status`
 - `settlement_seconds`
 
+Those L1 consumption fields stay `NULL` while the message is only `SENT`. They are populated only after the matcher finds a corresponding L1 completion event.
+
 ## Important bug fixes during implementation
 
 While hardening the new L1 path, a few real issues were found and fixed:
 
 - The matcher originally updated wallet summary tables only if the row already existed. That meant successful L1 matches could disappear from analytics. It now ensures those rows exist first.
 - `stark_block_journal.block_timestamp` is stored as Starknet epoch seconds, not as a ready-made SQL timestamp. The matcher and wallet rollups now convert that properly before doing time math.
+- The amount-and-time deposit matcher and withdrawal matcher now cast Starknet epoch seconds through `to_timestamp(...)` in SQL before comparing them to Ethereum timestamps. Without that cast PostgreSQL can fail with `operator does not exist: numeric + interval`.
 - Some new matcher SQL used untyped parameters inside `jsonb_build_object(...)` and `COALESCE(...)`. PostgreSQL could not infer those types at runtime. Explicit casts were added.
 
 These fixes were necessary for production use. Without them, you would get:

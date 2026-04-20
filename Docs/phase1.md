@@ -674,6 +674,12 @@ Columns:
 | `created_at` | `TIMESTAMPTZ` | insert time | auditability |
 | `updated_at` | `TIMESTAMPTZ` | update time | auditability |
 
+Count derivation:
+
+- `event_count` is computed from the receipt event arrays inside the raw block-with-receipts payload.
+- `state_diff_length` is computed from the state update payload and mirrors the populated `stark_block_state_updates.state_diff_length` value.
+- `is_orphaned = false` and `orphaned_at = NULL` are the normal canonical state. They only change when a conflicting row for the same lane/block number is marked superseded.
+
 Primary key:
 
 1. `(lane, block_number, block_hash)`

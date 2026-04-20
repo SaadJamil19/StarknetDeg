@@ -44,11 +44,13 @@ function summarizeBlockReceipts(blockWithReceipts) {
   let succeeded = 0;
   let reverted = 0;
   let l1Handlers = 0;
+  let events = 0;
 
   for (const entry of entries) {
     const receipt = entry.receipt || entry;
     const transaction = entry.transaction || entry;
     const executionStatus = normalizeExecutionStatus(receipt.execution_status);
+    events += Array.isArray(receipt.events) ? receipt.events.length : 0;
 
     if (executionStatus === EXECUTION_STATUSES.SUCCEEDED) {
       succeeded += 1;
@@ -63,6 +65,7 @@ function summarizeBlockReceipts(blockWithReceipts) {
 
   return {
     total: entries.length,
+    events,
     succeeded,
     reverted,
     l1Handlers,

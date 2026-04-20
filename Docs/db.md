@@ -53,13 +53,13 @@ This is the block lineage table. It is the backbone for checkpointing, replay, a
 - `starknet_version`: Starknet protocol version reported by the block.
 - `l1_da_mode`: Data availability mode recorded on the block.
 - `transaction_count`: Number of transactions in the block.
-- `event_count`: Number of receipt events reported for the block.
-- `state_diff_length`: Size of the state diff for the block.
+- `event_count`: Number of receipt events derived from the raw block-with-receipts payload. This can be `0` only when a block has no receipt events.
+- `state_diff_length`: Size summary for the state diff, derived from the same state-update payload used by `stark_block_state_updates`.
 - `succeeded_transaction_count`: Count of successful transactions in this block.
 - `reverted_transaction_count`: Count of reverted transactions in this block.
 - `l1_handler_transaction_count`: Count of L1 handler transactions in this block.
-- `is_orphaned`: Flag showing whether this block was orphaned during reconciliation.
-- `orphaned_at`: Time when this block was marked orphaned.
+- `is_orphaned`: Flag showing whether this block was orphaned during reconciliation. Normal canonical rows should stay `false`.
+- `orphaned_at`: Time when this block was marked orphaned. This stays `NULL` unless a conflicting block row is superseded.
 - `raw_block`: Full raw block payload stored for forensics.
 - `raw_state_update`: Full raw state update payload stored for forensics.
 - `created_at`: Time when this journal row was inserted.
@@ -109,15 +109,15 @@ This table stores bridge-like activities such as L1 handlers and L2-to-L1 messag
 - `metadata`: Extra parsing details for this bridge row.
 - `created_at`: Time when this row was inserted.
 - `updated_at`: Time when this row was last updated.
-- `eth_tx_hash`: Matched Ethereum transaction hash for this bridge row when we successfully link the L2 bridge to an L1 StarkGate event.
+- `eth_tx_hash`: Matched Ethereum transaction hash for this bridge row when we successfully link the L2 bridge to an L1 StarkGate event. Stays `NULL` while the row is `PENDING` or `UNMATCHED`.
 - `eth_block_number`: Ethereum block number where the matched L1 event happened.
 - `eth_block_timestamp`: Ethereum timestamp for the matched L1 event.
 - `eth_log_index`: Log index of the matched L1 event inside the Ethereum transaction receipt.
 - `eth_event_key`: Internal key of the matched `eth_starkgate_events` row.
-- `l1_match_status`: Cross-chain match state for this bridge row, usually `PENDING`, `MATCHED`, or `UNMATCHED`.
-- `settlement_seconds`: Time gap in seconds between the L1 bridge event and the L2 bridge effect.
-- `settlement_blocks_l1`: Ethereum block distance observed when the match was recorded.
-- `settlement_blocks_l2`: Starknet block distance observed when the match was recorded.
+- `l1_match_status`: Cross-chain match state for this bridge row, usually `PENDING`, `MATCHED`, or `UNMATCHED`. Only `MATCHED` rows are expected to have L1 settlement columns populated.
+- `settlement_seconds`: Time gap in seconds between the L1 bridge event and the L2 bridge effect. `NULL` until an L1/L2 match is found.
+- `settlement_blocks_l1`: Ethereum block distance observed when the match was recorded. `NULL` until an L1/L2 match is found.
+- `settlement_blocks_l2`: Starknet block distance observed when the match was recorded. Reserved for Starknet-side settlement distance and can stay `NULL` when only the L1 distance is known.
 
 ## `stark_contract_registry`
 
@@ -128,16 +128,16 @@ This is the contract routing registry used by the decoder engine.
 - `protocol`: Protocol name this contract belongs to.
 - `role`: Role of the contract, like router, factory, pair, pool, or singleton.
 - `decoder`: Decoder name the router should use for this contract.
-- `abi_version`: ABI version tag for this registry entry.
-- `valid_from_block`: First block where this registry entry should be used.
-- `valid_to_block`: Last block where this registry entry should be used.
+- `abi_version`: ABI version tag for this registry entry. Static rows can leave this `NULL` when the decoder uses selector metadata rather than a cached ABI tag.
+- `valid_from_block`: First block where this registry entry should be used. Static seed rows are stored as `0`, meaning valid for the full indexed history.
+- `valid_to_block`: Last block where this registry entry should be used. `NULL` means the active row has no known end block.
 - `metadata`: Extra registry metadata such as selector handlers or source URLs.
 - `is_active`: Flag showing whether this registry row is currently active.
 - `created_at`: Time when this registry row was inserted.
 - `updated_at`: Time when this registry row was last updated.
-- `abi_json`: Cached ABI JSON used for decoding and inspection.
-- `abi_refreshed_at`: Time when the ABI was last refreshed.
-- `abi_refreshed_at_block`: Block number at which the ABI was last refreshed.
+- `abi_json`: Cached ABI JSON used for decoding and inspection when the ABI refresh worker has fetched it. It can stay `NULL` for static selector-based registry rows.
+- `abi_refreshed_at`: Time when the ABI was last refreshed. `NULL` until the ABI refresh worker updates that row.
+- `abi_refreshed_at_block`: Block number at which the ABI was last refreshed. `NULL` until a deployment or class-replacement refresh is recorded.
 
 ## `stark_contract_security`
 
@@ -262,11 +262,11 @@ This table stores raw L2-to-L1 messages from transaction receipts.
 - `raw_message`: Full original raw message payload.
 - `created_at`: Time when this row was inserted.
 - `updated_at`: Time when this row was last updated.
-- `l1_consumed_tx_hash`: Ethereum transaction hash that consumed or completed this L2-to-L1 message when we can match it.
+- `l1_consumed_tx_hash`: Ethereum transaction hash that consumed or completed this L2-to-L1 message when we can match it. Stays `NULL` while `message_status = 'SENT'`.
 - `l1_consumed_block`: Ethereum block number where the message was consumed.
 - `l1_consumed_timestamp`: Ethereum timestamp when the message was consumed.
 - `message_status`: Current lifecycle status for the message, such as `SENT` or `CONSUMED`.
-- `settlement_seconds`: Time gap between L2 message emission and L1 consumption.
+- `settlement_seconds`: Time gap between L2 message emission and L1 consumption. `NULL` until a matching L1 consumption event is found.
 
 ## `stark_ohlcv_1m`
 
@@ -323,14 +323,14 @@ This table stores the latest materialized state for each pool.
 - `transaction_hash`: Transaction that produced this snapshot.
 - `transaction_index`: Transaction position inside the block.
 - `source_event_index`: Source event index for this snapshot.
-- `reserve0`: Latest known reserve of token0.
-- `reserve1`: Latest known reserve of token1.
-- `liquidity`: Latest known liquidity value for the pool.
+- `reserve0`: Latest known reserve of token0 for reserve-based XYK or solidly-style snapshots. CLMM swap snapshots such as Ekubo intentionally leave this `NULL`.
+- `reserve1`: Latest known reserve of token1 for reserve-based XYK or solidly-style snapshots. CLMM swap snapshots such as Ekubo intentionally leave this `NULL`.
+- `liquidity`: Latest known liquidity value for the pool. This is the primary state quantity for Ekubo-style CLMM snapshots.
 - `sqrt_ratio`: Latest sqrt price ratio if the pool model uses it.
 - `price_token1_per_token0`: Latest price of token1 quoted in token0 terms.
 - `price_token0_per_token1`: Latest inverse price.
 - `price_is_decimals_normalized`: Flag showing whether price used confirmed decimals.
-- `tvl_usd`: Latest TVL estimate in USD.
+- `tvl_usd`: Latest TVL estimate in USD. This is populated for reserve-based snapshots when token decimals and USD prices are available; Ekubo CLMM swap snapshots can leave it `NULL`.
 - `snapshot_kind`: Kind of snapshot that produced this row.
 - `metadata`: Extra pool snapshot details.
 - `created_at`: Time when this latest row was inserted.
@@ -358,14 +358,14 @@ This is the older compatibility pool-state table kept alongside the newer split 
 - `transaction_hash`: Transaction that produced the snapshot.
 - `transaction_index`: Transaction position inside the block.
 - `source_event_index`: Event index that produced the snapshot.
-- `reserve0`: Reserve of token0 at that snapshot.
-- `reserve1`: Reserve of token1 at that snapshot.
+- `reserve0`: Reserve of token0 at that snapshot for reserve-based pool models. CLMM snapshots can leave this `NULL`.
+- `reserve1`: Reserve of token1 at that snapshot for reserve-based pool models. CLMM snapshots can leave this `NULL`.
 - `liquidity`: Liquidity value captured in the snapshot.
 - `sqrt_ratio`: Sqrt price ratio captured in the snapshot.
 - `price_token1_per_token0`: Price of token1 in token0 terms at that moment.
 - `price_token0_per_token1`: Inverse price at that moment.
 - `price_is_decimals_normalized`: Flag showing whether decimals were confirmed.
-- `tvl_usd`: TVL estimate in USD for that snapshot.
+- `tvl_usd`: TVL estimate in USD for that snapshot. It can stay `NULL` for CLMM snapshots or when prices/decimals are not sufficient for reserve valuation.
 - `snapshot_kind`: Type of pool snapshot stored in this row.
 - `metadata`: Extra snapshot details.
 - `created_at`: Time when this row was inserted.
@@ -387,14 +387,14 @@ This is the append-only history table for pool state changes.
 - `transaction_hash`: Transaction that produced the state change.
 - `transaction_index`: Transaction position inside the block.
 - `source_event_index`: Source event index for the state change.
-- `reserve0`: Reserve0 recorded in this snapshot.
-- `reserve1`: Reserve1 recorded in this snapshot.
-- `liquidity`: Liquidity recorded in this snapshot.
+- `reserve0`: Reserve0 recorded in this snapshot for reserve-based pool models. CLMM swap snapshots intentionally leave this `NULL`.
+- `reserve1`: Reserve1 recorded in this snapshot for reserve-based pool models. CLMM swap snapshots intentionally leave this `NULL`.
+- `liquidity`: Liquidity recorded in this snapshot. This is the main CLMM state value for Ekubo rows.
 - `sqrt_ratio`: Sqrt ratio recorded in this snapshot.
 - `price_token1_per_token0`: Price at this snapshot.
 - `price_token0_per_token1`: Inverse price at this snapshot.
 - `price_is_decimals_normalized`: Flag showing whether confirmed decimals were used.
-- `tvl_usd`: TVL estimate in USD at this snapshot.
+- `tvl_usd`: TVL estimate in USD at this snapshot. It can stay `NULL` for CLMM swap snapshots or when prices/decimals are not sufficient for reserve valuation.
 - `snapshot_kind`: Type of snapshot event that produced this row.
 - `metadata`: Extra details for this state change.
 - `created_at`: Time when this row was inserted.
@@ -1076,3 +1076,4 @@ Operational rule:
 
 - AVNU and Fibrous must not be inserted into `stark_pool_registry` as pools
 - they remain router / aggregator entities only
+- `factory_address` and `stable_flag` are nullable by design. They apply to factory/pair style pools; singleton CLMM pools such as Ekubo do not have a per-pool factory address or stable/volatile flag.

@@ -754,6 +754,12 @@ Important columns:
 
 This table exists so we do not lose intermediate states.
 
+Pool model note:
+
+- `reserve0` and `reserve1` are populated by reserve-based snapshots, for example XYK `Sync` events.
+- Ekubo rows are CLMM swap snapshots, so their state is carried by `liquidity`, `sqrt_ratio`, `tick_after`, `tick_spacing`, `fee_tier`, and signed deltas.
+- `tvl_usd` needs reserve-style balances plus usable token USD prices. It can stay `NULL` for Ekubo CLMM swap snapshots.
+
 ### 9.3 `stark_pool_latest`
 
 This is the fast latest-state table for pools.

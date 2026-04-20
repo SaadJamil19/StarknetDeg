@@ -92,6 +92,8 @@ Columns:
 - `created_at`
 - `updated_at`
 
+The same state-diff length is also written into `stark_block_journal.state_diff_length`. Existing rows were backfilled from this table so both places agree.
+
 Why this table matters:
 
 - `stark_block_journal` already had the raw state update, but that was bundled into a broader block record.
@@ -178,6 +180,13 @@ Phase 4 also extended the existing registry table with:
 Why?
 
 Because once a verified DEX contract changes class hash, we need to store the refreshed ABI evidence somewhere that the system can audit later.
+
+Important nullable fields:
+
+- Static seed rows now use `valid_from_block = 0`, meaning the row is valid for the full indexed history unless a later replacement closes it.
+- `valid_to_block = NULL` means the active row has no known end block.
+- `abi_json` and `abi_refreshed_at_block` stay `NULL` until the ABI refresh worker sees a known contract deployment or class replacement and fetches ABI evidence.
+- `abi_version` can stay `NULL` for selector-based static rows where routing does not depend on a cached ABI version tag.
 
 ### 3.5 `stark_trades` And `stark_ohlcv_1m` Refinement
 

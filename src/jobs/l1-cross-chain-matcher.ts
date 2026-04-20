@@ -395,7 +395,8 @@ async function findBridgeInMatchByAmountAndTime(client, event, lane) {
         AND activity.token_address = $2
         AND activity.amount = $3
         AND activity.l2_wallet_address = $4
-        AND journal.block_timestamp BETWEEN $5 AND ($5 + INTERVAL '30 minutes')
+        AND to_timestamp(journal.block_timestamp::double precision)
+            BETWEEN $5::timestamptz AND ($5::timestamptz + INTERVAL '30 minutes')
       ORDER BY journal.block_timestamp ASC, activity.block_number ASC
       LIMIT 1
       FOR UPDATE OF activity`,
@@ -692,7 +693,7 @@ async function matchSingleWithdrawal(client, event, { lane }) {
       WHERE message.lane = $1
         AND message.message_status = 'SENT'
         AND message.from_address = $2
-        AND journal.block_timestamp < $3
+        AND to_timestamp(journal.block_timestamp::double precision) < $3::timestamptz
       ORDER BY journal.block_timestamp DESC, message.message_index DESC
       LIMIT 1
       FOR UPDATE OF message`,

@@ -398,7 +398,7 @@ async function syncRegistryToDatabase(client) {
            created_at,
            updated_at
        ) VALUES (
-           $1, $2, $3, $4, $5, $6, NULL, NULL, $7::jsonb, TRUE, NOW(), NOW()
+           $1, $2, $3, $4, $5, $6, $7, NULL, $8::jsonb, TRUE, NOW(), NOW()
        )
        ON CONFLICT (contract_address, class_hash)
        DO UPDATE SET
@@ -406,6 +406,7 @@ async function syncRegistryToDatabase(client) {
            role = EXCLUDED.role,
            decoder = EXCLUDED.decoder,
            abi_version = EXCLUDED.abi_version,
+           valid_from_block = COALESCE(stark_contract_registry.valid_from_block, EXCLUDED.valid_from_block),
            metadata = EXCLUDED.metadata,
            is_active = TRUE,
            updated_at = NOW()`,
@@ -416,6 +417,7 @@ async function syncRegistryToDatabase(client) {
         entry.role,
         entry.decoder,
         entry.abiVersion,
+        '0',
         JSON.stringify({
           ...(entry.metadata ?? {}),
           display_name: entry.displayName ?? null,
