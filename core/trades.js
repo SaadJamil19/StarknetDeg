@@ -140,6 +140,85 @@ async function persistTradesForBlock(client, { blockHash, blockNumber, blockTime
   };
 }
 
+async function refreshTradesForTransactions(client, {
+  blockHash,
+  blockNumber,
+  lane,
+  metadataPatch = {},
+  transactionHashes,
+}) {
+  const targetTransactionHashes = Array.from(new Set((transactionHashes ?? []).filter(Boolean)));
+  if (targetTransactionHashes.length === 0) {
+    return {
+      refreshedTrades: 0,
+      summary: {
+        trades: 0,
+      },
+    };
+  }
+
+  await client.query(
+    `DELETE FROM stark_trades
+      WHERE lane = $1
+        AND block_number = $2
+        AND transaction_hash = ANY($3::text[])`,
+    [lane, toNumericString(blockNumber, 'trade refresh block number'), targetTransactionHashes],
+  );
+
+  const journalResult = await client.query(
+    `SELECT block_timestamp
+       FROM stark_block_journal
+      WHERE lane = $1
+        AND block_number = $2
+        AND block_hash = $3
+        AND is_orphaned = FALSE
+      LIMIT 1`,
+    [lane, toNumericString(blockNumber, 'trade refresh block number'), blockHash],
+  );
+
+  if (journalResult.rowCount === 0) {
+    throw new Error(`Missing block journal row for trade refresh ${lane}/${blockNumber.toString(10)}.`);
+  }
+
+  const refreshResult = await persistTradesForBlock(client, {
+    blockHash,
+    blockNumber,
+    blockTimestamp: journalResult.rows[0].block_timestamp,
+    lane,
+  });
+
+  if (Object.keys(metadataPatch).length > 0) {
+    await client.query(
+      `UPDATE stark_trades
+          SET metadata = COALESCE(metadata, '{}'::jsonb) || $4::jsonb,
+              updated_at = NOW()
+        WHERE lane = $1
+          AND block_number = $2
+          AND transaction_hash = ANY($3::text[])`,
+      [
+        lane,
+        toNumericString(blockNumber, 'trade refresh block number'),
+        targetTransactionHashes,
+        toJsonbString(metadataPatch),
+      ],
+    );
+  }
+
+  const countResult = await client.query(
+    `SELECT COUNT(*) AS refreshed_count
+       FROM stark_trades
+      WHERE lane = $1
+        AND block_number = $2
+        AND transaction_hash = ANY($3::text[])`,
+    [lane, toNumericString(blockNumber, 'trade refresh block number'), targetTransactionHashes],
+  );
+
+  return {
+    refreshedTrades: Number.parseInt(String(countResult.rows[0]?.refreshed_count ?? 0), 10),
+    summary: refreshResult.summary,
+  };
+}
+
 function collectTradeTokenAddresses(actions) {
   const set = new Set();
 
@@ -1522,5 +1601,6 @@ function emptyTradeResult() {
 
 module.exports = {
   persistTradesForBlock,
+  refreshTradesForTransactions,
   repricePendingEnrichmentTrades,
 };

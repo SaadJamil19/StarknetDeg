@@ -6,6 +6,7 @@ require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 
 const { setTimeout: sleep } = require('node:timers/promises');
 const {
+  assertAbsoluteFinalityColumns,
   assertFinancialResilienceColumns,
   assertFoundationTables,
   assertFullNodePlan2Tables,
@@ -18,6 +19,7 @@ const {
 const { decodeBlockFromRaw } = require('../core/event-router');
 const { FINALITY_LANES } = require('../core/finality');
 const { toJsonbString } = require('../core/protocols/shared');
+const { refreshTradesForTransactions } = require('../core/trades');
 const { toBigIntStrict, toNumericString } = require('../lib/cairo/bigint');
 const {
   DEFAULT_SCALE,
@@ -59,6 +61,7 @@ async function main() {
   installSignalHandlers();
 
   await withClient(async (client) => {
+    await assertAbsoluteFinalityColumns(client);
     await assertFinancialResilienceColumns(client);
     await assertFoundationTables(client);
     await assertFullNodePlan2Tables(client);
@@ -97,6 +100,7 @@ async function refreshConcentrationRollups({
   requireL1 = parseBoolean(process.env.PHASE6_REQUIRE_L1, false),
 } = {}) {
   return withTransaction(async (client) => {
+    await assertAbsoluteFinalityColumns(client);
     await assertFinancialResilienceColumns(client);
     await assertFoundationTables(client);
     await assertFullNodePlan2Tables(client);
@@ -534,6 +538,15 @@ async function attemptUpgradeAwareRedecode(client, {
   const savepointName = buildRedecodeSavepointName(auditId);
 
   try {
+    await setAuditDiscrepancyStatus(client, {
+      auditId,
+      metadataPatch: {
+        redecode_pending: true,
+        redecode_retry_count: retryCount,
+        redecode_trigger: 'replaced_classes',
+      },
+      resolutionStatus: 'PENDING_REDECODE',
+    });
     await client.query(`SAVEPOINT ${savepointName}`);
     await clearDerivedRowsForRedecode(client, {
       blockNumber: transfer.blockNumber,
@@ -550,18 +563,31 @@ async function attemptUpgradeAwareRedecode(client, {
       lane,
       rpcClient,
     });
+    const tradeRefreshResult = await refreshTradesForTransactions(client, {
+      blockHash: transfer.blockHash,
+      blockNumber: transfer.blockNumber,
+      lane,
+      metadataPatch: {
+        transfer_lineage_redecoded: true,
+        transfer_lineage_refresh_tx_hash: transfer.transactionHash,
+      },
+      transactionHashes: [transfer.transactionHash],
+    });
 
     await client.query(`RELEASE SAVEPOINT ${savepointName}`);
-    await appendAuditDiscrepancyMetadata(client, {
+    await setAuditDiscrepancyStatus(client, {
       auditId,
       metadataPatch: {
         redecode_attempted: true,
+        redecode_pending: false,
         redecode_retry_count: retryCount,
         redecode_scope: 'block',
         redecode_summary: decodeSummary,
         redecode_trigger: 'replaced_classes',
         replaced_classes: forensic.replacedClasses,
+        trade_refresh_summary: tradeRefreshResult,
       },
+      resolutionStatus: 'logged',
     });
     return {
       fatalManualReview: false,
@@ -576,6 +602,7 @@ async function attemptUpgradeAwareRedecode(client, {
       metadataPatch: {
         redecode_attempted: true,
         redecode_error: formatError(error),
+        redecode_pending: false,
         redecode_retry_count: retryCount,
         redecode_scope: 'block',
         redecode_trigger: 'replaced_classes',
@@ -886,6 +913,25 @@ async function appendAuditDiscrepancyMetadata(client, { auditId, metadataPatch =
       WHERE audit_id = $1`,
     [
       String(auditId),
+      toJsonbString(metadataPatch),
+    ],
+  );
+}
+
+async function setAuditDiscrepancyStatus(client, {
+  auditId,
+  metadataPatch = {},
+  resolutionStatus,
+}) {
+  await client.query(
+    `UPDATE stark_audit_discrepancies
+        SET resolution_status = $2,
+            metadata = COALESCE(metadata, '{}'::jsonb) || $3::jsonb,
+            updated_at = NOW()
+      WHERE audit_id = $1`,
+    [
+      String(auditId),
+      resolutionStatus,
       toJsonbString(metadataPatch),
     ],
   );

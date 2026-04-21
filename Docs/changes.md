@@ -718,3 +718,51 @@ This file lists the report-driven schema enhancement and bug-fix changes in simp
   - three-strike re-decode guardrails
   - post-turbo `VACUUM ANALYZE`
   - persistent retry counting and `FATAL_MANUAL_REVIEW`
+
+## Changes 12: Integrity & Maintenance
+
+- Added token-lineage carry-forward in `jobs/wallet-rollups.js`.
+  - wallet replay now has a built-in `TOKEN_LINEAGE_MAP`
+  - known migration hops such as legacy `DAI v0 -> DAI` carry source-token cost basis into the destination token instead of realizing synthetic migration PnL
+  - gas on the migration transaction is capitalized into the destination token basis so lifetime wallet PnL stays continuous across protocol token upgrades
+- Added cross-table re-decode consistency.
+  - when `jobs/concentration-rollups.js` re-decodes a block because transfer lineage changed, it now also refreshes `stark_trades` for the affected transaction hash
+  - refreshed trade rows are metadata-flagged as transfer-lineage redecoded so wallet PnL and holder replay stay on the same corrected truth
+- Added non-blocking turbo maintenance in `core/block-processor.js`.
+  - post-rebuild maintenance now starts on a separate lower-impact connection
+  - when PostgreSQL supports it, maintenance uses `VACUUM (ANALYZE, PARALLEL 4)`
+  - if maintenance runs beyond 10 minutes, live-mode block processing resumes while maintenance continues in the background
+- Added FIFO proof storage with `sql/0017_integrity_and_maintenance.sql`.
+  - creates `stark_pnl_audit_trail`
+  - every relieved FIFO lot now records buy trade / sell trade linkage, relieved quantity, relieved cost basis, relieved proceeds, and realized PnL
+- Updated `core/checkpoint.js` assertions and Phase 6 docs for:
+  - token lineage continuity
+  - trade refresh after transfer re-decode
+  - non-blocking planner maintenance
+  - the new `stark_pnl_audit_trail` proof table
+
+## Changes 13: Absolute Finality
+
+- Upgraded token lineage in `jobs/wallet-rollups.js` from single-hop to recursive ancestry.
+  - direct migration hops still carry source cost basis into the destination token without realizing synthetic PnL
+  - lineage metadata now tracks the root token address, full migration path, and whether ancestry is ambiguous because multiple legacy sources converge into the same token
+  - this keeps lifetime cost basis continuous across future multi-hop token upgrade chains, not just `DAI v0 -> DAI`
+- Added strict wallet-rollup fencing for unresolved re-decodes.
+  - `jobs/concentration-rollups.js` now marks upgrade-aware repairs as `PENDING_REDECODE` before block-scoped re-decode starts
+  - `jobs/wallet-rollups.js` now clamps replay before the earliest `PENDING_REDECODE` block, so wallet PnL never finalizes across dirty transfer lineage
+  - successful re-decodes clear the pending state back to `logged`; failed paths still resolve into decoder review, RPC repair, clamp-zero, or fatal manual review
+- Hardened turbo maintenance in `core/block-processor.js` with WAL-aware throttling.
+  - background maintenance still uses `VACUUM (ANALYZE, PARALLEL 4)` when PostgreSQL supports it
+  - after each vacuum pass, the worker measures `pg_current_wal_lsn()` growth
+  - if WAL growth exceeds `INDEXER_TURBO_WAL_GROWTH_BYTES`, the maintenance connection sleeps for 60 seconds before continuing
+  - live-mode startup can still proceed after 10 minutes while maintenance continues on the lower-impact connection
+- Extended `sql/0018_absolute_finality.sql`.
+  - adds `stark_pnl_audit_trail.lot_id`
+  - adds a uniqueness guard on `(sell_tx_hash, buy_tx_hash, lot_id)`
+  - extends `stark_audit_discrepancies.resolution_status` to include `PENDING_REDECODE`
+  - adds a partial index for pending re-decode block lookups
+- Updated `Docs/phase6_analytics.md` and `Docs/db.md` to document:
+  - recursive token lineage
+  - wallet replay fencing on pending re-decodes
+  - WAL-throttled background vacuum
+  - restart-safe FIFO proof rows

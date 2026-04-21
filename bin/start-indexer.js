@@ -94,7 +94,7 @@ async function main() {
 
       if (turboIndexSummary.changed) {
         console.log(
-          `[phase4] turbo index manager action=${turboIndexSummary.action} historical=${turboIndexSummary.historicalMode} indexes=${turboIndexSummary.indexCount}`,
+          `[phase4] turbo index manager action=${turboIndexSummary.action} historical=${turboIndexSummary.historicalMode} indexes=${turboIndexSummary.indexCount} vacuum_analyzed=${Boolean(turboIndexSummary.vacuumAnalyzed)} maintenance_deferred=${Boolean(turboIndexSummary.maintenanceDeferred)} wal_throttle_count=${turboIndexSummary.walThrottleCount ?? 0}`,
         );
       }
 
@@ -156,7 +156,7 @@ async function main() {
   const restoreSummary = await reconcileTurboBackfillIndexes({ forceRestore: true, turboMode: false });
   if (restoreSummary.changed) {
     console.log(
-      `[phase4] turbo index manager action=${restoreSummary.action} historical=${restoreSummary.historicalMode} indexes=${restoreSummary.indexCount}`,
+      `[phase4] turbo index manager action=${restoreSummary.action} historical=${restoreSummary.historicalMode} indexes=${restoreSummary.indexCount} vacuum_analyzed=${Boolean(restoreSummary.vacuumAnalyzed)} maintenance_deferred=${Boolean(restoreSummary.maintenanceDeferred)} wal_throttle_count=${restoreSummary.walThrottleCount ?? 0}`,
     );
   }
 

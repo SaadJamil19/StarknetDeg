@@ -52,6 +52,12 @@ const FINANCIAL_RESILIENCE_COLUMNS = Object.freeze([
 const PROTOCOL_ACCURACY_COLUMNS = Object.freeze([
   { table: 'stark_audit_discrepancies', column: 'retry_count' },
 ]);
+const INTEGRITY_MAINTENANCE_TABLES = Object.freeze([
+  'stark_pnl_audit_trail',
+]);
+const ABSOLUTE_FINALITY_COLUMNS = Object.freeze([
+  { table: 'stark_pnl_audit_trail', column: 'lot_id' },
+]);
 const SCHEMA_ENHANCEMENT_TABLES = Object.freeze([
   'tokens',
 ]);
@@ -142,6 +148,14 @@ async function assertFinancialResilienceColumns(client) {
 
 async function assertProtocolAccuracyColumns(client) {
   await assertColumnsExist(client, PROTOCOL_ACCURACY_COLUMNS, 'Protocol accuracy', 'sql/0016_protocol_accuracy.sql');
+}
+
+async function assertIntegrityMaintenanceTables(client) {
+  await assertTablesExist(client, INTEGRITY_MAINTENANCE_TABLES, 'Integrity maintenance', 'sql/0017_integrity_and_maintenance.sql');
+}
+
+async function assertAbsoluteFinalityColumns(client) {
+  await assertColumnsExist(client, ABSOLUTE_FINALITY_COLUMNS, 'Absolute finality', 'sql/0018_absolute_finality.sql');
 }
 
 async function assertSchemaEnhancementTables(client) {
@@ -475,6 +489,8 @@ module.exports = {
   assertL1Tables,
   assertFullNodePlan2Tables,
   assertFinancialResilienceColumns,
+  assertAbsoluteFinalityColumns,
+  assertIntegrityMaintenanceTables,
   assertProtocolAccuracyColumns,
   assertSchemaEnhancementTables,
   assertSchemaEnhancementViews,

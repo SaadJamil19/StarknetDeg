@@ -6,15 +6,18 @@ require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 
 const { setTimeout: sleep } = require('node:timers/promises');
 const {
+  assertAbsoluteFinalityColumns,
   assertFinancialResilienceColumns,
   assertFoundationTables,
   assertFullNodePlan2Tables,
+  assertIntegrityMaintenanceTables,
   assertPhase2Tables,
   assertPhase3Tables,
   assertPhase4Tables,
   assertPhase6Tables,
   assertL1Tables,
 } = require('../core/checkpoint');
+const { listStaticCoreTokens } = require('../core/constants/tokens');
 const { FINALITY_LANES } = require('../core/finality');
 const { knownErc20Cache } = require('../core/known-erc20-cache');
 const { toJsonbString } = require('../core/protocols/shared');
@@ -48,6 +51,81 @@ const FIFO_DUST_THRESHOLD_SCALED = decimalStringToScaled(process.env.PHASE6_FIFO
 const GAS_PRICE_FALLBACK_WINDOW_SECONDS = parsePositiveInteger(process.env.PHASE6_GAS_PRICE_FALLBACK_WINDOW_SECONDS, 3600);
 const FIXED_GAS_ANCHOR_ETH_USD_SCALED = parseOptionalUsdScaled(process.env.PHASE6_FIXED_GAS_ANCHOR_ETH_USD);
 const FIXED_GAS_ANCHOR_STRK_USD_SCALED = parseOptionalUsdScaled(process.env.PHASE6_FIXED_GAS_ANCHOR_STRK_USD);
+const TOKEN_LINEAGE_MAP = buildTokenLineageMap();
+
+function buildTokenLineageMap() {
+  const byKey = new Map(listStaticCoreTokens().map((token) => [token.key, token]));
+  const legacyDai = byKey.get('DAI_V0');
+  const canonicalDai = byKey.get('DAI');
+  const edges = [];
+  const directEdgeBySource = new Map();
+  const parentEdgesByDestination = new Map();
+
+  if (legacyDai?.address && canonicalDai?.address) {
+    edges.push({
+      canonicalAddress: canonicalDai.address,
+      destinationAddress: canonicalDai.address,
+      lineageKey: 'DAI',
+      migrationType: 'starkgate_token_upgrade',
+      sourceAddress: legacyDai.address,
+      windowEnd: null,
+      windowStart: null,
+    });
+  }
+
+  for (const edge of edges) {
+    if (directEdgeBySource.has(edge.sourceAddress)) {
+      throw new Error(`Duplicate token lineage source edge detected for ${edge.sourceAddress}.`);
+    }
+    directEdgeBySource.set(edge.sourceAddress, edge);
+    if (!parentEdgesByDestination.has(edge.destinationAddress)) {
+      parentEdgesByDestination.set(edge.destinationAddress, []);
+    }
+    parentEdgesByDestination.get(edge.destinationAddress).push(edge);
+  }
+
+  const resolved = new Map();
+  const resolveAncestry = (tokenAddress, chain = []) => {
+    if (resolved.has(tokenAddress)) {
+      return resolved.get(tokenAddress);
+    }
+    if (chain.includes(tokenAddress)) {
+      throw new Error(`Token lineage cycle detected: ${[...chain, tokenAddress].join(' -> ')}`);
+    }
+
+    const directEdge = directEdgeBySource.get(tokenAddress);
+    if (!directEdge) {
+      return null;
+    }
+
+    const parentEdges = parentEdgesByDestination.get(tokenAddress) ?? [];
+    const parentEdge = parentEdges.length === 1 ? parentEdges[0] : null;
+    const parentResolution = parentEdge === null
+      ? null
+      : resolveAncestry(parentEdge.sourceAddress, [...chain, tokenAddress]);
+    const ancestorAddresses = parentResolution === null
+      ? [tokenAddress]
+      : [...parentResolution.ancestorAddresses, tokenAddress];
+    const fullPath = [...ancestorAddresses, directEdge.destinationAddress];
+    const resolution = {
+      ...directEdge,
+      ambiguousAncestry: parentEdges.length > 1,
+      ancestorAddresses,
+      depth: fullPath.length - 1,
+      fullPath,
+      rootAddress: ancestorAddresses[0],
+    };
+
+    resolved.set(tokenAddress, resolution);
+    return resolution;
+  };
+
+  for (const edge of edges) {
+    resolveAncestry(edge.sourceAddress);
+  }
+
+  return resolved;
+}
 
 async function main() {
   const runOnce = parseBoolean(process.env.PHASE6_WALLET_ROLLUPS_RUN_ONCE, true);
@@ -58,9 +136,11 @@ async function main() {
   installSignalHandlers();
 
   await withClient(async (client) => {
+    await assertAbsoluteFinalityColumns(client);
     await assertFinancialResilienceColumns(client);
     await assertFoundationTables(client);
     await assertFullNodePlan2Tables(client);
+    await assertIntegrityMaintenanceTables(client);
     await assertPhase2Tables(client);
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
@@ -76,7 +156,7 @@ async function main() {
         const summary = await refreshWalletRollups();
         initialFullRefreshDone = true;
         console.log(
-          `[phase6] wallet-rollups mode=full lane=${summary.lane} max_block=${summary.maxBlockNumber} wallets=${summary.wallets} positions=${summary.positions} pnl_events=${summary.pnlEvents} wallet_transfers=${summary.walletTransfers} priced_trades=${summary.pricedTrades} skipped_trades=${summary.skippedTrades}`,
+          `[phase6] wallet-rollups mode=full lane=${summary.lane} max_block=${summary.maxBlockNumber} pending_redecode_block=${summary.blockedByPendingRedecodeBlock ?? 'none'} wallets=${summary.wallets} positions=${summary.positions} pnl_events=${summary.pnlEvents} wallet_transfers=${summary.walletTransfers} priced_trades=${summary.pricedTrades} skipped_trades=${summary.skippedTrades}`,
         );
       } else {
         const summary = await repairPendingWalletPricing();
@@ -104,9 +184,11 @@ async function refreshWalletRollups({
   requireL1 = parseBoolean(process.env.PHASE6_REQUIRE_L1, false),
 } = {}) {
   return withTransaction(async (client) => {
+    await assertAbsoluteFinalityColumns(client);
     await assertFinancialResilienceColumns(client);
     await assertFoundationTables(client);
     await assertFullNodePlan2Tables(client);
+    await assertIntegrityMaintenanceTables(client);
     await assertPhase2Tables(client);
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
@@ -114,13 +196,22 @@ async function refreshWalletRollups({
     await assertL1Tables(client);
 
     const window = await resolveAnalyticsWindow(client, { indexerKey, lane, requireL1 });
+    const pendingRedecodeBlock = window.maxBlockNumber === null
+      ? null
+      : await findEarliestPendingRedecodeBlock(client, {
+        lane: window.lane,
+        maxBlockNumber: window.maxBlockNumber,
+      });
+    const effectiveMaxBlockNumber = clampAnalyticsBlockBeforePendingRedecode(window.maxBlockNumber, pendingRedecodeBlock);
 
     await client.query(`DELETE FROM stark_wallet_pnl_events WHERE lane = $1`, [window.lane]);
     await client.query(`DELETE FROM stark_wallet_positions WHERE lane = $1`, [window.lane]);
     await client.query(`DELETE FROM stark_wallet_stats WHERE lane = $1`, [window.lane]);
+    await client.query(`DELETE FROM stark_pnl_audit_trail WHERE lane = $1`, [window.lane]);
 
-    if (window.maxBlockNumber === null) {
+    if (effectiveMaxBlockNumber === null) {
       return {
+        blockedByPendingRedecodeBlock: pendingRedecodeBlock === null ? null : pendingRedecodeBlock.toString(10),
         lane: window.lane,
         maxBlockNumber: 'none',
         pnlEvents: 0,
@@ -132,9 +223,9 @@ async function refreshWalletRollups({
       };
     }
 
-    const trades = await loadTrades(client, { lane: window.lane, maxBlockNumber: window.maxBlockNumber });
-    const bridges = await loadBridgeActivities(client, { lane: window.lane, maxBlockNumber: window.maxBlockNumber });
-    const transfers = await loadWalletTransfers(client, { lane: window.lane, maxBlockNumber: window.maxBlockNumber });
+    const trades = await loadTrades(client, { lane: window.lane, maxBlockNumber: effectiveMaxBlockNumber });
+    const bridges = await loadBridgeActivities(client, { lane: window.lane, maxBlockNumber: effectiveMaxBlockNumber });
+    const transfers = await loadWalletTransfers(client, { lane: window.lane, maxBlockNumber: effectiveMaxBlockNumber });
     const tokenContext = await loadTokenMarketContext(client, {
       lane: window.lane,
       tokenAddresses: collectTokenAddresses(trades, bridges, transfers),
@@ -152,6 +243,7 @@ async function refreshWalletRollups({
     const positions = new Map();
     const walletStats = new Map();
     const pnlEvents = [];
+    const pnlAuditTrail = [];
     let pricedTrades = 0;
     let skippedTrades = 0;
     let walletTransfers = 0;
@@ -188,6 +280,7 @@ async function refreshWalletRollups({
       const accepted = processTrade({
         lane: window.lane,
         pnlEvents,
+        pnlAuditTrail,
         positions,
         tokenContext,
         trade: item,
@@ -216,6 +309,10 @@ async function refreshWalletRollups({
       await insertWalletPnlEvent(client, pnlEvent);
     }
 
+    for (const auditTrailRow of pnlAuditTrail) {
+      await insertPnlAuditTrailRow(client, auditTrailRow);
+    }
+
     const walletRows = Array.from(walletStats.values()).map((stats) => ({
       lane: window.lane,
       ...finalizeWalletStats(stats),
@@ -232,7 +329,8 @@ async function refreshWalletRollups({
 
     return {
       lane: window.lane,
-      maxBlockNumber: window.maxBlockNumber.toString(10),
+      blockedByPendingRedecodeBlock: pendingRedecodeBlock === null ? null : pendingRedecodeBlock.toString(10),
+      maxBlockNumber: effectiveMaxBlockNumber.toString(10),
       pnlEvents: pnlEvents.length,
       positions: positionRows.length,
       pricedTrades,
@@ -249,6 +347,7 @@ async function repairPendingWalletPricing({
   requireL1 = parseBoolean(process.env.PHASE6_REQUIRE_L1, false),
 } = {}) {
   return withClient(async (client) => {
+    await assertAbsoluteFinalityColumns(client);
     await assertFinancialResilienceColumns(client);
     await assertFoundationTables(client);
     await assertFullNodePlan2Tables(client);
@@ -984,7 +1083,7 @@ function processTransferActivity({ positions, tokenContext, transfer, walletStat
   }
 }
 
-function processTrade({ lane, pnlEvents, positions, tokenContext, trade, walletStats }) {
+function processTrade({ lane, pnlAuditTrail, pnlEvents, positions, tokenContext, trade, walletStats }) {
   if (!trade.traderAddress || trade.tokenInAddress === trade.tokenOutAddress) {
     return false;
   }
@@ -1032,10 +1131,95 @@ function processTrade({ lane, pnlEvents, positions, tokenContext, trade, walletS
     stats.metadata.pending_gas_fee_trades += 1;
   }
 
+  const lineageMigration = resolveTokenLineageMigration(trade);
+  if (lineageMigration) {
+    sellPosition.metadata.lineage_migration_out_count = (sellPosition.metadata.lineage_migration_out_count ?? 0) + 1;
+    buyPosition.metadata.lineage_migration_in_count = (buyPosition.metadata.lineage_migration_in_count ?? 0) + 1;
+    stats.metadata.lineage_migration_count = (stats.metadata.lineage_migration_count ?? 0) + 1;
+
+    const carriedInventory = consumeInventoryWithoutPnl(sellPosition, trade.amountIn, stats);
+    const carriedCostBasisUsdScaled = carriedInventory.costBasisUsdScaled;
+    const migratedCostBasisUsdScaled = carriedCostBasisUsdScaled + gasFeeUsdScaled;
+
+    if (carriedInventory.inventoryGap > 0n) {
+      sellPosition.pendingPricing = true;
+      buyPosition.pendingPricing = true;
+      sellPosition.metadata.inventory_gap_qty += Number(carriedInventory.inventoryGap);
+      stats.metadata.inventory_gap_qty += Number(carriedInventory.inventoryGap);
+    }
+
+    addTradeLot(buyPosition, {
+      blockNumber: trade.blockNumber,
+      costBasisUsdScaled: migratedCostBasisUsdScaled,
+      lineagePath: lineageMigration.fullPath,
+      lineageRootAddress: lineageMigration.rootAddress,
+      lotId: `${trade.tradeKey}:migration`,
+      quantity: trade.amountOut,
+      tradeKey: trade.tradeKey,
+      transactionHash: trade.transactionHash,
+    });
+
+    pnlEvents.push(buildPnlEvent({
+      blockHash: trade.blockHash,
+      blockNumber: trade.blockNumber,
+      blockTimestamp: trade.blockTimestamp,
+      costBasisUsdScaled: migratedCostBasisUsdScaled,
+      externalQuantity: 0n,
+      gasFeeAmount: hasGasFee ? trade.actualFeeAmount : null,
+      gasFeeTokenAddress: trade.gasFeeTokenAddress,
+      gasFeeUsdScaled: hasGasFee ? gasFeeUsdScaled : null,
+      lane,
+      metadata: {
+        fee_data_availability_mode: trade.feeDataAvailabilityMode ?? null,
+        gas_fee_token_reason: trade.gasFeeTokenReason ?? null,
+        gas_fee_token_symbol: trade.gasFeeTokenSymbol ?? null,
+        gas_fee_unit: trade.actualFeeUnit ?? null,
+        lineage_ambiguous_ancestry: Boolean(lineageMigration.ambiguousAncestry),
+        lineage_carryover: true,
+        lineage_depth: lineageMigration.depth,
+        lineage_key: lineageMigration.lineageKey,
+        lineage_migration_type: lineageMigration.migrationType,
+        lineage_path: lineageMigration.fullPath,
+        lineage_root_address: lineageMigration.rootAddress,
+        migrated_from_token: trade.tokenInAddress,
+        trade_side: 'migration_in',
+        tx_version: trade.txVersion === null ? null : trade.txVersion.toString(10),
+      },
+      pnlEventKey: `${trade.tradeKey}:${trade.tokenOutAddress}:migration_in`,
+      positionAmountAfter: buyPosition.tradedQuantity + buyPosition.externalQuantity,
+      proceedsUsdScaled: null,
+      quantity: trade.amountOut,
+      realizedPnlUsdScaled: null,
+      remainingCostBasisUsdScaled: buyPosition.tradedCostBasisUsdScaled,
+      side: 'buy',
+      sourceEventIndex: trade.sourceEventIndex,
+      tokenAddress: trade.tokenOutAddress,
+      tradeKey: trade.tradeKey,
+      tradedQuantity: trade.amountOut,
+      transactionHash: trade.transactionHash,
+      transactionIndex: trade.transactionIndex,
+      walletAddress: trade.traderAddress,
+    }));
+
+    return true;
+  }
+
   const sellResult = consumeTradeSellInventory(sellPosition, {
     amountSold: trade.amountIn,
     proceedsUsdScaled: sellProceedsUsdScaled,
-  }, stats);
+  }, {
+    auditTrail: pnlAuditTrail,
+    sellContext: {
+      lane,
+      sellBlockNumber: trade.blockNumber,
+      sellSourceEventIndex: trade.sourceEventIndex,
+      sellTradeKey: trade.tradeKey,
+      sellTransactionHash: trade.transactionHash,
+      tokenAddress: trade.tokenInAddress,
+      walletAddress: trade.traderAddress,
+    },
+    stats,
+  });
 
   if (sellResult.realizedPnlUsdScaled !== null) {
     sellPosition.realizedPnlUsdScaled += sellResult.realizedPnlUsdScaled;
@@ -1062,8 +1246,12 @@ function processTrade({ lane, pnlEvents, positions, tokenContext, trade, walletS
   addTradeLot(buyPosition, {
     blockNumber: trade.blockNumber,
     costBasisUsdScaled: buyCostBasisUsdScaled,
+    lineagePath: [trade.tokenOutAddress],
+    lineageRootAddress: trade.tokenOutAddress,
+    lotId: trade.tradeKey,
     quantity: trade.amountOut,
     tradeKey: trade.tradeKey,
+    transactionHash: trade.transactionHash,
   });
 
   pnlEvents.push(buildPnlEvent({
@@ -1253,6 +1441,57 @@ function applyTokenInfoToPosition(position, tokenInfo) {
   position.tokenDecimals = tokenInfo.decimals;
 }
 
+function resolveTokenLineageMigration(trade) {
+  const lineageEntry = TOKEN_LINEAGE_MAP.get(trade.tokenInAddress);
+  if (!lineageEntry) {
+    return null;
+  }
+
+  if (String(trade.tokenOutAddress).toLowerCase() !== String(lineageEntry.canonicalAddress).toLowerCase()) {
+    return null;
+  }
+
+  if (lineageEntry.windowStart && trade.blockTimestamp && trade.blockTimestamp < lineageEntry.windowStart) {
+    return null;
+  }
+
+  if (lineageEntry.windowEnd && trade.blockTimestamp && trade.blockTimestamp > lineageEntry.windowEnd) {
+    return null;
+  }
+
+  return lineageEntry;
+}
+
+async function findEarliestPendingRedecodeBlock(client, { lane, maxBlockNumber }) {
+  const result = await client.query(
+    `SELECT MIN(block_number) AS block_number
+       FROM stark_audit_discrepancies
+      WHERE lane = $1
+        AND resolution_status = 'PENDING_REDECODE'
+        AND block_number IS NOT NULL
+        AND block_number <= $2`,
+    [lane, toNumericString(maxBlockNumber, 'wallet pending redecode max block')],
+  );
+
+  return result.rows[0]?.block_number === null
+    ? null
+    : toBigIntStrict(result.rows[0].block_number, 'wallet pending redecode block number');
+}
+
+function clampAnalyticsBlockBeforePendingRedecode(maxBlockNumber, pendingRedecodeBlock) {
+  if (maxBlockNumber === null || maxBlockNumber === undefined) {
+    return null;
+  }
+
+  if (pendingRedecodeBlock === null || pendingRedecodeBlock === undefined) {
+    return maxBlockNumber;
+  }
+
+  return pendingRedecodeBlock <= 0n
+    ? null
+    : minBigInt(maxBlockNumber, pendingRedecodeBlock - 1n);
+}
+
 function ensurePosition(positions, walletAddress, tokenAddress) {
   const key = `${walletAddress}:${tokenAddress}`;
   if (positions.has(key)) {
@@ -1278,6 +1517,8 @@ function ensurePosition(positions, walletAddress, tokenAddress) {
       fifo_dust_closed_lots: 0,
       fifo_dust_closed_qty: '0',
       inventory_gap_qty: 0,
+      lineage_migration_in_count: 0,
+      lineage_migration_out_count: 0,
       pending_gas_fee_trades: 0,
       skipped_unpriced_trades: 0,
     },
@@ -1324,6 +1565,7 @@ function ensureWalletStats(walletStats, walletAddress) {
       fifo_dust_closed_lots: 0,
       fifo_dust_closed_qty: '0',
       inventory_gap_qty: 0,
+      lineage_migration_count: 0,
       pending_gas_fee_trades: 0,
       pending_pricing_positions: 0,
       skipped_unpriced_trades: 0,
@@ -1397,12 +1639,13 @@ function consumeInventoryWithoutPnl(position, amount, stats) {
   };
 }
 
-function consumeTradeSellInventory(position, { amountSold, proceedsUsdScaled }, stats) {
+function consumeTradeSellInventory(position, { amountSold, proceedsUsdScaled }, { auditTrail = null, sellContext = null, stats = null } = {}) {
   let remaining = amountSold;
   let externalQuantitySold = 0n;
   let tradedQuantitySold = 0n;
   let tradedCostBasisRelieved = 0n;
   let realizedPnlUsdScaled = null;
+  let lotMatches = [];
 
   if (position.externalQuantity > 0n) {
     const externalQtyBefore = position.externalQuantity;
@@ -1417,12 +1660,27 @@ function consumeTradeSellInventory(position, { amountSold, proceedsUsdScaled }, 
     const consumed = consumeTradeLots(position, remaining);
     tradedQuantitySold = consumed.quantity;
     tradedCostBasisRelieved = consumed.costBasisUsdScaled;
+    lotMatches = consumed.matches;
     remaining -= tradedQuantitySold;
 
     const proceedsForTraded = amountSold === 0n
       ? 0n
       : (proceedsUsdScaled * tradedQuantitySold) / amountSold;
     realizedPnlUsdScaled = proceedsForTraded - tradedCostBasisRelieved;
+
+    if (auditTrail && sellContext && tradedQuantitySold > 0n) {
+      appendPnlAuditTrailRows(auditTrail, {
+        lane: sellContext.lane,
+        lotMatches,
+        proceedsUsdScaled: proceedsForTraded,
+        sellBlockNumber: sellContext.sellBlockNumber,
+        sellSourceEventIndex: sellContext.sellSourceEventIndex,
+        sellTradeKey: sellContext.sellTradeKey,
+        sellTransactionHash: sellContext.sellTransactionHash,
+        tokenAddress: sellContext.tokenAddress,
+        walletAddress: sellContext.walletAddress,
+      });
+    }
   }
 
   trimDustLots(position, stats);
@@ -1436,7 +1694,16 @@ function consumeTradeSellInventory(position, { amountSold, proceedsUsdScaled }, 
   };
 }
 
-function addTradeLot(position, { blockNumber, costBasisUsdScaled, quantity, tradeKey }) {
+function addTradeLot(position, {
+  blockNumber,
+  costBasisUsdScaled,
+  lineagePath = null,
+  lineageRootAddress = null,
+  lotId = null,
+  quantity,
+  tradeKey,
+  transactionHash,
+}) {
   if (quantity <= 0n) {
     return;
   }
@@ -1446,8 +1713,12 @@ function addTradeLot(position, { blockNumber, costBasisUsdScaled, quantity, trad
   position.tradeLots.push({
     blockNumber,
     costBasisUsdScaled,
+    lineagePath: Array.isArray(lineagePath) && lineagePath.length > 0 ? [...lineagePath] : [position.tokenAddress],
+    lineageRootAddress: lineageRootAddress ?? position.tokenAddress,
+    lotId: lotId ?? tradeKey ?? transactionHash ?? `${position.walletAddress}:${position.tokenAddress}:${position.tradeLots.length}`,
     quantity,
     tradeKey,
+    transactionHash,
   });
 }
 
@@ -1496,6 +1767,7 @@ function consumeTradeLots(position, amount) {
   let remaining = amount;
   let consumedQuantity = 0n;
   let consumedCostBasisUsdScaled = 0n;
+  const matches = [];
 
   while (remaining > 0n && position.tradeLots.length > 0) {
     const lot = position.tradeLots[0];
@@ -1508,6 +1780,18 @@ function consumeTradeLots(position, amount) {
     remaining -= lotConsumed;
     consumedQuantity += lotConsumed;
     consumedCostBasisUsdScaled += lotCostRelieved;
+    if (lotConsumed > 0n) {
+      matches.push({
+        buyBlockNumber: lot.blockNumber,
+        buyLineagePath: Array.isArray(lot.lineagePath) ? [...lot.lineagePath] : null,
+        buyLineageRootAddress: lot.lineageRootAddress ?? null,
+        buyTradeKey: lot.tradeKey ?? null,
+        buyTransactionHash: lot.transactionHash ?? null,
+        costBasisUsdScaled: lotCostRelieved,
+        lotId: lot.lotId ?? lot.tradeKey ?? lot.transactionHash ?? null,
+        quantity: lotConsumed,
+      });
+    }
 
     if (lot.quantity === 0n) {
       position.tradeLots.shift();
@@ -1531,8 +1815,59 @@ function consumeTradeLots(position, amount) {
 
   return {
     costBasisUsdScaled: boundedCostBasis,
+    matches,
     quantity: consumedQuantity,
   };
+}
+
+function appendPnlAuditTrailRows(auditTrail, {
+  lane,
+  lotMatches,
+  proceedsUsdScaled,
+  sellBlockNumber,
+  sellSourceEventIndex,
+  sellTradeKey,
+  sellTransactionHash,
+  tokenAddress,
+  walletAddress,
+}) {
+  const totalMatchedQuantity = lotMatches.reduce((sum, item) => sum + item.quantity, 0n);
+  let remainingProceedsUsdScaled = proceedsUsdScaled;
+  let remainingQuantity = totalMatchedQuantity;
+
+  for (let index = 0; index < lotMatches.length; index += 1) {
+    const match = lotMatches[index];
+    const relievedProceedsUsdScaled = index === (lotMatches.length - 1) || remainingQuantity === 0n
+      ? remainingProceedsUsdScaled
+      : (remainingProceedsUsdScaled * match.quantity) / remainingQuantity;
+    const relievedRealizedPnlUsdScaled = relievedProceedsUsdScaled - match.costBasisUsdScaled;
+
+    auditTrail.push({
+      auditTrailKey: `${sellTradeKey}:${match.buyTradeKey ?? 'unknown'}:${index}`,
+      buyTradeKey: match.buyTradeKey,
+      buyTransactionHash: match.buyTransactionHash,
+      lane,
+      lotId: match.lotId ?? `${sellTradeKey}:${index}`,
+      metadata: {
+        buy_block_number: match.buyBlockNumber === null ? null : match.buyBlockNumber.toString(10),
+        buy_lineage_path: match.buyLineagePath ?? null,
+        buy_lineage_root_address: match.buyLineageRootAddress ?? null,
+      },
+      relievedCostBasisUsdScaled: match.costBasisUsdScaled,
+      relievedProceedsUsdScaled,
+      relievedQuantity: match.quantity,
+      relievedRealizedPnlUsdScaled,
+      sellBlockNumber,
+      sellSourceEventIndex,
+      sellTradeKey,
+      sellTransactionHash,
+      tokenAddress,
+      walletAddress,
+    });
+
+    remainingProceedsUsdScaled -= relievedProceedsUsdScaled;
+    remainingQuantity -= match.quantity;
+  }
 }
 
 function buildPnlEvent(payload) {
@@ -1716,6 +2051,61 @@ async function insertWalletPnlEvent(client, event) {
       toNumericString(event.positionAmountAfter, 'wallet pnl position amount after'),
       scaledOrNullToNumeric(event.remainingCostBasisUsdScaled),
       toJsonbString(event.metadata ?? {}),
+    ],
+  );
+}
+
+async function insertPnlAuditTrailRow(client, row) {
+  await client.query(
+    `INSERT INTO stark_pnl_audit_trail (
+         audit_trail_key,
+         lane,
+         wallet_address,
+         token_address,
+         lot_id,
+         buy_trade_key,
+         buy_tx_hash,
+         sell_trade_key,
+         sell_tx_hash,
+         sell_block_number,
+         sell_source_event_index,
+         relieved_quantity,
+         relieved_cost_basis_usd,
+         relieved_proceeds_usd,
+         relieved_realized_pnl_usd,
+         metadata,
+         created_at,
+         updated_at
+     ) VALUES (
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+         $11, $12, $13, $14, $15, $16::jsonb, NOW(), NOW()
+     )
+     ON CONFLICT (audit_trail_key)
+     DO UPDATE SET
+         lot_id = EXCLUDED.lot_id,
+         relieved_quantity = EXCLUDED.relieved_quantity,
+         relieved_cost_basis_usd = EXCLUDED.relieved_cost_basis_usd,
+         relieved_proceeds_usd = EXCLUDED.relieved_proceeds_usd,
+         relieved_realized_pnl_usd = EXCLUDED.relieved_realized_pnl_usd,
+         metadata = EXCLUDED.metadata,
+         updated_at = NOW()`,
+    [
+      row.auditTrailKey,
+      row.lane,
+      row.walletAddress,
+      row.tokenAddress,
+      row.lotId,
+      row.buyTradeKey ?? null,
+      row.buyTransactionHash ?? null,
+      row.sellTradeKey,
+      row.sellTransactionHash,
+      toNumericString(row.sellBlockNumber, 'pnl audit sell block number'),
+      toNumericString(row.sellSourceEventIndex, 'pnl audit sell source event index'),
+      toNumericString(row.relievedQuantity, 'pnl audit relieved quantity'),
+      scaledOrNullToNumeric(row.relievedCostBasisUsdScaled),
+      scaledOrNullToNumeric(row.relievedProceedsUsdScaled),
+      scaledOrNullToNumeric(row.relievedRealizedPnlUsdScaled),
+      toJsonbString(row.metadata ?? {}),
     ],
   );
 }

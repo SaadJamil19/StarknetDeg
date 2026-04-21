@@ -693,7 +693,37 @@ The wallet rollup does this:
 
 All USD math in this path stays on scaled integer arithmetic. No native JavaScript float is used for `notional_usd`, gas-fee USD, or lot cost basis.
 
-## 6.10 The Self-Healing Repair Loop
+### 6.10 Token Lineage Carry-Forward
+
+Some Starknet tokens have migration history instead of simple one-token continuity.
+
+Current built-in lineage map handles known protocol-level migrations such as legacy `DAI v0 -> DAI`.
+
+Official Starknet docs clearly document the `DAI v0 -> DAI` migration and also note that many tokens still have legacy bridge infrastructure. They do not publish a broad, canonical list of multi-hop L2 token-address migrations, so the built-in map stays conservative and only hard-codes migrations we can defend from the docs and token registry.
+
+When a trade matches a lineage hop:
+
+1. the source token inventory is relieved without realizing PnL
+2. the relieved cost basis is carried into the destination token
+3. gas is added to the carried basis of the destination token
+4. the wallet keeps lifetime continuity instead of booking a synthetic realized exit on the old token
+
+The lineage resolver is now recursive.
+
+That means if the map ever contains:
+
+- `Token A -> Token B`
+- `Token B -> Token C`
+
+then a `B -> C` migration keeps carrying the inherited basis that originally came from `A`.
+
+The resulting lot metadata stores:
+
+- the lineage root address
+- the full lineage path
+- whether ancestry was ambiguous because multiple legacy sources converged into the same token
+
+## 6.11 The Self-Healing Repair Loop
 
 The refined Phase 6 job now has a repair path.
 
@@ -770,13 +800,16 @@ Current flow:
    - `stark_block_state_updates.replaced_classes`
    - `stark_event_raw.resolved_class_hash`
 4. if `stark_block_state_updates.replaced_classes` shows upgrade history, clear the block's transfer-derived rows and re-decode the raw block
-5. each audited block gets a persistent `retry_count`
-6. after `PHASE6_REDECODE_STRIKE_LIMIT` re-decode strikes, the row is marked `FATAL_MANUAL_REVIEW` and replay moves on instead of stalling forever
-7. otherwise restart holder replay from the beginning of the lane transaction
-8. if the same gap still exists after the allowed strikes, then use proxy policy:
+5. if that re-decode changes transfer lineage, re-run trade derivation for the same transaction hash so `stark_trades` stays aligned with corrected transfer truth
+6. while a block is actively waiting on re-decode, the audit row moves to `PENDING_REDECODE`
+7. wallet rollups fence their replay window before the earliest `PENDING_REDECODE` block so PnL is never finalized across dirty transfer lineage
+8. each audited block gets a persistent `retry_count`
+9. after `PHASE6_REDECODE_STRIKE_LIMIT` re-decode strikes, the row is marked `FATAL_MANUAL_REVIEW` and replay moves on instead of stalling forever
+10. otherwise restart holder replay from the beginning of the lane transaction
+11. if the same gap still exists after the allowed strikes, then use proxy policy:
    - proxy/upgrade evidence defaults to decoder-review-first
    - otherwise historical `balanceOf` can repair the row
-9. store the final resolution on the audit row
+12. store the final resolution on the audit row
 
 This matters because an RPC repair is evidence of a replay gap, not a substitute for decoder correctness.
 
@@ -864,9 +897,27 @@ Current behavior:
    - `CREATE INDEX CONCURRENTLY`
    - `DROP INDEX CONCURRENTLY`
 4. after rebuild, the worker performs an index health check and refuses to process live-head blocks while required indexes are missing or invalid
-5. once the indexes are valid, the worker runs `VACUUM ANALYZE` on `stark_transfers` and `stark_trades`
+5. once the indexes are valid, the worker starts planner maintenance on a separate low-impact connection
+6. when PostgreSQL supports it, maintenance uses `VACUUM (ANALYZE, PARALLEL 4)`
+7. after each vacuum pass, the worker checks `pg_current_wal_lsn()` growth
+8. if WAL growth exceeds `INDEXER_TURBO_WAL_GROWTH_BYTES`, maintenance sleeps for 60 seconds before continuing
+9. if maintenance runs past 10 minutes, live-mode indexing resumes while vacuum continues in the background
 
 This avoids blocking live writes while still guaranteeing that live-mode queries do not run on half-restored index state.
+
+## 9.2 FIFO Proof Table
+
+`stark_pnl_audit_trail` exists to make FIFO relief auditable.
+
+Every time a traded lot is relieved on a sell:
+
+1. the originating buy trade key and buy transaction hash are recorded
+2. a stable `lot_id` is recorded for the relieved lot
+3. the matching sell trade key and sell transaction hash are recorded
+4. relieved quantity, relieved cost basis, relieved proceeds, and relieved realized PnL are stored side by side
+5. `(sell_tx_hash, buy_tx_hash, lot_id)` is unique, so a restarted job cannot double-write the same relief proof row
+
+That gives a direct buy-to-sell proof chain for each FIFO match instead of forcing a reviewer to reverse-engineer lot matching from aggregate position balances.
 
 ## 10. Precision Rules In Phase 6
 
@@ -898,6 +949,7 @@ set PHASE6_BALANCE_RPC_ON_PROXY_DISCREPANCY=false
 set PHASE6_REDECODE_STRIKE_LIMIT=3
 set PHASE6_FIFO_DUST_THRESHOLD=0.0000000001
 set PHASE6_GAS_PRICE_FALLBACK_WINDOW_SECONDS=3600
+set INDEXER_TURBO_WAL_GROWTH_BYTES=268435456
 npm run start:bridge-accounting
 npm run start:wallet-rollups
 npm run start:concentration-rollups

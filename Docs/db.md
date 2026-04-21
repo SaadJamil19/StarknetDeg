@@ -233,7 +233,7 @@ This table stores forensic audit rows for replay mismatches that should not be s
 - `delta_amount`: Signed delta that caused the mismatch.
 - `attempted_balance_after`: Replayed post-delta balance before any repair or clamp.
 - `resolved_balance`: Final balance chosen after audit handling.
-- `resolution_status`: Resolution state such as `logged`, `decoder_review_required`, `rpc_repaired`, `rpc_unavailable`, `clamped_zero`, or `FATAL_MANUAL_REVIEW`.
+- `resolution_status`: Resolution state such as `logged`, `PENDING_REDECODE`, `decoder_review_required`, `rpc_repaired`, `rpc_unavailable`, `clamped_zero`, or `FATAL_MANUAL_REVIEW`.
 - `retry_count`: Number of upgrade-aware re-decode strikes recorded for this discrepancy.
 - `suspected_cause`: Short cause hint, for example proxy upgrade history, a generic replay gap, or missing gas price history.
 - `metadata`: Extra forensic evidence such as proxy flags, replaced class history, observed event class hash, re-decode attempts, gas-anchor fallback details, and RPC fallback notes.
@@ -844,6 +844,30 @@ This table stores current wallet positions by token.
 - `metadata`: Extra position details and repair flags.
 - `created_at`: Time when this row was inserted.
 - `updated_at`: Time when this row was last updated.
+
+## `stark_pnl_audit_trail`
+
+This table stores lot-level FIFO proof rows linking each relieved buy lot to the sell that consumed it.
+
+- `audit_trail_key`: Unique id for the proof row.
+- `lane`: Finality lane for this proof row.
+- `wallet_address`: Wallet whose inventory lot was relieved.
+- `token_address`: Token whose lot was relieved.
+- `lot_id`: Stable lot identifier used to prevent duplicate proof rows across restarts.
+- `buy_trade_key`: Trade key that originally created the lot, when known.
+- `buy_tx_hash`: Transaction hash of the originating buy.
+- `sell_trade_key`: Trade key that relieved the lot.
+- `sell_tx_hash`: Transaction hash of the relieving sell.
+- `sell_block_number`: Block where the relieving sell happened.
+- `sell_source_event_index`: Source event index for the relieving sell.
+- `relieved_quantity`: Quantity relieved from the original lot.
+- `relieved_cost_basis_usd`: USD cost basis relieved from the lot.
+- `relieved_proceeds_usd`: USD proceeds allocated to that relieved quantity.
+- `relieved_realized_pnl_usd`: Realized PnL for that exact buy-to-sell match.
+- `metadata`: Extra lineage details such as originating buy block.
+- `(sell_tx_hash, buy_tx_hash, lot_id)`: Unique tuple guarding against duplicate FIFO proof writes.
+- `created_at`: Time when this proof row was inserted.
+- `updated_at`: Time when this proof row was last updated.
 
 ## `stark_wallet_stats`
 

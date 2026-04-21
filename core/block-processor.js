@@ -1,5 +1,6 @@
 'use strict';
 
+const { setTimeout: sleep } = require('node:timers/promises');
 const { toBigIntStrict, toNumericString } = require('../lib/cairo/bigint');
 const { withClient, withTransaction } = require('../lib/db');
 const { normalizeL1HandlerSender } = require('./bridge');
@@ -33,6 +34,28 @@ const TURBO_BACKFILL_INDEX_DEFS = Object.freeze([
 const turboBackfillIndexState = {
   historicalMode: null,
 };
+const turboBackfillMaintenanceState = {
+  error: null,
+  promise: null,
+  running: false,
+  startedAt: null,
+};
+const TURBO_MAINTENANCE_WAIT_MS = 10 * 60 * 1000;
+const TURBO_MAINTENANCE_WAL_GROWTH_BYTES = parseNonNegativeBigInt(process.env.INDEXER_TURBO_WAL_GROWTH_BYTES, 268435456n, 'INDEXER_TURBO_WAL_GROWTH_BYTES');
+const TURBO_MAINTENANCE_WAL_SLEEP_MS = 60_000;
+
+function parseNonNegativeBigInt(value, fallbackValue, label) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return fallbackValue;
+  }
+
+  const parsed = BigInt(String(value).trim());
+  if (parsed < 0n) {
+    throw new Error(`${label} cannot be negative.`);
+  }
+
+  return parsed;
+}
 
 async function processAcceptedBlock({
   rpcClient,
@@ -317,7 +340,7 @@ async function reconcileTurboBackfillIndexes({
           `Turbo index health check failed. missing=${postCreateIssues.missing.join(',') || 'none'} invalid=${postCreateIssues.invalid.join(',') || 'none'}`,
         );
       }
-      await vacuumAnalyzeTurboBackfillTables(client);
+      const maintenanceSummary = await ensureTurboBackfillMaintenance();
       turboBackfillIndexState.historicalMode = false;
       return {
         action: 'rebuilt',
@@ -326,7 +349,9 @@ async function reconcileTurboBackfillIndexes({
         indexCount: TURBO_BACKFILL_INDEX_DEFS.length,
         invalidIndexes: 0,
         missingIndexes: 0,
-        vacuumAnalyzed: true,
+        maintenanceDeferred: Boolean(maintenanceSummary.deferred),
+        vacuumAnalyzed: Boolean(maintenanceSummary.completed),
+        walThrottleCount: maintenanceSummary.walThrottleCount ?? 0,
       };
     }
 
@@ -338,7 +363,9 @@ async function reconcileTurboBackfillIndexes({
       indexCount: TURBO_BACKFILL_INDEX_DEFS.length,
       invalidIndexes: 0,
       missingIndexes: 0,
+      maintenanceDeferred: false,
       vacuumAnalyzed: false,
+      walThrottleCount: 0,
     };
   });
 }
@@ -380,9 +407,80 @@ async function createTurboBackfillIndexes(client) {
 }
 
 async function vacuumAnalyzeTurboBackfillTables(client) {
+  const versionResult = await client.query(`SELECT current_setting('server_version_num') AS server_version_num`);
+  const serverVersionNum = Number.parseInt(String(versionResult.rows[0]?.server_version_num ?? '0'), 10);
+  const vacuumStatement = serverVersionNum >= 130000
+    ? 'VACUUM (ANALYZE, PARALLEL 4)'
+    : 'VACUUM ANALYZE';
+
+  await client.query(`SET vacuum_cost_delay = '10ms'`);
+  await client.query(`SET vacuum_cost_limit = 200`);
+
+  let walThrottleCount = 0;
   for (const tableName of ['stark_transfers', 'stark_trades']) {
-    await client.query(`VACUUM ANALYZE ${tableName}`);
+    const walStartLsn = await readCurrentWalLsn(client);
+    await client.query(`${vacuumStatement} ${tableName}`);
+    const walGrowthBytes = walStartLsn === null
+      ? null
+      : await readWalGrowthBytes(client, walStartLsn);
+    if (walGrowthBytes !== null && walGrowthBytes > TURBO_MAINTENANCE_WAL_GROWTH_BYTES) {
+      walThrottleCount += 1;
+      await sleep(TURBO_MAINTENANCE_WAL_SLEEP_MS);
+    }
   }
+
+  return {
+    walThrottleCount,
+  };
+}
+
+async function readCurrentWalLsn(client) {
+  const result = await client.query(`SELECT pg_current_wal_lsn() AS wal_lsn`);
+  return result.rows[0]?.wal_lsn ?? null;
+}
+
+async function readWalGrowthBytes(client, previousWalLsn) {
+  if (!previousWalLsn) {
+    return null;
+  }
+
+  const result = await client.query(
+    `SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), $1::pg_lsn) AS wal_growth_bytes`,
+    [previousWalLsn],
+  );
+  const value = result.rows[0]?.wal_growth_bytes ?? null;
+  return value === null ? null : toBigIntStrict(value, 'turbo maintenance wal growth bytes');
+}
+
+async function ensureTurboBackfillMaintenance() {
+  if (!turboBackfillMaintenanceState.promise) {
+    turboBackfillMaintenanceState.running = true;
+    turboBackfillMaintenanceState.startedAt = Date.now();
+    turboBackfillMaintenanceState.error = null;
+    turboBackfillMaintenanceState.promise = withClient(async (client) => {
+      try {
+        const maintenanceSummary = await vacuumAnalyzeTurboBackfillTables(client);
+        return { ...maintenanceSummary, completed: true, deferred: false };
+      } finally {
+        turboBackfillMaintenanceState.running = false;
+      }
+    }).catch((error) => {
+      turboBackfillMaintenanceState.error = error;
+      return {
+        completed: false,
+        deferred: false,
+        error: error.message || String(error),
+        walThrottleCount: 0,
+      };
+    }).finally(() => {
+      turboBackfillMaintenanceState.promise = null;
+    });
+  }
+
+  return Promise.race([
+    turboBackfillMaintenanceState.promise,
+    new Promise((resolve) => setTimeout(() => resolve({ completed: false, deferred: true, walThrottleCount: 0 }), TURBO_MAINTENANCE_WAIT_MS)),
+  ]);
 }
 
 function normalizeFetchedBlock({ block, stateUpdate, requestedBlockNumber }) {
