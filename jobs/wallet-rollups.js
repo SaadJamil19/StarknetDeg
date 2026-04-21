@@ -156,7 +156,7 @@ async function main() {
         const summary = await refreshWalletRollups();
         initialFullRefreshDone = true;
         console.log(
-          `[phase6] wallet-rollups mode=full lane=${summary.lane} max_block=${summary.maxBlockNumber} pending_redecode_block=${summary.blockedByPendingRedecodeBlock ?? 'none'} wallets=${summary.wallets} positions=${summary.positions} pnl_events=${summary.pnlEvents} wallet_transfers=${summary.walletTransfers} priced_trades=${summary.pricedTrades} skipped_trades=${summary.skippedTrades}`,
+          `[phase6] wallet-rollups mode=full lane=${summary.lane} max_block=${summary.maxBlockNumber} pending_redecode_block=${summary.blockedByPendingRedecodeBlock ?? 'none'} cleared_orphaned_fences=${summary.clearedOrphanedFences ?? 0} wallets=${summary.wallets} positions=${summary.positions} pnl_events=${summary.pnlEvents} wallet_transfers=${summary.walletTransfers} priced_trades=${summary.pricedTrades} skipped_trades=${summary.skippedTrades}`,
         );
       } else {
         const summary = await repairPendingWalletPricing();
@@ -194,6 +194,7 @@ async function refreshWalletRollups({
     await assertPhase4Tables(client);
     await assertPhase6Tables(client);
     await assertL1Tables(client);
+    const clearedOrphanedFences = await clearOrphanedPendingRedecodeDiscrepancies(client, { lane });
 
     const window = await resolveAnalyticsWindow(client, { indexerKey, lane, requireL1 });
     const pendingRedecodeBlock = window.maxBlockNumber === null
@@ -212,6 +213,7 @@ async function refreshWalletRollups({
     if (effectiveMaxBlockNumber === null) {
       return {
         blockedByPendingRedecodeBlock: pendingRedecodeBlock === null ? null : pendingRedecodeBlock.toString(10),
+        clearedOrphanedFences,
         lane: window.lane,
         maxBlockNumber: 'none',
         pnlEvents: 0,
@@ -330,6 +332,7 @@ async function refreshWalletRollups({
     return {
       lane: window.lane,
       blockedByPendingRedecodeBlock: pendingRedecodeBlock === null ? null : pendingRedecodeBlock.toString(10),
+      clearedOrphanedFences,
       maxBlockNumber: effectiveMaxBlockNumber.toString(10),
       pnlEvents: pnlEvents.length,
       positions: positionRows.length,
@@ -356,6 +359,7 @@ async function repairPendingWalletPricing({
     await assertPhase4Tables(client);
     await assertPhase6Tables(client);
     await assertL1Tables(client);
+    await clearOrphanedPendingRedecodeDiscrepancies(client, { lane });
 
     const window = await resolveAnalyticsWindow(client, { indexerKey, lane, requireL1 });
     if (window.maxBlockNumber === null) {
@@ -773,37 +777,34 @@ function allocateGasFeesToTrades(trades, tokenContext) {
       for (const trade of tradeGroup) {
         trade.gasFeePending = true;
         trade.gasFeeAnchorMode = 'missing';
+        trade.gasFeeEventCount = tradeGroup.length;
+        trade.gasFeeAllocationMode = 'per_pnl_event';
       }
       gasPriceAudits.push(buildGasPriceMissingAudit(referenceTrade));
       continue;
     }
 
-    const totalNotional = tradeGroup.reduce(
-      (sum, trade) => sum + (trade.notionalUsdScaled === null ? 0n : absBigInt(trade.notionalUsdScaled)),
-      0n,
-    );
     let remainingGasFeeUsdScaled = totalGasFeeUsdScaled;
-    let remainingWeight = totalNotional > 0n ? totalNotional : BigInt(tradeGroup.length);
+    let remainingEventCount = BigInt(tradeGroup.length);
 
     for (let index = 0; index < tradeGroup.length; index += 1) {
       const trade = tradeGroup[index];
+      trade.gasFeeEventCount = tradeGroup.length;
+      trade.gasFeeAllocationMode = 'per_pnl_event';
       if (index === tradeGroup.length - 1) {
         trade.gasFeeUsdScaled = remainingGasFeeUsdScaled;
         break;
       }
 
-      const weight = totalNotional > 0n
-        ? (trade.notionalUsdScaled === null ? 0n : absBigInt(trade.notionalUsdScaled))
-        : 1n;
-      if (weight === 0n || remainingWeight === 0n) {
+      if (remainingEventCount <= 0n) {
         trade.gasFeeUsdScaled = 0n;
         continue;
       }
 
-      const allocation = (remainingGasFeeUsdScaled * weight) / remainingWeight;
+      const allocation = remainingGasFeeUsdScaled / remainingEventCount;
       trade.gasFeeUsdScaled = allocation;
       remainingGasFeeUsdScaled -= allocation;
-      remainingWeight -= weight;
+      remainingEventCount -= 1n;
     }
   }
 
@@ -965,6 +966,8 @@ function buildGasPriceMissingAudit(trade) {
       fee_unit: trade.actualFeeUnit ?? null,
       fixed_anchor_eth_configured: FIXED_GAS_ANCHOR_ETH_USD_SCALED !== null,
       fixed_anchor_strk_configured: FIXED_GAS_ANCHOR_STRK_USD_SCALED !== null,
+      gas_fee_allocation_mode: trade.gasFeeAllocationMode ?? 'per_pnl_event',
+      gas_fee_event_count: trade.gasFeeEventCount ?? 1,
       gas_fee_token_reason: trade.gasFeeTokenReason ?? null,
       gas_fee_token_symbol: trade.gasFeeTokenSymbol ?? null,
       tx_version: trade.txVersion === null ? null : trade.txVersion.toString(10),
@@ -1139,7 +1142,14 @@ function processTrade({ lane, pnlAuditTrail, pnlEvents, positions, tokenContext,
 
     const carriedInventory = consumeInventoryWithoutPnl(sellPosition, trade.amountIn, stats);
     const carriedCostBasisUsdScaled = carriedInventory.costBasisUsdScaled;
-    const migratedCostBasisUsdScaled = carriedCostBasisUsdScaled + gasFeeUsdScaled;
+    const migrationLots = buildMigrationCarryoverLots({
+      amountOut: trade.amountOut,
+      consumedMatches: carriedInventory.matches,
+      fallbackLineagePath: lineageMigration.fullPath,
+      fallbackRootAddress: lineageMigration.rootAddress,
+      gasFeeUsdScaled,
+      trade,
+    });
 
     if (carriedInventory.inventoryGap > 0n) {
       sellPosition.pendingPricing = true;
@@ -1148,22 +1158,26 @@ function processTrade({ lane, pnlAuditTrail, pnlEvents, positions, tokenContext,
       stats.metadata.inventory_gap_qty += Number(carriedInventory.inventoryGap);
     }
 
-    addTradeLot(buyPosition, {
-      blockNumber: trade.blockNumber,
-      costBasisUsdScaled: migratedCostBasisUsdScaled,
-      lineagePath: lineageMigration.fullPath,
-      lineageRootAddress: lineageMigration.rootAddress,
-      lotId: `${trade.tradeKey}:migration`,
-      quantity: trade.amountOut,
-      tradeKey: trade.tradeKey,
-      transactionHash: trade.transactionHash,
-    });
+    for (let index = 0; index < migrationLots.length; index += 1) {
+      const lot = migrationLots[index];
+      addTradeLot(buyPosition, {
+        blockNumber: trade.blockNumber,
+        costBasisUsdScaled: lot.costBasisUsdScaled,
+        lineagePath: lot.lineagePath,
+        lineageRootAddress: lot.lineageRootAddress,
+        lotId: `${trade.tradeKey}:migration:${lot.lineageRootAddress}:${index}`,
+        quantity: lot.quantity,
+        rootAcquiredBlockNumber: lot.rootAcquiredBlockNumber,
+        tradeKey: trade.tradeKey,
+        transactionHash: trade.transactionHash,
+      });
+    }
 
     pnlEvents.push(buildPnlEvent({
       blockHash: trade.blockHash,
       blockNumber: trade.blockNumber,
       blockTimestamp: trade.blockTimestamp,
-      costBasisUsdScaled: migratedCostBasisUsdScaled,
+      costBasisUsdScaled: carriedCostBasisUsdScaled + gasFeeUsdScaled,
       externalQuantity: 0n,
       gasFeeAmount: hasGasFee ? trade.actualFeeAmount : null,
       gasFeeTokenAddress: trade.gasFeeTokenAddress,
@@ -1171,6 +1185,8 @@ function processTrade({ lane, pnlAuditTrail, pnlEvents, positions, tokenContext,
       lane,
       metadata: {
         fee_data_availability_mode: trade.feeDataAvailabilityMode ?? null,
+        gas_fee_allocation_mode: trade.gasFeeAllocationMode ?? 'per_pnl_event',
+        gas_fee_event_count: trade.gasFeeEventCount ?? 1,
         gas_fee_token_reason: trade.gasFeeTokenReason ?? null,
         gas_fee_token_symbol: trade.gasFeeTokenSymbol ?? null,
         gas_fee_unit: trade.actualFeeUnit ?? null,
@@ -1243,16 +1259,17 @@ function processTrade({ lane, pnlAuditTrail, pnlEvents, positions, tokenContext,
     stats.metadata.inventory_gap_qty += Number(sellResult.inventoryGap);
   }
 
-  addTradeLot(buyPosition, {
-    blockNumber: trade.blockNumber,
-    costBasisUsdScaled: buyCostBasisUsdScaled,
-    lineagePath: [trade.tokenOutAddress],
-    lineageRootAddress: trade.tokenOutAddress,
-    lotId: trade.tradeKey,
-    quantity: trade.amountOut,
-    tradeKey: trade.tradeKey,
-    transactionHash: trade.transactionHash,
-  });
+    addTradeLot(buyPosition, {
+      blockNumber: trade.blockNumber,
+      costBasisUsdScaled: buyCostBasisUsdScaled,
+      lineagePath: [trade.tokenOutAddress],
+      lineageRootAddress: trade.tokenOutAddress,
+      lotId: trade.tradeKey,
+      quantity: trade.amountOut,
+      rootAcquiredBlockNumber: trade.blockNumber,
+      tradeKey: trade.tradeKey,
+      transactionHash: trade.transactionHash,
+    });
 
   pnlEvents.push(buildPnlEvent({
     blockHash: trade.blockHash,
@@ -1266,6 +1283,8 @@ function processTrade({ lane, pnlAuditTrail, pnlEvents, positions, tokenContext,
     lane,
     metadata: {
       fee_data_availability_mode: trade.feeDataAvailabilityMode ?? null,
+      gas_fee_allocation_mode: trade.gasFeeAllocationMode ?? 'per_pnl_event',
+      gas_fee_event_count: trade.gasFeeEventCount ?? 1,
       gas_fee_token_reason: trade.gasFeeTokenReason ?? null,
       gas_fee_token_symbol: trade.gasFeeTokenSymbol ?? null,
       gas_fee_unit: trade.actualFeeUnit ?? null,
@@ -1306,6 +1325,8 @@ function processTrade({ lane, pnlAuditTrail, pnlEvents, positions, tokenContext,
     lane,
     metadata: {
       fee_data_availability_mode: trade.feeDataAvailabilityMode ?? null,
+      gas_fee_allocation_mode: trade.gasFeeAllocationMode ?? 'per_pnl_event',
+      gas_fee_event_count: trade.gasFeeEventCount ?? 1,
       gas_fee_token_reason: trade.gasFeeTokenReason ?? null,
       gas_fee_token_symbol: trade.gasFeeTokenSymbol ?? null,
       gas_fee_unit: trade.actualFeeUnit ?? null,
@@ -1478,6 +1499,25 @@ async function findEarliestPendingRedecodeBlock(client, { lane, maxBlockNumber }
     : toBigIntStrict(result.rows[0].block_number, 'wallet pending redecode block number');
 }
 
+async function clearOrphanedPendingRedecodeDiscrepancies(client, { lane }) {
+  const result = await client.query(
+    `DELETE FROM stark_audit_discrepancies AS audit
+      WHERE audit.lane = $1
+        AND audit.resolution_status = 'PENDING_REDECODE'
+        AND NOT EXISTS (
+             SELECT 1
+               FROM stark_block_journal AS journal
+              WHERE journal.lane = audit.lane
+                AND journal.block_number = audit.block_number
+                AND journal.block_hash = audit.block_hash
+                AND journal.is_orphaned = FALSE
+        )`,
+    [lane],
+  );
+
+  return Number(result.rowCount ?? 0);
+}
+
 function clampAnalyticsBlockBeforePendingRedecode(maxBlockNumber, pendingRedecodeBlock) {
   if (maxBlockNumber === null || maxBlockNumber === undefined) {
     return null;
@@ -1596,11 +1636,60 @@ function updateActivityMarkers(position, blockNumber, blockTimestamp) {
   }
 }
 
+function buildMigrationCarryoverLots({
+  amountOut,
+  consumedMatches,
+  fallbackLineagePath,
+  fallbackRootAddress,
+  gasFeeUsdScaled,
+  trade,
+}) {
+  const normalizedMatches = Array.isArray(consumedMatches)
+    ? consumedMatches.filter((item) => item.quantity > 0n)
+    : [];
+  if (normalizedMatches.length === 0) {
+    return [{
+      costBasisUsdScaled: gasFeeUsdScaled,
+      lineagePath: fallbackLineagePath,
+      lineageRootAddress: fallbackRootAddress,
+      quantity: amountOut,
+      rootAcquiredBlockNumber: trade.blockNumber,
+    }];
+  }
+
+  const orderedMatches = [...normalizedMatches].sort(compareRootAgeMatches);
+  const totalConsumedQuantity = orderedMatches.reduce((sum, item) => sum + item.quantity, 0n);
+  let remainingOutQuantity = amountOut;
+  let remainingGasFeeUsdScaled = gasFeeUsdScaled;
+  let remainingConsumedQuantity = totalConsumedQuantity;
+
+  return orderedMatches.map((match, index) => {
+    const quantity = index === (orderedMatches.length - 1) || remainingConsumedQuantity === 0n
+      ? remainingOutQuantity
+      : proportionalShare(amountOut, match.quantity, remainingConsumedQuantity);
+    const gasAllocation = index === (orderedMatches.length - 1) || remainingConsumedQuantity === 0n
+      ? remainingGasFeeUsdScaled
+      : proportionalShare(remainingGasFeeUsdScaled, match.quantity, remainingConsumedQuantity);
+    remainingOutQuantity -= quantity;
+    remainingGasFeeUsdScaled -= gasAllocation;
+    remainingConsumedQuantity -= match.quantity;
+
+    return {
+      costBasisUsdScaled: match.costBasisUsdScaled + gasAllocation,
+      lineagePath: Array.isArray(match.lineagePath) && match.lineagePath.length > 0 ? match.lineagePath : fallbackLineagePath,
+      lineageRootAddress: match.lineageRootAddress ?? fallbackRootAddress,
+      quantity,
+      rootAcquiredBlockNumber: match.rootAcquiredBlockNumber ?? trade.blockNumber,
+    };
+  });
+}
+
 function consumeInventoryWithoutPnl(position, amount, stats) {
   let remaining = amount;
   let externalCostBasisRelieved = 0n;
   let tradedCostBasisRelieved = 0n;
   let externalQuantityConsumed = 0n;
+  const matches = [];
   let tradedQuantityConsumed = 0n;
 
   if (position.externalQuantity > 0n) {
@@ -1612,6 +1701,16 @@ function consumeInventoryWithoutPnl(position, amount, stats) {
     remaining -= externalConsumed;
     externalQuantityConsumed += externalConsumed;
     externalCostBasisRelieved += externalCostRelieved;
+    if (externalConsumed > 0n) {
+      matches.push({
+        costBasisUsdScaled: externalCostRelieved,
+        lineagePath: [position.tokenAddress],
+        lineageRootAddress: position.tokenAddress,
+        lotId: `external:${position.walletAddress}:${position.tokenAddress}`,
+        quantity: externalConsumed,
+        rootAcquiredBlockNumber: position.firstActivityBlockNumber ?? position.lastActivityBlockNumber ?? null,
+      });
+    }
   }
 
   if (remaining > 0n && position.tradedQuantity > 0n) {
@@ -1619,6 +1718,7 @@ function consumeInventoryWithoutPnl(position, amount, stats) {
     remaining -= consumed.quantity;
     tradedQuantityConsumed += consumed.quantity;
     tradedCostBasisRelieved += consumed.costBasisUsdScaled;
+    matches.push(...consumed.matches);
   }
 
   if (remaining > 0n) {
@@ -1634,6 +1734,7 @@ function consumeInventoryWithoutPnl(position, amount, stats) {
     externalCostBasisRelieved,
     externalQuantityConsumed,
     inventoryGap: remaining,
+    matches,
     tradedCostBasisRelieved,
     tradedQuantityConsumed,
   };
@@ -1701,6 +1802,7 @@ function addTradeLot(position, {
   lineageRootAddress = null,
   lotId = null,
   quantity,
+  rootAcquiredBlockNumber = null,
   tradeKey,
   transactionHash,
 }) {
@@ -1717,9 +1819,11 @@ function addTradeLot(position, {
     lineageRootAddress: lineageRootAddress ?? position.tokenAddress,
     lotId: lotId ?? tradeKey ?? transactionHash ?? `${position.walletAddress}:${position.tokenAddress}:${position.tradeLots.length}`,
     quantity,
+    rootAcquiredBlockNumber: rootAcquiredBlockNumber ?? blockNumber,
     tradeKey,
     transactionHash,
   });
+  sortTradeLotsForConsumption(position);
 }
 
 function trimDustLots(position, stats) {
@@ -1764,6 +1868,7 @@ function trimDustLots(position, stats) {
 }
 
 function consumeTradeLots(position, amount) {
+  sortTradeLotsForConsumption(position);
   let remaining = amount;
   let consumedQuantity = 0n;
   let consumedCostBasisUsdScaled = 0n;
@@ -1785,11 +1890,15 @@ function consumeTradeLots(position, amount) {
         buyBlockNumber: lot.blockNumber,
         buyLineagePath: Array.isArray(lot.lineagePath) ? [...lot.lineagePath] : null,
         buyLineageRootAddress: lot.lineageRootAddress ?? null,
+        buyRootAcquiredBlockNumber: lot.rootAcquiredBlockNumber ?? null,
         buyTradeKey: lot.tradeKey ?? null,
         buyTransactionHash: lot.transactionHash ?? null,
         costBasisUsdScaled: lotCostRelieved,
         lotId: lot.lotId ?? lot.tradeKey ?? lot.transactionHash ?? null,
+        lineagePath: Array.isArray(lot.lineagePath) ? [...lot.lineagePath] : null,
+        lineageRootAddress: lot.lineageRootAddress ?? null,
         quantity: lotConsumed,
+        rootAcquiredBlockNumber: lot.rootAcquiredBlockNumber ?? null,
       });
     }
 
@@ -1852,6 +1961,7 @@ function appendPnlAuditTrailRows(auditTrail, {
         buy_block_number: match.buyBlockNumber === null ? null : match.buyBlockNumber.toString(10),
         buy_lineage_path: match.buyLineagePath ?? null,
         buy_lineage_root_address: match.buyLineageRootAddress ?? null,
+        buy_root_acquired_block_number: match.buyRootAcquiredBlockNumber === null ? null : match.buyRootAcquiredBlockNumber.toString(10),
       },
       relievedCostBasisUsdScaled: match.costBasisUsdScaled,
       relievedProceedsUsdScaled,
@@ -1868,6 +1978,62 @@ function appendPnlAuditTrailRows(auditTrail, {
     remainingProceedsUsdScaled -= relievedProceedsUsdScaled;
     remainingQuantity -= match.quantity;
   }
+}
+
+function sortTradeLotsForConsumption(position) {
+  position.tradeLots.sort(compareTradeLotsForConsumption);
+}
+
+function compareTradeLotsForConsumption(left, right) {
+  const rootAgeComparison = compareOptionalBigInt(left.rootAcquiredBlockNumber, right.rootAcquiredBlockNumber);
+  if (rootAgeComparison !== 0) {
+    return rootAgeComparison;
+  }
+
+  const lotBlockComparison = compareOptionalBigInt(left.blockNumber, right.blockNumber);
+  if (lotBlockComparison !== 0) {
+    return lotBlockComparison;
+  }
+
+  const rootAddressComparison = compareOptionalString(left.lineageRootAddress, right.lineageRootAddress);
+  if (rootAddressComparison !== 0) {
+    return rootAddressComparison;
+  }
+
+  return compareOptionalString(left.lotId, right.lotId);
+}
+
+function compareRootAgeMatches(left, right) {
+  const rootAgeComparison = compareOptionalBigInt(left.rootAcquiredBlockNumber, right.rootAcquiredBlockNumber);
+  if (rootAgeComparison !== 0) {
+    return rootAgeComparison;
+  }
+
+  const rootAddressComparison = compareOptionalString(left.lineageRootAddress, right.lineageRootAddress);
+  if (rootAddressComparison !== 0) {
+    return rootAddressComparison;
+  }
+
+  return compareOptionalString(left.lotId, right.lotId);
+}
+
+function compareOptionalBigInt(left, right) {
+  if (left === null || left === undefined) {
+    return right === null || right === undefined ? 0 : 1;
+  }
+  if (right === null || right === undefined) {
+    return -1;
+  }
+  return compareBigInt(left, right);
+}
+
+function compareOptionalString(left, right) {
+  const normalizedLeft = left === null || left === undefined ? '' : String(left);
+  const normalizedRight = right === null || right === undefined ? '' : String(right);
+  if (normalizedLeft === normalizedRight) {
+    return 0;
+  }
+  return normalizedLeft < normalizedRight ? -1 : 1;
 }
 
 function buildPnlEvent(payload) {

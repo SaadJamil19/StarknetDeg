@@ -766,3 +766,28 @@ This file lists the report-driven schema enhancement and bug-fix changes in simp
   - wallet replay fencing on pending re-decodes
   - WAL-throttled background vacuum
   - restart-safe FIFO proof rows
+
+## Changes 14: Sovereign Audit Readiness
+
+- Hardened convergent token lineage in `jobs/wallet-rollups.js`.
+  - recursive lineage still carries source-token basis into descendant tokens without realizing synthetic migration PnL
+  - when multiple legacy roots converge into one destination token, lots are now consumed by `root-age priority`
+  - priority is deterministic: oldest acquired root first, then lot block, then stable lot id
+  - this keeps merged-token FIFO replay auditable instead of relying on ambiguous parent selection
+- Added reorg-resilient fencing cleanup.
+  - `jobs/concentration-rollups.js` now deletes `PENDING_REDECODE` audit rows whose block is no longer canonical in `stark_block_journal`
+  - `jobs/wallet-rollups.js` also clears orphaned pending fences before choosing its replay cutoff, so wallet PnL does not deadlock on orphaned blocks
+  - `core/block-processor.js` now clears `PENDING_REDECODE` rows for newly orphaned blocks during conflicting-block handling
+- Updated gas accounting for multi-call swap transactions in `jobs/wallet-rollups.js`.
+  - Starknet receipts can contain multiple emitted events for a single transaction, and one transaction can therefore produce multiple swap-derived trade rows
+  - `actual_fee_usd` is now split evenly across the transaction's PnL-bearing trade events instead of being weighted by notional
+  - the per-event gas slice is what gets capitalized into lot basis or subtracted from sell proceeds
+- Extended turbo index management in `core/block-processor.js`.
+  - non-unique indexes on `stark_pnl_audit_trail` now join the drop/rebuild cycle alongside `stark_transfers` and `stark_trades`
+  - turbo index discovery is now table-aware, so optional Phase 6 tables are only managed when they exist
+  - post-rebuild maintenance now vacuums `stark_pnl_audit_trail` too when the table exists
+- Updated `Docs/phase6_analytics.md` for:
+  - root-age priority on convergent lineage
+  - orphan-safe pending re-decode fences
+  - equal gas splitting across multi-event swap transactions
+  - turbo management of audit-trail indexes

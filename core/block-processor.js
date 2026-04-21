@@ -16,20 +16,22 @@ const { publishBlockRealtimeUpdates } = require('./realtime');
 
 const TURBO_BACKFILL_LIVE_BUFFER_BLOCKS = 1000n;
 const TURBO_BACKFILL_INDEX_DEFS = Object.freeze([
-  { name: 'stark_transfers_block_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_transfers_block_idx ON stark_transfers (lane, block_number, transaction_index, source_event_index)' },
-  { name: 'stark_transfers_token_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_transfers_token_idx ON stark_transfers (token_address, block_number)' },
-  { name: 'stark_transfers_address_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_transfers_address_idx ON stark_transfers (from_address, to_address)' },
-  { name: 'stark_transfers_tx_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_transfers_tx_idx ON stark_transfers (lane, transaction_hash, source_event_index)' },
-  { name: 'stark_trades_block_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_block_idx ON stark_trades (lane, block_number, transaction_index, source_event_index)' },
-  { name: 'stark_trades_pool_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_pool_idx ON stark_trades (lane, pool_id, block_timestamp)' },
-  { name: 'stark_trades_bucket_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_bucket_idx ON stark_trades (lane, bucket_1m, pool_id)' },
-  { name: 'stark_trades_token_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_token_idx ON stark_trades (token_in_address, token_out_address, block_number)' },
-  { name: 'stark_trades_pending_enrichment_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_pending_enrichment_idx ON stark_trades (pending_enrichment, lane, block_number) WHERE pending_enrichment = TRUE' },
-  { name: 'stark_trades_route_group_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_route_group_idx ON stark_trades (lane, route_group_key, transaction_hash)' },
-  { name: 'stark_trades_tx_sequence_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_tx_sequence_idx ON stark_trades (lane, transaction_hash, transaction_index, source_event_index)' },
-  { name: 'stark_trades_route_sequence_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_route_sequence_idx ON stark_trades (lane, route_group_key, sequence_id)' },
-  { name: 'st_l1_wallet_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS st_l1_wallet_idx ON stark_trades (l1_wallet_address) WHERE l1_wallet_address IS NOT NULL' },
-  { name: 'st_post_bridge_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS st_post_bridge_idx ON stark_trades (is_post_bridge_trade, block_timestamp) WHERE is_post_bridge_trade = TRUE' },
+  { tableName: 'stark_transfers', name: 'stark_transfers_block_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_transfers_block_idx ON stark_transfers (lane, block_number, transaction_index, source_event_index)' },
+  { tableName: 'stark_transfers', name: 'stark_transfers_token_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_transfers_token_idx ON stark_transfers (token_address, block_number)' },
+  { tableName: 'stark_transfers', name: 'stark_transfers_address_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_transfers_address_idx ON stark_transfers (from_address, to_address)' },
+  { tableName: 'stark_transfers', name: 'stark_transfers_tx_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_transfers_tx_idx ON stark_transfers (lane, transaction_hash, source_event_index)' },
+  { tableName: 'stark_trades', name: 'stark_trades_block_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_block_idx ON stark_trades (lane, block_number, transaction_index, source_event_index)' },
+  { tableName: 'stark_trades', name: 'stark_trades_pool_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_pool_idx ON stark_trades (lane, pool_id, block_timestamp)' },
+  { tableName: 'stark_trades', name: 'stark_trades_bucket_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_bucket_idx ON stark_trades (lane, bucket_1m, pool_id)' },
+  { tableName: 'stark_trades', name: 'stark_trades_token_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_token_idx ON stark_trades (token_in_address, token_out_address, block_number)' },
+  { tableName: 'stark_trades', name: 'stark_trades_pending_enrichment_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_pending_enrichment_idx ON stark_trades (pending_enrichment, lane, block_number) WHERE pending_enrichment = TRUE' },
+  { tableName: 'stark_trades', name: 'stark_trades_route_group_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_route_group_idx ON stark_trades (lane, route_group_key, transaction_hash)' },
+  { tableName: 'stark_trades', name: 'stark_trades_tx_sequence_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_tx_sequence_idx ON stark_trades (lane, transaction_hash, transaction_index, source_event_index)' },
+  { tableName: 'stark_trades', name: 'stark_trades_route_sequence_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_route_sequence_idx ON stark_trades (lane, route_group_key, sequence_id)' },
+  { tableName: 'stark_trades', name: 'st_l1_wallet_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS st_l1_wallet_idx ON stark_trades (l1_wallet_address) WHERE l1_wallet_address IS NOT NULL' },
+  { tableName: 'stark_trades', name: 'st_post_bridge_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS st_post_bridge_idx ON stark_trades (is_post_bridge_trade, block_timestamp) WHERE is_post_bridge_trade = TRUE' },
+  { tableName: 'stark_pnl_audit_trail', name: 'stark_pnl_audit_trail_sell_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_pnl_audit_trail_sell_idx ON stark_pnl_audit_trail (lane, sell_tx_hash, token_address, wallet_address)' },
+  { tableName: 'stark_pnl_audit_trail', name: 'stark_pnl_audit_trail_buy_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_pnl_audit_trail_buy_idx ON stark_pnl_audit_trail (lane, buy_tx_hash, token_address, wallet_address) WHERE buy_tx_hash IS NOT NULL' },
 ]);
 const turboBackfillIndexState = {
   historicalMode: null,
@@ -283,6 +285,7 @@ async function reconcileTurboBackfillIndexes({
 
   return withClient(async (client) => {
     const indexIssues = await findTurboBackfillIndexIssues(client);
+    const activeIndexDefs = indexIssues.defs;
 
     if (historicalMode) {
       if (turboBackfillIndexState.historicalMode === true) {
@@ -290,19 +293,19 @@ async function reconcileTurboBackfillIndexes({
           action: 'noop',
           changed: false,
           historicalMode,
-          indexCount: TURBO_BACKFILL_INDEX_DEFS.length,
+          indexCount: activeIndexDefs.length,
           invalidIndexes: 0,
           missingIndexes: 0,
         };
       }
 
-      await dropTurboBackfillIndexes(client);
+      await dropTurboBackfillIndexes(client, { defs: activeIndexDefs });
       turboBackfillIndexState.historicalMode = true;
       return {
         action: 'dropped',
         changed: true,
         historicalMode,
-        indexCount: TURBO_BACKFILL_INDEX_DEFS.length,
+        indexCount: activeIndexDefs.length,
         invalidIndexes: indexIssues.invalid.length,
         missingIndexes: indexIssues.missing.length,
       };
@@ -318,7 +321,7 @@ async function reconcileTurboBackfillIndexes({
         action: 'noop',
         changed: false,
         historicalMode,
-        indexCount: TURBO_BACKFILL_INDEX_DEFS.length,
+        indexCount: activeIndexDefs.length,
         invalidIndexes: 0,
         missingIndexes: 0,
       };
@@ -331,9 +334,12 @@ async function reconcileTurboBackfillIndexes({
       || forceRestore
     ) {
       if (indexIssues.invalid.length > 0) {
-        await dropTurboBackfillIndexes(client, { names: indexIssues.invalid });
+        await dropTurboBackfillIndexes(client, {
+          defs: activeIndexDefs,
+          names: indexIssues.invalid,
+        });
       }
-      await createTurboBackfillIndexes(client);
+      await createTurboBackfillIndexes(client, activeIndexDefs);
       const postCreateIssues = await findTurboBackfillIndexIssues(client);
       if (postCreateIssues.missing.length > 0 || postCreateIssues.invalid.length > 0) {
         throw new Error(
@@ -346,7 +352,7 @@ async function reconcileTurboBackfillIndexes({
         action: 'rebuilt',
         changed: true,
         historicalMode,
-        indexCount: TURBO_BACKFILL_INDEX_DEFS.length,
+        indexCount: postCreateIssues.defs.length,
         invalidIndexes: 0,
         missingIndexes: 0,
         maintenanceDeferred: Boolean(maintenanceSummary.deferred),
@@ -360,7 +366,7 @@ async function reconcileTurboBackfillIndexes({
       action: 'noop',
       changed: false,
       historicalMode,
-      indexCount: TURBO_BACKFILL_INDEX_DEFS.length,
+      indexCount: activeIndexDefs.length,
       invalidIndexes: 0,
       missingIndexes: 0,
       maintenanceDeferred: false,
@@ -371,7 +377,15 @@ async function reconcileTurboBackfillIndexes({
 }
 
 async function findTurboBackfillIndexIssues(client) {
-  const expectedNames = TURBO_BACKFILL_INDEX_DEFS.map((entry) => entry.name);
+  const defs = await resolveActiveTurboBackfillIndexDefs(client);
+  const expectedNames = defs.map((entry) => entry.name);
+  if (expectedNames.length === 0) {
+    return {
+      defs,
+      invalid: [],
+      missing: [],
+    };
+  }
   const result = await client.query(
     `SELECT class.relname AS indexname,
             COALESCE(index_meta.indisvalid, FALSE) AS indisvalid
@@ -385,14 +399,33 @@ async function findTurboBackfillIndexIssues(client) {
 
   const existing = new Map(result.rows.map((row) => [row.indexname, Boolean(row.indisvalid)]));
   return {
+    defs,
     invalid: expectedNames.filter((name) => existing.has(name) && existing.get(name) === false),
     missing: expectedNames.filter((name) => !existing.has(name)),
   };
 }
 
-async function dropTurboBackfillIndexes(client, { names = null } = {}) {
-  const allowedNames = new Set(TURBO_BACKFILL_INDEX_DEFS.map((entry) => entry.name));
-  const targetNames = (names ?? TURBO_BACKFILL_INDEX_DEFS.map((entry) => entry.name))
+async function resolveActiveTurboBackfillIndexDefs(client) {
+  const uniqueTableNames = [...new Set(TURBO_BACKFILL_INDEX_DEFS.map((entry) => entry.tableName))];
+  const result = await client.query(
+    `SELECT table_name,
+            to_regclass('public.' || table_name) IS NOT NULL AS table_exists
+       FROM unnest($1::text[]) AS table_name`,
+    [uniqueTableNames],
+  );
+  const existingTables = new Set(
+    result.rows
+      .filter((row) => Boolean(row.table_exists))
+      .map((row) => row.table_name),
+  );
+
+  return TURBO_BACKFILL_INDEX_DEFS.filter((entry) => existingTables.has(entry.tableName));
+}
+
+async function dropTurboBackfillIndexes(client, { defs = null, names = null } = {}) {
+  const activeDefs = defs ?? await resolveActiveTurboBackfillIndexDefs(client);
+  const allowedNames = new Set(activeDefs.map((entry) => entry.name));
+  const targetNames = (names ?? activeDefs.map((entry) => entry.name))
     .filter((name) => allowedNames.has(name));
 
   for (const name of targetNames) {
@@ -400,8 +433,9 @@ async function dropTurboBackfillIndexes(client, { names = null } = {}) {
   }
 }
 
-async function createTurboBackfillIndexes(client) {
-  for (const entry of TURBO_BACKFILL_INDEX_DEFS) {
+async function createTurboBackfillIndexes(client, defs = null) {
+  const activeDefs = defs ?? await resolveActiveTurboBackfillIndexDefs(client);
+  for (const entry of activeDefs) {
     await client.query(entry.createSql);
   }
 }
@@ -416,8 +450,9 @@ async function vacuumAnalyzeTurboBackfillTables(client) {
   await client.query(`SET vacuum_cost_delay = '10ms'`);
   await client.query(`SET vacuum_cost_limit = 200`);
 
+  const tablesToVacuum = await resolveTurboMaintenanceTables(client);
   let walThrottleCount = 0;
-  for (const tableName of ['stark_transfers', 'stark_trades']) {
+  for (const tableName of tablesToVacuum) {
     const walStartLsn = await readCurrentWalLsn(client);
     await client.query(`${vacuumStatement} ${tableName}`);
     const walGrowthBytes = walStartLsn === null
@@ -432,6 +467,19 @@ async function vacuumAnalyzeTurboBackfillTables(client) {
   return {
     walThrottleCount,
   };
+}
+
+async function resolveTurboMaintenanceTables(client) {
+  const result = await client.query(
+    `SELECT table_name,
+            to_regclass('public.' || table_name) IS NOT NULL AS table_exists
+       FROM unnest($1::text[]) AS table_name`,
+    [['stark_transfers', 'stark_trades', 'stark_pnl_audit_trail']],
+  );
+
+  return result.rows
+    .filter((row) => Boolean(row.table_exists))
+    .map((row) => row.table_name);
 }
 
 async function readCurrentWalLsn(client) {
@@ -552,6 +600,30 @@ async function markConflictingBlockRows(client, { lane, blockNumber, blockHash }
         AND block_hash <> $3
         AND is_orphaned = FALSE`,
     [lane, toNumericString(blockNumber, 'block number'), blockHash],
+  );
+  await clearPendingRedecodeDiscrepanciesForOrphanedBlock(client, { lane, blockNumber });
+}
+
+async function clearPendingRedecodeDiscrepanciesForOrphanedBlock(client, { lane, blockNumber }) {
+  const tableCheck = await client.query(`SELECT to_regclass('public.stark_audit_discrepancies') AS regclass`);
+  if (tableCheck.rows[0]?.regclass === null) {
+    return;
+  }
+
+  await client.query(
+    `DELETE FROM stark_audit_discrepancies AS audit
+      WHERE audit.lane = $1
+        AND audit.block_number = $2
+        AND audit.resolution_status = 'PENDING_REDECODE'
+        AND NOT EXISTS (
+             SELECT 1
+               FROM stark_block_journal AS journal
+              WHERE journal.lane = audit.lane
+                AND journal.block_number = audit.block_number
+                AND journal.block_hash = audit.block_hash
+                AND journal.is_orphaned = FALSE
+        )`,
+    [lane, toNumericString(blockNumber, 'pending redecode cleanup block number')],
   );
 }
 

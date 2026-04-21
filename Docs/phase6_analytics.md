@@ -686,10 +686,11 @@ The wallet rollup does this:
    - version `>= 3` with `resource_bounds` or `fee_data_availability_mode` defaults to STRK
 4. look for the closest `stark_price_ticks` row within `PHASE6_GAS_PRICE_FALLBACK_WINDOW_SECONDS`
 5. prefer the closest tick by timestamp, while still preferring same-lineage-or-earlier ticks on ties
-6. if no historical tick exists, optionally use configured fixed anchors:
+6. if a transaction contains multiple PnL-bearing swap events, the fee is split evenly across those events before being attached to lot cost basis
+7. if no historical tick exists, optionally use configured fixed anchors:
    - `PHASE6_FIXED_GAS_ANCHOR_ETH_USD`
    - `PHASE6_FIXED_GAS_ANCHOR_STRK_USD`
-7. if no safe anchor exists, keep the trade pending and write a `PRICE_MISSING_AUDIT` row into `stark_audit_discrepancies`
+8. if no safe anchor exists, keep the trade pending and write a `PRICE_MISSING_AUDIT` row into `stark_audit_discrepancies`
 
 All USD math in this path stays on scaled integer arithmetic. No native JavaScript float is used for `notional_usd`, gas-fee USD, or lot cost basis.
 
@@ -722,6 +723,14 @@ The resulting lot metadata stores:
 - the lineage root address
 - the full lineage path
 - whether ancestry was ambiguous because multiple legacy sources converged into the same token
+
+If multiple legacy roots converge into one destination token, the carry-forward lots are ordered by `root-age priority`:
+
+1. oldest acquired root block first
+2. then destination lot block
+3. then stable lot id
+
+That gives deterministic, auditable FIFO consumption even when two legacy assets eventually merge into one canonical token.
 
 ## 6.11 The Self-Healing Repair Loop
 
@@ -803,13 +812,14 @@ Current flow:
 5. if that re-decode changes transfer lineage, re-run trade derivation for the same transaction hash so `stark_trades` stays aligned with corrected transfer truth
 6. while a block is actively waiting on re-decode, the audit row moves to `PENDING_REDECODE`
 7. wallet rollups fence their replay window before the earliest `PENDING_REDECODE` block so PnL is never finalized across dirty transfer lineage
-8. each audited block gets a persistent `retry_count`
-9. after `PHASE6_REDECODE_STRIKE_LIMIT` re-decode strikes, the row is marked `FATAL_MANUAL_REVIEW` and replay moves on instead of stalling forever
-10. otherwise restart holder replay from the beginning of the lane transaction
-11. if the same gap still exists after the allowed strikes, then use proxy policy:
+8. if the pending block is later orphaned by canonical reorg handling, the fence row is deleted automatically
+9. each audited block gets a persistent `retry_count`
+10. after `PHASE6_REDECODE_STRIKE_LIMIT` re-decode strikes, the row is marked `FATAL_MANUAL_REVIEW` and replay moves on instead of stalling forever
+11. otherwise restart holder replay from the beginning of the lane transaction
+12. if the same gap still exists after the allowed strikes, then use proxy policy:
    - proxy/upgrade evidence defaults to decoder-review-first
    - otherwise historical `balanceOf` can repair the row
-12. store the final resolution on the audit row
+13. store the final resolution on the audit row
 
 This matters because an RPC repair is evidence of a replay gap, not a substitute for decoder correctness.
 
@@ -891,7 +901,7 @@ Turbo backfill deliberately trades query ergonomics for write speed.
 
 Current behavior:
 
-1. while replay is more than `1000` blocks behind head, non-unique indexes on `stark_transfers` and `stark_trades` are dropped
+1. while replay is more than `1000` blocks behind head, non-unique indexes on `stark_transfers`, `stark_trades`, and `stark_pnl_audit_trail` are dropped when those tables exist
 2. when replay moves back into the live buffer, index rebuild runs on a fresh connection outside the block-processing transaction
 3. index rebuild uses:
    - `CREATE INDEX CONCURRENTLY`

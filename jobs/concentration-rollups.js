@@ -78,7 +78,7 @@ async function main() {
     try {
       const summary = await refreshConcentrationRollups();
       console.log(
-        `[phase6] concentration-rollups lane=${summary.lane} max_block=${summary.maxBlockNumber} balances=${summary.balances} deltas=${summary.deltas} concentrations=${summary.concentrations} alerts=${summary.alerts} audits=${summary.auditedDiscrepancies ?? 0} rpc_repairs=${summary.rpcRepairs ?? 0} negative_gaps=${summary.negativeBalanceGaps ?? 0}`,
+        `[phase6] concentration-rollups lane=${summary.lane} max_block=${summary.maxBlockNumber} balances=${summary.balances} deltas=${summary.deltas} concentrations=${summary.concentrations} alerts=${summary.alerts} audits=${summary.auditedDiscrepancies ?? 0} cleared_orphaned_fences=${summary.clearedOrphanedFences ?? 0} rpc_repairs=${summary.rpcRepairs ?? 0} negative_gaps=${summary.negativeBalanceGaps ?? 0}`,
       );
     } catch (error) {
       console.error(`[phase6] concentration-rollups error: ${formatError(error)}`);
@@ -109,6 +109,7 @@ async function refreshConcentrationRollups({
     await assertPhase4Tables(client);
     await assertPhase6Tables(client);
     await assertProtocolAccuracyColumns(client);
+    const clearedOrphanedFences = await clearOrphanedPendingRedecodeDiscrepancies(client, { lane });
 
     const window = await resolveAnalyticsWindow(client, { indexerKey, lane, requireL1 });
 
@@ -132,6 +133,7 @@ async function refreshConcentrationRollups({
         maxBlockNumber: 'none',
         negativeBalanceGaps: 0,
         auditedDiscrepancies: 0,
+        clearedOrphanedFences,
         rpcRepairs: 0,
       };
     }
@@ -248,10 +250,30 @@ async function refreshConcentrationRollups({
       lane: window.lane,
       maxBlockNumber: window.maxBlockNumber.toString(10),
       auditedDiscrepancies,
+      clearedOrphanedFences,
       negativeBalanceGaps,
       rpcRepairs,
     };
   });
+}
+
+async function clearOrphanedPendingRedecodeDiscrepancies(client, { lane }) {
+  const result = await client.query(
+    `DELETE FROM stark_audit_discrepancies AS audit
+      WHERE audit.lane = $1
+        AND audit.resolution_status = 'PENDING_REDECODE'
+        AND NOT EXISTS (
+             SELECT 1
+               FROM stark_block_journal AS journal
+              WHERE journal.lane = audit.lane
+                AND journal.block_number = audit.block_number
+                AND journal.block_hash = audit.block_hash
+                AND journal.is_orphaned = FALSE
+        )`,
+    [lane],
+  );
+
+  return Number(result.rowCount ?? 0);
 }
 
 async function loadTransfers(client, { lane, maxBlockNumber }) {
