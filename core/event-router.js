@@ -79,15 +79,24 @@ async function decodeBlockFromRaw(client, { lane, blockNumber, blockHash, rpcCli
         throw new Error(`Decoder ${route.decoder} is not available.`);
       }
 
-      const decoded = await Promise.resolve(decoder.decodeEvent({
-        client,
-        contractMetadata: route.contractMetadata,
-        event,
-        receiptContext: receiptContexts.get(route.decoder),
-        route,
-        rpcClient,
-        tx,
-      }));
+      let decoded;
+      try {
+        decoded = await Promise.resolve(decoder.decodeEvent({
+          client,
+          contractMetadata: route.contractMetadata,
+          event,
+          receiptContext: receiptContexts.get(route.decoder),
+          route,
+          rpcClient,
+          tx,
+        }));
+      } catch (error) {
+        const audit = buildDecoderFailureAudit({ error, event, route, tx });
+        await insertAudit(client, audit);
+        await markEventStatus(client, tx, event, 'FAILED', audit.reason);
+        failedEventCount += 1;
+        continue;
+      }
       const result = applyTransactionRoutingContext(decoded, { route, tx, txContext });
 
       await persistResultBundle(client, tx, result);
@@ -235,6 +244,32 @@ function buildNoRouteAudit({ event, tx }) {
       selector_name: isStandard ? 'standard_dex_selector' : null,
     }),
     reason: isStandard ? 'STANDARD_DEX_SELECTOR_UNMATCHED' : 'NO_DECODER_ROUTE',
+    selector: event.selector,
+    sourceEventIndex: event.receiptEventIndex,
+    transactionHash: tx.transactionHash,
+    transactionIndex: tx.transactionIndex,
+  };
+}
+
+function buildDecoderFailureAudit({ error, event, route, tx }) {
+  const message = error?.message || String(error || 'unknown decoder error');
+  return {
+    blockHash: tx.blockHash,
+    blockNumber: tx.blockNumber,
+    emitterAddress: event.fromAddress,
+    lane: tx.lane,
+    metadata: normalizeActionMetadata({
+      decoder: route?.decoder ?? null,
+      handler: route?.handler ?? null,
+      keys_length: event.keys.length,
+      protocol: route?.protocol ?? null,
+      protocol_key: route?.protocolKey ?? null,
+      resolved_class_hash: event.resolvedClassHash,
+      selector_name: route?.selectorName ?? null,
+      soft_failed: true,
+      error_message: message.slice(0, 500),
+    }),
+    reason: `DECODER_SOFT_FAILED:${route?.decoder ?? 'unknown'}`,
     selector: event.selector,
     sourceEventIndex: event.receiptEventIndex,
     transactionHash: tx.transactionHash,
@@ -635,7 +670,14 @@ function createReceiptContextController() {
     let result = emptyResultBundle();
 
     if (decoder && typeof decoder.flushReceiptContext === 'function') {
-      result = normalizeResultBundle(decoder.flushReceiptContext({ receiptContext, tx }));
+      try {
+        result = normalizeResultBundle(decoder.flushReceiptContext({ receiptContext, tx }));
+      } catch (error) {
+        result = {
+          ...emptyResultBundle(),
+          audits: [buildDecoderFlushFailureAudit({ error, protocol, tx })],
+        };
+      }
     }
 
     if (decoder && typeof decoder.clearReceiptContext === 'function') {
@@ -650,6 +692,26 @@ function createReceiptContextController() {
 
     return result;
   }
+}
+
+function buildDecoderFlushFailureAudit({ error, protocol, tx }) {
+  const message = error?.message || String(error || 'unknown decoder flush error');
+  return {
+    blockHash: tx.blockHash,
+    blockNumber: tx.blockNumber,
+    emitterAddress: null,
+    lane: tx.lane,
+    metadata: normalizeActionMetadata({
+      decoder: protocol,
+      soft_failed: true,
+      error_message: message.slice(0, 500),
+    }),
+    reason: `DECODER_FLUSH_SOFT_FAILED:${protocol}`,
+    selector: null,
+    sourceEventIndex: null,
+    transactionHash: tx.transactionHash,
+    transactionIndex: tx.transactionIndex,
+  };
 }
 
 function mergeResultBundles(bundles) {

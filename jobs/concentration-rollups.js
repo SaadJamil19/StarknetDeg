@@ -5,7 +5,17 @@ const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 
 const { setTimeout: sleep } = require('node:timers/promises');
-const { assertFoundationTables, assertPhase2Tables, assertPhase3Tables, assertPhase4Tables, assertPhase6Tables } = require('../core/checkpoint');
+const {
+  assertFinancialResilienceColumns,
+  assertFoundationTables,
+  assertFullNodePlan2Tables,
+  assertPhase2Tables,
+  assertPhase3Tables,
+  assertPhase4Tables,
+  assertPhase6Tables,
+  assertProtocolAccuracyColumns,
+} = require('../core/checkpoint');
+const { decodeBlockFromRaw } = require('../core/event-router');
 const { FINALITY_LANES } = require('../core/finality');
 const { toJsonbString } = require('../core/protocols/shared');
 const { toBigIntStrict, toNumericString } = require('../lib/cairo/bigint');
@@ -18,6 +28,8 @@ const {
   scaledToNumericString,
 } = require('../lib/cairo/fixed-point');
 const { closePool, withClient, withTransaction } = require('../lib/db');
+const { StarknetRpcClient } = require('../lib/starknet-rpc');
+const { parseU256FromArray } = require('../core/normalize');
 const {
   ZERO_ADDRESS,
   computeUsdValueFromRawAmount,
@@ -31,6 +43,14 @@ const {
 } = require('./analytics-utils');
 
 let shuttingDown = false;
+const REDECODE_STRIKE_LIMIT = parsePositiveInteger(process.env.PHASE6_REDECODE_STRIKE_LIMIT, 3);
+const REDECODE_MAX_REPLAY_RESTARTS = parsePositiveInteger(process.env.PHASE6_REDECODE_MAX_REPLAY_RESTARTS, 12);
+class ReplayRebuildRequired extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ReplayRebuildRequired';
+  }
+}
 
 async function main() {
   const runOnce = parseBoolean(process.env.PHASE6_CONCENTRATION_RUN_ONCE, true);
@@ -39,11 +59,14 @@ async function main() {
   installSignalHandlers();
 
   await withClient(async (client) => {
+    await assertFinancialResilienceColumns(client);
     await assertFoundationTables(client);
+    await assertFullNodePlan2Tables(client);
     await assertPhase2Tables(client);
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
     await assertPhase6Tables(client);
+    await assertProtocolAccuracyColumns(client);
   });
 
   console.log(`[phase6] concentration-rollups starting run_once=${runOnce}`);
@@ -52,7 +75,7 @@ async function main() {
     try {
       const summary = await refreshConcentrationRollups();
       console.log(
-        `[phase6] concentration-rollups lane=${summary.lane} max_block=${summary.maxBlockNumber} balances=${summary.balances} deltas=${summary.deltas} concentrations=${summary.concentrations} alerts=${summary.alerts}`,
+        `[phase6] concentration-rollups lane=${summary.lane} max_block=${summary.maxBlockNumber} balances=${summary.balances} deltas=${summary.deltas} concentrations=${summary.concentrations} alerts=${summary.alerts} audits=${summary.auditedDiscrepancies ?? 0} rpc_repairs=${summary.rpcRepairs ?? 0} negative_gaps=${summary.negativeBalanceGaps ?? 0}`,
       );
     } catch (error) {
       console.error(`[phase6] concentration-rollups error: ${formatError(error)}`);
@@ -74,11 +97,14 @@ async function refreshConcentrationRollups({
   requireL1 = parseBoolean(process.env.PHASE6_REQUIRE_L1, false),
 } = {}) {
   return withTransaction(async (client) => {
+    await assertFinancialResilienceColumns(client);
     await assertFoundationTables(client);
+    await assertFullNodePlan2Tables(client);
     await assertPhase2Tables(client);
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
     await assertPhase6Tables(client);
+    await assertProtocolAccuracyColumns(client);
 
     const window = await resolveAnalyticsWindow(client, { indexerKey, lane, requireL1 });
 
@@ -100,40 +126,84 @@ async function refreshConcentrationRollups({
         deltas: 0,
         lane: window.lane,
         maxBlockNumber: 'none',
+        negativeBalanceGaps: 0,
+        auditedDiscrepancies: 0,
+        rpcRepairs: 0,
       };
     }
 
-    const transfers = await loadTransfers(client, {
-      lane: window.lane,
-      maxBlockNumber: window.maxBlockNumber,
-    });
     const activeTraderSet = await loadActiveTraderSet(client, { lane: window.lane });
+    const rpcRepairEnabled = parseBoolean(process.env.PHASE6_BALANCE_RPC_REPAIR, true);
+    const allowRpcOnProxyDiscrepancy = parseBoolean(process.env.PHASE6_BALANCE_RPC_ON_PROXY_DISCREPANCY, false);
+    const rpcClient = rpcRepairEnabled && process.env.STARKNET_RPC_URL ? new StarknetRpcClient() : null;
+    let balanceState = new Map();
+    let deltaRows = [];
+    let auditedDiscrepancies = 0;
+    let rpcRepairs = 0;
+    let negativeBalanceGaps = 0;
+    let transfers = [];
+
+    for (let replayAttempt = 0; replayAttempt < REDECODE_MAX_REPLAY_RESTARTS; replayAttempt += 1) {
+      transfers = await loadTransfers(client, {
+        lane: window.lane,
+        maxBlockNumber: window.maxBlockNumber,
+      });
+      balanceState = new Map();
+      deltaRows = [];
+      auditedDiscrepancies = 0;
+      rpcRepairs = 0;
+      negativeBalanceGaps = 0;
+
+      try {
+        for (const transfer of transfers) {
+          if (transfer.fromAddress !== ZERO_ADDRESS) {
+            const delta = await applyTransferDelta(balanceState, transfer, {
+              activeTraderSet,
+              allowRpcOnProxyDiscrepancy,
+              client,
+              deltaAmount: -transfer.amount,
+              direction: 'debit',
+              holderAddress: transfer.fromAddress,
+              lane: window.lane,
+              rpcClient,
+            });
+            deltaRows.push(delta);
+            if (delta.metadata?.audit_id) {
+              auditedDiscrepancies += 1;
+            }
+            if (delta.metadata?.balance_repaired_from_rpc) {
+              rpcRepairs += 1;
+            } else if (delta.metadata?.negative_balance_gap) {
+              negativeBalanceGaps += 1;
+            }
+          }
+
+          if (transfer.toAddress !== ZERO_ADDRESS) {
+            const delta = await applyTransferDelta(balanceState, transfer, {
+              activeTraderSet,
+              allowRpcOnProxyDiscrepancy,
+              client,
+              deltaAmount: transfer.amount,
+              direction: 'credit',
+              holderAddress: transfer.toAddress,
+              lane: window.lane,
+              rpcClient,
+            });
+            deltaRows.push(delta);
+          }
+        }
+        break;
+      } catch (error) {
+        if (!(error instanceof ReplayRebuildRequired) || replayAttempt === (REDECODE_MAX_REPLAY_RESTARTS - 1)) {
+          throw error;
+        }
+      }
+    }
+
     const tokenContext = await loadTokenMarketContext(client, {
       lane: window.lane,
       tokenAddresses: Array.from(new Set(transfers.map((row) => row.tokenAddress))),
     });
-    const balanceState = new Map();
-    const deltaRows = [];
-
-    for (const transfer of transfers) {
-      if (transfer.fromAddress !== ZERO_ADDRESS) {
-        deltaRows.push(applyTransferDelta(balanceState, transfer, {
-          activeTraderSet,
-          deltaAmount: -transfer.amount,
-          direction: 'debit',
-          holderAddress: transfer.fromAddress,
-        }));
-      }
-
-      if (transfer.toAddress !== ZERO_ADDRESS) {
-        deltaRows.push(applyTransferDelta(balanceState, transfer, {
-          activeTraderSet,
-          deltaAmount: transfer.amount,
-          direction: 'credit',
-          holderAddress: transfer.toAddress,
-        }));
-      }
-    }
 
     for (const delta of deltaRows) {
       await insertHolderDelta(client, delta, { lane: window.lane });
@@ -173,6 +243,9 @@ async function refreshConcentrationRollups({
       deltas: deltaRows.length,
       lane: window.lane,
       maxBlockNumber: window.maxBlockNumber.toString(10),
+      auditedDiscrepancies,
+      negativeBalanceGaps,
+      rpcRepairs,
     };
   });
 }
@@ -221,7 +294,16 @@ async function loadActiveTraderSet(client, { lane }) {
   return new Set(result.rows.map((row) => row.wallet_address).filter(Boolean));
 }
 
-function applyTransferDelta(balanceState, transfer, { activeTraderSet, deltaAmount, direction, holderAddress }) {
+async function applyTransferDelta(balanceState, transfer, {
+  activeTraderSet,
+  allowRpcOnProxyDiscrepancy = false,
+  client,
+  deltaAmount,
+  direction,
+  holderAddress,
+  lane,
+  rpcClient = null,
+}) {
   const key = `${transfer.tokenAddress}:${holderAddress}`;
   const isInternalTransfer = Boolean(
     transfer.fromAddress
@@ -243,20 +325,146 @@ function applyTransferDelta(balanceState, transfer, { activeTraderSet, deltaAmou
   };
 
   let nextBalance = current.balance + deltaAmount;
+  const metadata = {
+    classification: isInternalTransfer ? 'INTERNAL_TRANSFER' : 'TOKEN_TRANSFER',
+    peer_wallet_address: direction === 'credit' ? transfer.fromAddress : transfer.toAddress,
+  };
+
   if (nextBalance < 0n) {
-    nextBalance = 0n;
+    metadata.negative_balance_gap = (-nextBalance).toString(10);
+    metadata.balance_before_delta = current.balance.toString(10);
+    metadata.attempted_balance_after = nextBalance.toString(10);
+
+    const forensic = await loadDiscrepancyForensics(client, {
+      lane,
+      holderAddress,
+      transfer,
+    });
+    metadata.suspected_cause = forensic.suspectedCause;
+    metadata.proxy_upgrade_suspected = forensic.proxyEvidence;
+    metadata.upgrade_event_count = forensic.replacedClasses.length;
+    metadata.observed_event_class_hash = forensic.observedEventClassHash;
+
+    const audit = await insertAuditDiscrepancy(client, {
+      attemptedBalanceAfter: nextBalance,
+      balanceBefore: current.balance,
+      deltaAmount,
+      forensic,
+      holderAddress,
+      lane,
+      transfer,
+    });
+    const auditId = audit.auditId;
+    metadata.audit_id = String(auditId);
+    metadata.audit_retry_count = audit.retryCount;
+
+    const redecodeDecision = await attemptUpgradeAwareRedecode(client, {
+      auditId,
+      balanceBefore: current.balance,
+      forensic,
+      lane,
+      rpcClient,
+      transfer,
+    });
+    metadata.audit_retry_count = redecodeDecision.retryCount;
+    if (redecodeDecision.triggered) {
+      metadata.redecode_triggered = true;
+      throw new ReplayRebuildRequired(
+        `Upgrade-aware re-decode triggered for ${transfer.transactionHash} at block ${transfer.blockNumber.toString(10)}.`,
+      );
+    }
+    if (redecodeDecision.fatalManualReview) {
+      nextBalance = 0n;
+      metadata.decoder_review_required = true;
+      metadata.rpc_repair_skipped = true;
+      metadata.rpc_repair_skip_reason = 'redecode_strike_limit';
+      metadata.fatal_manual_review = true;
+      await updateAuditDiscrepancyResolution(client, {
+        auditId,
+        metadataPatch: {
+          redecode_retry_count: redecodeDecision.retryCount,
+          rpc_attempted: false,
+          rpc_skip_reason: 'redecode_strike_limit',
+        },
+        resolutionStatus: 'FATAL_MANUAL_REVIEW',
+        resolvedBalance: nextBalance,
+      });
+      persistBalanceState(current, nextBalance, transfer, balanceState, key);
+      return {
+        balanceDirection: direction,
+        blockHash: transfer.blockHash,
+        blockNumber: transfer.blockNumber,
+        deltaAmount,
+        deltaKey: `${transfer.transferKey}:${holderAddress}:${direction}`,
+        holderAddress,
+        sourceEventIndex: transfer.sourceEventIndex,
+        tokenAddress: transfer.tokenAddress,
+        transactionHash: transfer.transactionHash,
+        transactionIndex: transfer.transactionIndex,
+        transferKey: transfer.transferKey,
+        metadata,
+      };
+    }
+
+    const shouldAttemptRpc = Boolean(
+      rpcClient
+      && (!forensic.proxyEvidence || allowRpcOnProxyDiscrepancy)
+    );
+
+    if (shouldAttemptRpc) {
+      const repairedBalance = await safeReadBalanceOfAtBlock(rpcClient, {
+        blockNumber: transfer.blockNumber,
+        holderAddress,
+        tokenAddress: transfer.tokenAddress,
+      });
+
+      if (repairedBalance !== null) {
+        nextBalance = repairedBalance;
+        metadata.balance_repaired_from_rpc = true;
+        metadata.rpc_repair_block_number = transfer.blockNumber.toString(10);
+        await updateAuditDiscrepancyResolution(client, {
+          auditId,
+          metadataPatch: {
+            rpc_attempted: true,
+            rpc_repair_block_number: transfer.blockNumber.toString(10),
+          },
+          resolutionStatus: 'rpc_repaired',
+          resolvedBalance: repairedBalance,
+        });
+      } else {
+        nextBalance = 0n;
+        metadata.balance_repair_missing_rpc = true;
+        await updateAuditDiscrepancyResolution(client, {
+          auditId,
+          metadataPatch: {
+            rpc_attempted: true,
+            rpc_result: 'empty_or_failed',
+          },
+          resolutionStatus: 'rpc_unavailable',
+          resolvedBalance: nextBalance,
+        });
+      }
+    } else {
+      nextBalance = 0n;
+      metadata.balance_repair_missing_rpc = !rpcClient;
+      metadata.decoder_review_required = forensic.proxyEvidence;
+      metadata.rpc_repair_skipped = true;
+      metadata.rpc_repair_skip_reason = forensic.proxyEvidence
+        ? 'proxy_upgrade_suspected'
+        : 'rpc_disabled_or_missing';
+      await updateAuditDiscrepancyResolution(client, {
+        auditId,
+        metadataPatch: {
+          rpc_attempted: false,
+          rpc_skip_reason: metadata.rpc_repair_skip_reason,
+        },
+        resolutionStatus: forensic.proxyEvidence ? 'decoder_review_required' : 'clamped_zero',
+        resolvedBalance: nextBalance,
+      });
+    }
   }
 
-  if (current.firstSeenBlockNumber === null) {
-    current.firstSeenBlockNumber = transfer.blockNumber;
-  }
-
-  current.balance = nextBalance;
-  current.lastUpdatedBlockNumber = transfer.blockNumber;
-  current.lastTransactionHash = transfer.transactionHash;
-  current.lastTransactionIndex = transfer.transactionIndex;
-  current.lastSourceEventIndex = transfer.sourceEventIndex;
-  balanceState.set(key, current);
+  persistBalanceState(current, nextBalance, transfer, balanceState, key);
 
   return {
     balanceDirection: direction,
@@ -270,11 +478,435 @@ function applyTransferDelta(balanceState, transfer, { activeTraderSet, deltaAmou
     transactionHash: transfer.transactionHash,
     transactionIndex: transfer.transactionIndex,
     transferKey: transfer.transferKey,
-    metadata: {
-      classification: isInternalTransfer ? 'INTERNAL_TRANSFER' : 'TOKEN_TRANSFER',
-      peer_wallet_address: direction === 'credit' ? transfer.fromAddress : transfer.toAddress,
-    },
+    metadata,
   };
+}
+
+function persistBalanceState(current, nextBalance, transfer, balanceState, key) {
+  if (current.firstSeenBlockNumber === null) {
+    current.firstSeenBlockNumber = transfer.blockNumber;
+  }
+
+  current.balance = nextBalance;
+  current.lastUpdatedBlockNumber = transfer.blockNumber;
+  current.lastTransactionHash = transfer.transactionHash;
+  current.lastTransactionIndex = transfer.transactionIndex;
+  current.lastSourceEventIndex = transfer.sourceEventIndex;
+  balanceState.set(key, current);
+}
+
+async function attemptUpgradeAwareRedecode(client, {
+  auditId,
+  balanceBefore,
+  forensic,
+  lane,
+  rpcClient,
+  transfer,
+}) {
+  if (!forensic || forensic.replacedClasses.length === 0) {
+    return {
+      fatalManualReview: false,
+      retryCount: 0,
+      triggered: false,
+    };
+  }
+
+  const retryCount = await incrementAuditDiscrepancyRetryCount(client, { auditId });
+  if (retryCount > REDECODE_STRIKE_LIMIT) {
+    await updateAuditDiscrepancyResolution(client, {
+      auditId,
+      metadataPatch: {
+        redecode_attempted: false,
+        redecode_retry_count: retryCount,
+        redecode_trigger: 'replaced_classes',
+        strike_limit: REDECODE_STRIKE_LIMIT,
+      },
+      resolutionStatus: 'FATAL_MANUAL_REVIEW',
+      resolvedBalance: balanceBefore,
+    });
+    return {
+      fatalManualReview: true,
+      retryCount,
+      triggered: false,
+    };
+  }
+
+  const savepointName = buildRedecodeSavepointName(auditId);
+
+  try {
+    await client.query(`SAVEPOINT ${savepointName}`);
+    await clearDerivedRowsForRedecode(client, {
+      blockNumber: transfer.blockNumber,
+      lane,
+    });
+    await resetRawDecodeStatusesForRedecode(client, {
+      blockNumber: transfer.blockNumber,
+      lane,
+    });
+
+    const decodeSummary = await decodeBlockFromRaw(client, {
+      blockHash: transfer.blockHash,
+      blockNumber: transfer.blockNumber,
+      lane,
+      rpcClient,
+    });
+
+    await client.query(`RELEASE SAVEPOINT ${savepointName}`);
+    await appendAuditDiscrepancyMetadata(client, {
+      auditId,
+      metadataPatch: {
+        redecode_attempted: true,
+        redecode_retry_count: retryCount,
+        redecode_scope: 'block',
+        redecode_summary: decodeSummary,
+        redecode_trigger: 'replaced_classes',
+        replaced_classes: forensic.replacedClasses,
+      },
+    });
+    return {
+      fatalManualReview: false,
+      retryCount,
+      triggered: true,
+    };
+  } catch (error) {
+    await client.query(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+    await client.query(`RELEASE SAVEPOINT ${savepointName}`);
+    await updateAuditDiscrepancyResolution(client, {
+      auditId,
+      metadataPatch: {
+        redecode_attempted: true,
+        redecode_error: formatError(error),
+        redecode_retry_count: retryCount,
+        redecode_scope: 'block',
+        redecode_trigger: 'replaced_classes',
+      },
+      resolutionStatus: 'decoder_review_required',
+      resolvedBalance: balanceBefore,
+    });
+    return {
+      fatalManualReview: false,
+      retryCount,
+      triggered: false,
+    };
+  }
+}
+
+function buildRedecodeSavepointName(auditId) {
+  return `redecode_${String(auditId).replace(/[^a-zA-Z0-9_]/g, '_')}`;
+}
+
+async function clearDerivedRowsForRedecode(client, { lane, blockNumber }) {
+  const params = [lane, toNumericString(blockNumber, 'redecode block number')];
+  const statements = [
+    'DELETE FROM stark_action_norm WHERE lane = $1 AND block_number = $2',
+    'DELETE FROM stark_transfers WHERE lane = $1 AND block_number = $2',
+    'DELETE FROM stark_bridge_activities WHERE lane = $1 AND block_number = $2',
+    'DELETE FROM stark_unknown_event_audit WHERE lane = $1 AND block_number = $2',
+  ];
+
+  for (const statement of statements) {
+    await client.query(statement, params);
+  }
+}
+
+async function resetRawDecodeStatusesForRedecode(client, { lane, blockNumber }) {
+  const params = [lane, toNumericString(blockNumber, 'redecode block number')];
+  await client.query(
+    `UPDATE stark_tx_raw
+        SET normalized_status = 'PENDING',
+            decode_error = NULL,
+            processed_at = NULL,
+            updated_at = NOW()
+      WHERE lane = $1
+        AND block_number = $2`,
+    params,
+  );
+  await client.query(
+    `UPDATE stark_event_raw
+        SET normalized_status = 'PENDING',
+            decode_error = NULL,
+            processed_at = NULL,
+            updated_at = NOW()
+      WHERE lane = $1
+        AND block_number = $2`,
+    params,
+  );
+}
+
+async function loadDiscrepancyForensics(client, {
+  lane,
+  holderAddress,
+  transfer,
+}) {
+  const [securityResult, registryResult, replacementResult, eventResult] = await Promise.all([
+    client.query(
+      `SELECT is_upgradeable,
+              class_hash,
+              risk_label,
+              security_flags
+         FROM stark_contract_security
+        WHERE contract_address = $1
+        LIMIT 1`,
+      [transfer.tokenAddress],
+    ),
+    client.query(
+      `SELECT protocol,
+              decoder,
+              class_hash,
+              valid_from_block
+         FROM stark_contract_registry
+        WHERE contract_address = $1
+          AND is_active = TRUE
+        ORDER BY COALESCE(valid_from_block, 0) DESC, updated_at DESC
+        LIMIT 1`,
+      [transfer.tokenAddress],
+    ),
+    client.query(
+      `SELECT state.block_number,
+              COALESCE(item ->> 'class_hash', item ->> 'classHash') AS class_hash
+         FROM stark_block_state_updates AS state
+        CROSS JOIN LATERAL jsonb_array_elements(state.replaced_classes) AS item
+        WHERE state.lane = $1
+          AND state.block_number <= $2
+          AND lower(COALESCE(item ->> 'contract_address', item ->> 'address', item ->> 'contractAddress')) = lower($3)
+        ORDER BY state.block_number DESC
+        LIMIT 5`,
+      [lane, toNumericString(transfer.blockNumber, 'discrepancy block number'), transfer.tokenAddress],
+    ),
+    client.query(
+      `SELECT resolved_class_hash
+         FROM stark_event_raw
+        WHERE lane = $1
+          AND block_number = $2
+          AND transaction_hash = $3
+          AND receipt_event_index = $4
+          AND from_address = $5
+        LIMIT 1`,
+      [
+        lane,
+        toNumericString(transfer.blockNumber, 'discrepancy event block number'),
+        transfer.transactionHash,
+        toNumericString(transfer.sourceEventIndex, 'discrepancy source event index'),
+        transfer.tokenAddress,
+      ],
+    ),
+  ]);
+
+  const security = securityResult.rows[0] ?? null;
+  const registry = registryResult.rows[0] ?? null;
+  const replacedClasses = replacementResult.rows.map((row) => ({
+    block_number: row.block_number === null ? null : String(row.block_number),
+    class_hash: row.class_hash ?? null,
+  }));
+  const observedEventClassHash = eventResult.rows[0]?.resolved_class_hash ?? null;
+  const proxyEvidence = Boolean(
+    security?.is_upgradeable
+    || security?.security_flags?.is_proxy
+    || replacedClasses.length > 0
+  );
+
+  return {
+    holderAddress,
+    observedEventClassHash,
+    proxyEvidence,
+    registry: registry === null ? null : {
+      class_hash: registry.class_hash ?? null,
+      decoder: registry.decoder ?? null,
+      protocol: registry.protocol ?? null,
+      valid_from_block: registry.valid_from_block === null ? null : String(registry.valid_from_block),
+    },
+    replacedClasses,
+    security: security === null ? null : {
+      class_hash: security.class_hash ?? null,
+      is_upgradeable: Boolean(security.is_upgradeable),
+      proxy_classification: security.security_flags?.proxy_classification ?? null,
+      proxy_slot_hits: security.security_flags?.proxy_slot_hits ?? [],
+      risk_label: security.risk_label ?? null,
+    },
+    suspectedCause: proxyEvidence
+      ? 'proxy_or_class_upgrade_history'
+      : 'historical_transfer_gap_or_decoder_miss',
+  };
+}
+
+async function insertAuditDiscrepancy(client, {
+  attemptedBalanceAfter,
+  balanceBefore,
+  deltaAmount,
+  forensic,
+  holderAddress,
+  lane,
+  transfer,
+}) {
+  const existing = await client.query(
+    `SELECT audit_id, retry_count
+       FROM stark_audit_discrepancies
+      WHERE lane = $1
+        AND discrepancy_type = 'NEGATIVE_BALANCE_REPLAY'
+        AND transaction_hash = $2
+        AND source_event_index = $3
+        AND token_address = $4
+        AND holder_address = $5
+      ORDER BY audit_id DESC
+      LIMIT 1`,
+    [
+      lane,
+      transfer.transactionHash,
+      toNumericString(transfer.sourceEventIndex, 'audit discrepancy source event index'),
+      transfer.tokenAddress,
+      holderAddress,
+    ],
+  );
+
+  if (existing.rowCount > 0) {
+    const row = existing.rows[0];
+    await client.query(
+      `UPDATE stark_audit_discrepancies
+          SET block_number = $2,
+              block_hash = $3,
+              transaction_index = $4,
+              transfer_key = $5,
+              balance_before = $6,
+              delta_amount = $7,
+              attempted_balance_after = $8,
+              suspected_cause = $9,
+              metadata = COALESCE(metadata, '{}'::jsonb) || $10::jsonb,
+              updated_at = NOW()
+        WHERE audit_id = $1`,
+      [
+        row.audit_id,
+        toNumericString(transfer.blockNumber, 'audit discrepancy block number'),
+        transfer.blockHash,
+        toNumericString(transfer.transactionIndex, 'audit discrepancy transaction index'),
+        transfer.transferKey,
+        toNumericString(balanceBefore, 'audit balance before'),
+        toNumericString(deltaAmount, 'audit delta amount'),
+        toNumericString(attemptedBalanceAfter, 'audit attempted balance after'),
+        forensic.suspectedCause,
+        toJsonbString(forensic),
+      ],
+    );
+
+    return {
+      auditId: BigInt(row.audit_id),
+      retryCount: Number.parseInt(String(row.retry_count ?? 0), 10),
+    };
+  }
+
+  const result = await client.query(
+    `INSERT INTO stark_audit_discrepancies (
+         lane,
+         discrepancy_type,
+         block_number,
+         block_hash,
+         transaction_hash,
+         transaction_index,
+         source_event_index,
+         transfer_key,
+         token_address,
+         holder_address,
+         balance_before,
+         delta_amount,
+         attempted_balance_after,
+         resolution_status,
+         suspected_cause,
+         metadata,
+         retry_count,
+         created_at,
+         updated_at
+     ) VALUES (
+         $1, 'NEGATIVE_BALANCE_REPLAY', $2, $3, $4, $5, $6, $7, $8, $9,
+         $10, $11, $12, 'logged', $13, $14::jsonb, 0, NOW(), NOW()
+     )
+     RETURNING audit_id`,
+    [
+      lane,
+      toNumericString(transfer.blockNumber, 'audit discrepancy block number'),
+      transfer.blockHash,
+      transfer.transactionHash,
+      toNumericString(transfer.transactionIndex, 'audit discrepancy transaction index'),
+      toNumericString(transfer.sourceEventIndex, 'audit discrepancy source event index'),
+      transfer.transferKey,
+      transfer.tokenAddress,
+      holderAddress,
+      toNumericString(balanceBefore, 'audit balance before'),
+      toNumericString(deltaAmount, 'audit delta amount'),
+      toNumericString(attemptedBalanceAfter, 'audit attempted balance after'),
+      forensic.suspectedCause,
+      toJsonbString(forensic),
+    ],
+  );
+
+  return {
+    auditId: BigInt(result.rows[0].audit_id),
+    retryCount: 0,
+  };
+}
+
+async function incrementAuditDiscrepancyRetryCount(client, { auditId }) {
+  const result = await client.query(
+    `UPDATE stark_audit_discrepancies
+        SET retry_count = retry_count + 1,
+            updated_at = NOW()
+      WHERE audit_id = $1
+      RETURNING retry_count`,
+    [String(auditId)],
+  );
+
+  return Number.parseInt(String(result.rows[0]?.retry_count ?? 0), 10);
+}
+
+async function updateAuditDiscrepancyResolution(client, {
+  auditId,
+  metadataPatch = {},
+  resolutionStatus,
+  resolvedBalance,
+}) {
+  await client.query(
+    `UPDATE stark_audit_discrepancies
+        SET resolved_balance = $2,
+            resolution_status = $3,
+            metadata = COALESCE(metadata, '{}'::jsonb) || $4::jsonb,
+            updated_at = NOW()
+      WHERE audit_id = $1`,
+    [
+      String(auditId),
+      toNumericString(resolvedBalance, 'resolved discrepancy balance'),
+      resolutionStatus,
+      toJsonbString(metadataPatch),
+    ],
+  );
+}
+
+async function appendAuditDiscrepancyMetadata(client, { auditId, metadataPatch = {} }) {
+  await client.query(
+    `UPDATE stark_audit_discrepancies
+        SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
+            updated_at = NOW()
+      WHERE audit_id = $1`,
+    [
+      String(auditId),
+      toJsonbString(metadataPatch),
+    ],
+  );
+}
+
+async function safeReadBalanceOfAtBlock(rpcClient, { blockNumber, holderAddress, tokenAddress }) {
+  if (!rpcClient || typeof rpcClient.callContract !== 'function') {
+    return null;
+  }
+
+  try {
+    const result = await rpcClient.callContract({
+      blockId: blockNumber,
+      calldata: [holderAddress],
+      contractAddress: tokenAddress,
+      entrypoint: 'balanceOf',
+    });
+    return parseU256FromArray(result, 0, 'balanceOf');
+  } catch (error) {
+    return null;
+  }
 }
 
 function buildConcentrationRows({ balanceState, lane, maxBlockNumber, tokenContext }) {

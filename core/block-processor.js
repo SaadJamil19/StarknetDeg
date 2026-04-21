@@ -1,7 +1,7 @@
 'use strict';
 
 const { toBigIntStrict, toNumericString } = require('../lib/cairo/bigint');
-const { withTransaction } = require('../lib/db');
+const { withClient, withTransaction } = require('../lib/db');
 const { normalizeL1HandlerSender } = require('./bridge');
 const { advanceCheckpoint, ensureIndexStateRows, getCheckpoint } = require('./checkpoint');
 const { decodeBlockFromRaw } = require('./event-router');
@@ -13,7 +13,36 @@ const { persistPriceDataForBlock, resetLatestPricesForBlock } = require('./price
 const { persistOhlcvForBlock } = require('./ohlcv');
 const { publishBlockRealtimeUpdates } = require('./realtime');
 
-async function processAcceptedBlock({ rpcClient, indexerKey, lane = FINALITY_LANES.ACCEPTED_ON_L2, blockNumber }) {
+const TURBO_BACKFILL_LIVE_BUFFER_BLOCKS = 1000n;
+const TURBO_BACKFILL_INDEX_DEFS = Object.freeze([
+  { name: 'stark_transfers_block_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_transfers_block_idx ON stark_transfers (lane, block_number, transaction_index, source_event_index)' },
+  { name: 'stark_transfers_token_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_transfers_token_idx ON stark_transfers (token_address, block_number)' },
+  { name: 'stark_transfers_address_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_transfers_address_idx ON stark_transfers (from_address, to_address)' },
+  { name: 'stark_transfers_tx_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_transfers_tx_idx ON stark_transfers (lane, transaction_hash, source_event_index)' },
+  { name: 'stark_trades_block_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_block_idx ON stark_trades (lane, block_number, transaction_index, source_event_index)' },
+  { name: 'stark_trades_pool_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_pool_idx ON stark_trades (lane, pool_id, block_timestamp)' },
+  { name: 'stark_trades_bucket_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_bucket_idx ON stark_trades (lane, bucket_1m, pool_id)' },
+  { name: 'stark_trades_token_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_token_idx ON stark_trades (token_in_address, token_out_address, block_number)' },
+  { name: 'stark_trades_pending_enrichment_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_pending_enrichment_idx ON stark_trades (pending_enrichment, lane, block_number) WHERE pending_enrichment = TRUE' },
+  { name: 'stark_trades_route_group_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_route_group_idx ON stark_trades (lane, route_group_key, transaction_hash)' },
+  { name: 'stark_trades_tx_sequence_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_tx_sequence_idx ON stark_trades (lane, transaction_hash, transaction_index, source_event_index)' },
+  { name: 'stark_trades_route_sequence_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_trades_route_sequence_idx ON stark_trades (lane, route_group_key, sequence_id)' },
+  { name: 'st_l1_wallet_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS st_l1_wallet_idx ON stark_trades (l1_wallet_address) WHERE l1_wallet_address IS NOT NULL' },
+  { name: 'st_post_bridge_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS st_post_bridge_idx ON stark_trades (is_post_bridge_trade, block_timestamp) WHERE is_post_bridge_trade = TRUE' },
+]);
+const turboBackfillIndexState = {
+  historicalMode: null,
+};
+
+async function processAcceptedBlock({
+  rpcClient,
+  indexerKey,
+  lane = FINALITY_LANES.ACCEPTED_ON_L2,
+  blockNumber,
+  prefetchedPayload = null,
+  skipRealtime = false,
+  turboMode = false,
+}) {
   if (!rpcClient) {
     throw new Error('rpcClient is required.');
   }
@@ -25,19 +54,17 @@ async function processAcceptedBlock({ rpcClient, indexerKey, lane = FINALITY_LAN
     throw new Error(`Phase 3 canonical processor only supports ${FINALITY_LANES.ACCEPTED_ON_L2}. Received ${canonicalLane}.`);
   }
 
-  const [block, stateUpdate] = await Promise.all([
-    rpcClient.getBlockWithReceipts(requestedBlockNumber),
-    rpcClient.getStateUpdate(requestedBlockNumber),
-  ]);
-
-  const normalized = normalizeFetchedBlock({ block, requestedBlockNumber, stateUpdate });
-  const emitterClassHashes = await resolveEmitterClassHashes({
-    block: normalized.block,
-    blockNumber: normalized.blockNumber,
-    rpcClient,
-  });
+  const payload = prefetchedPayload ?? await fetchAcceptedBlockPayload({ blockNumber: requestedBlockNumber, rpcClient });
+  const { emitterClassHashes, normalized } = payload;
+  if (normalized.blockNumber !== requestedBlockNumber) {
+    throw new Error(`Prefetched payload block mismatch. Requested ${requestedBlockNumber.toString()}, received ${normalized.blockNumber.toString()}.`);
+  }
 
   const committed = await withTransaction(async (client) => {
+    if (turboMode) {
+      await applyTurboSessionSettings(client);
+    }
+
     await ensureIndexStateRows(client, indexerKey);
 
     const checkpoint = await getCheckpoint(client, {
@@ -157,17 +184,205 @@ async function processAcceptedBlock({ rpcClient, indexerKey, lane = FINALITY_LAN
   let realtimeSummary = null;
   let realtimeError = null;
 
-  try {
-    realtimeSummary = await publishBlockRealtimeUpdates(committed.realtimePayload);
-  } catch (error) {
-    realtimeError = error.stack || error.message || String(error);
+  if (!skipRealtime) {
+    try {
+      realtimeSummary = await publishBlockRealtimeUpdates(committed.realtimePayload);
+    } catch (error) {
+      realtimeError = error.stack || error.message || String(error);
+    }
   }
 
   return {
     ...committed,
     realtimeError,
+    realtimeSkipped: Boolean(skipRealtime),
     realtimeSummary,
   };
+}
+
+async function fetchAcceptedBlockPayload({ rpcClient, blockNumber }) {
+  const requestedBlockNumber = toBigIntStrict(blockNumber, 'block number');
+  const [block, stateUpdate] = await Promise.all([
+    rpcClient.getBlockWithReceipts(requestedBlockNumber),
+    rpcClient.getStateUpdate(requestedBlockNumber),
+  ]);
+
+  const normalized = normalizeFetchedBlock({ block, requestedBlockNumber, stateUpdate });
+  const emitterClassHashes = await resolveEmitterClassHashes({
+    block: normalized.block,
+    blockNumber: normalized.blockNumber,
+    rpcClient,
+  });
+
+  return { emitterClassHashes, normalized };
+}
+
+async function prefetchAcceptedBlockPayloads({ blockNumbers, concurrency = 4, rpcClient }) {
+  const numbers = Array.from(blockNumbers ?? []);
+  const results = new Array(numbers.length);
+  let cursor = 0;
+
+  const workers = Array.from({ length: Math.max(1, Math.min(concurrency, numbers.length || 1)) }, async () => {
+    while (cursor < numbers.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await fetchAcceptedBlockPayload({ blockNumber: numbers[index], rpcClient });
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
+}
+
+async function applyTurboSessionSettings(client) {
+  await client.query('SET LOCAL synchronous_commit = OFF');
+}
+
+async function reconcileTurboBackfillIndexes({
+  blockNumber = null,
+  forceRestore = false,
+  latestHead = null,
+  turboMode = false,
+} = {}) {
+  const normalizedBlockNumber = blockNumber === null || blockNumber === undefined
+    ? null
+    : toBigIntStrict(blockNumber, 'turbo index block number');
+  const normalizedLatestHead = latestHead === null || latestHead === undefined
+    ? null
+    : toBigIntStrict(latestHead, 'turbo index latest head');
+  const historicalMode = Boolean(
+    turboMode
+    && !forceRestore
+    && normalizedBlockNumber !== null
+    && normalizedLatestHead !== null
+    && normalizedBlockNumber < (normalizedLatestHead - TURBO_BACKFILL_LIVE_BUFFER_BLOCKS)
+  );
+
+  return withClient(async (client) => {
+    const indexIssues = await findTurboBackfillIndexIssues(client);
+
+    if (historicalMode) {
+      if (turboBackfillIndexState.historicalMode === true) {
+        return {
+          action: 'noop',
+          changed: false,
+          historicalMode,
+          indexCount: TURBO_BACKFILL_INDEX_DEFS.length,
+          invalidIndexes: 0,
+          missingIndexes: 0,
+        };
+      }
+
+      await dropTurboBackfillIndexes(client);
+      turboBackfillIndexState.historicalMode = true;
+      return {
+        action: 'dropped',
+        changed: true,
+        historicalMode,
+        indexCount: TURBO_BACKFILL_INDEX_DEFS.length,
+        invalidIndexes: indexIssues.invalid.length,
+        missingIndexes: indexIssues.missing.length,
+      };
+    }
+
+    if (
+      turboBackfillIndexState.historicalMode === false
+      && indexIssues.missing.length === 0
+      && indexIssues.invalid.length === 0
+      && !forceRestore
+    ) {
+      return {
+        action: 'noop',
+        changed: false,
+        historicalMode,
+        indexCount: TURBO_BACKFILL_INDEX_DEFS.length,
+        invalidIndexes: 0,
+        missingIndexes: 0,
+      };
+    }
+
+    if (
+      turboBackfillIndexState.historicalMode === true
+      || indexIssues.missing.length > 0
+      || indexIssues.invalid.length > 0
+      || forceRestore
+    ) {
+      if (indexIssues.invalid.length > 0) {
+        await dropTurboBackfillIndexes(client, { names: indexIssues.invalid });
+      }
+      await createTurboBackfillIndexes(client);
+      const postCreateIssues = await findTurboBackfillIndexIssues(client);
+      if (postCreateIssues.missing.length > 0 || postCreateIssues.invalid.length > 0) {
+        throw new Error(
+          `Turbo index health check failed. missing=${postCreateIssues.missing.join(',') || 'none'} invalid=${postCreateIssues.invalid.join(',') || 'none'}`,
+        );
+      }
+      await vacuumAnalyzeTurboBackfillTables(client);
+      turboBackfillIndexState.historicalMode = false;
+      return {
+        action: 'rebuilt',
+        changed: true,
+        historicalMode,
+        indexCount: TURBO_BACKFILL_INDEX_DEFS.length,
+        invalidIndexes: 0,
+        missingIndexes: 0,
+        vacuumAnalyzed: true,
+      };
+    }
+
+    turboBackfillIndexState.historicalMode = false;
+    return {
+      action: 'noop',
+      changed: false,
+      historicalMode,
+      indexCount: TURBO_BACKFILL_INDEX_DEFS.length,
+      invalidIndexes: 0,
+      missingIndexes: 0,
+      vacuumAnalyzed: false,
+    };
+  });
+}
+
+async function findTurboBackfillIndexIssues(client) {
+  const expectedNames = TURBO_BACKFILL_INDEX_DEFS.map((entry) => entry.name);
+  const result = await client.query(
+    `SELECT class.relname AS indexname,
+            COALESCE(index_meta.indisvalid, FALSE) AS indisvalid
+       FROM pg_class AS class
+       LEFT JOIN pg_index AS index_meta
+              ON index_meta.indexrelid = class.oid
+      WHERE class.relkind = 'i'
+        AND class.relname = ANY($1::text[])`,
+    [expectedNames],
+  );
+
+  const existing = new Map(result.rows.map((row) => [row.indexname, Boolean(row.indisvalid)]));
+  return {
+    invalid: expectedNames.filter((name) => existing.has(name) && existing.get(name) === false),
+    missing: expectedNames.filter((name) => !existing.has(name)),
+  };
+}
+
+async function dropTurboBackfillIndexes(client, { names = null } = {}) {
+  const allowedNames = new Set(TURBO_BACKFILL_INDEX_DEFS.map((entry) => entry.name));
+  const targetNames = (names ?? TURBO_BACKFILL_INDEX_DEFS.map((entry) => entry.name))
+    .filter((name) => allowedNames.has(name));
+
+  for (const name of targetNames) {
+    await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${name}`);
+  }
+}
+
+async function createTurboBackfillIndexes(client) {
+  for (const entry of TURBO_BACKFILL_INDEX_DEFS) {
+    await client.query(entry.createSql);
+  }
+}
+
+async function vacuumAnalyzeTurboBackfillTables(client) {
+  for (const tableName of ['stark_transfers', 'stark_trades']) {
+    await client.query(`VACUUM ANALYZE ${tableName}`);
+  }
 }
 
 function normalizeFetchedBlock({ block, stateUpdate, requestedBlockNumber }) {
@@ -422,6 +637,9 @@ async function upsertBlockStateUpdate(client, { lane, normalized }) {
 async function upsertRawArtifacts(client, { emitterClassHashes, lane, normalized }) {
   const blockHash = normalized.block.block_hash;
   const transactions = Array.isArray(normalized.block.transactions) ? normalized.block.transactions : [];
+  const txRows = [];
+  const eventRows = [];
+  const messageRows = [];
 
   for (let transactionIndex = 0; transactionIndex < transactions.length; transactionIndex += 1) {
     const item = transactions[transactionIndex] ?? {};
@@ -435,6 +653,92 @@ async function upsertRawArtifacts(client, { emitterClassHashes, lane, normalized
     const contractAddress = normalizeOptionalAddress(transaction.contract_address ?? receipt.contract_address, 'tx.contract_address');
     const calldata = Array.isArray(transaction.calldata) ? normalizeHexArray(transaction.calldata, 'tx.calldata') : [];
     const l1SenderAddress = txType === 'L1_HANDLER' ? normalizeL1HandlerSender(calldata) : null;
+
+    txRows.push([
+      lane,
+      toNumericString(normalized.blockNumber, 'block number'),
+      blockHash,
+      toNumericString(transactionIndex, 'transaction index'),
+      transactionHash,
+      txType,
+      finalityStatus,
+      executionStatus,
+      senderAddress,
+      contractAddress,
+      l1SenderAddress,
+      normalizeOptionalHexText(transaction.nonce),
+      toNullableNumeric(receipt.actual_fee?.amount),
+      receipt.actual_fee?.unit ?? null,
+      toNumericString((receipt.events ?? []).length, 'events count'),
+      toNumericString((receipt.messages_sent ?? []).length, 'messages sent count'),
+      receipt.revert_reason ?? null,
+      JSON.stringify(calldata),
+      JSON.stringify(transaction),
+      JSON.stringify(receipt),
+    ]);
+
+    const events = Array.isArray(receipt.events) ? receipt.events : [];
+    for (let receiptEventIndex = 0; receiptEventIndex < events.length; receiptEventIndex += 1) {
+      const rawEvent = events[receiptEventIndex];
+      const fromAddress = normalizeAddress(rawEvent.from_address, 'event.from_address');
+      const keys = normalizeHexArray(rawEvent.keys ?? [], 'event.keys');
+      const data = normalizeHexArray(rawEvent.data ?? [], 'event.data');
+      const selector = keys[0] ?? normalizeSelector(0, 'event.selector');
+      const resolvedClassHash = emitterClassHashes.get(fromAddress) ?? null;
+
+      eventRows.push([
+        lane,
+        toNumericString(normalized.blockNumber, 'block number'),
+        blockHash,
+        transactionHash,
+        toNumericString(transactionIndex, 'transaction index'),
+        toNumericString(receiptEventIndex, 'receipt event index'),
+        finalityStatus,
+        executionStatus,
+        fromAddress,
+        selector,
+        resolvedClassHash,
+        JSON.stringify(keys),
+        JSON.stringify(data),
+        JSON.stringify(rawEvent),
+      ]);
+    }
+
+    const messages = Array.isArray(receipt.messages_sent) ? receipt.messages_sent : [];
+    for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+      const rawMessage = messages[messageIndex];
+      const payload = normalizeHexArray(rawMessage.payload ?? [], 'message.payload');
+
+      messageRows.push([
+        lane,
+        toNumericString(normalized.blockNumber, 'block number'),
+        blockHash,
+        transactionHash,
+        toNumericString(transactionIndex, 'transaction index'),
+        toNumericString(messageIndex, 'message index'),
+        normalizeAddress(rawMessage.from_address, 'message.from_address'),
+        normalizeAddress(rawMessage.to_address, 'message.to_address'),
+        JSON.stringify(payload),
+        JSON.stringify(rawMessage),
+      ]);
+    }
+  }
+
+  await bulkUpsertTxRaw(client, txRows);
+  await bulkUpsertEventRaw(client, eventRows);
+  await bulkUpsertMessages(client, messageRows);
+}
+
+async function bulkUpsertTxRaw(client, rows) {
+  if (rows.length === 0) {
+    return;
+  }
+
+  for (const chunk of chunkRows(rows, 250)) {
+    const { params, valuesSql } = buildValuesSql(chunk, (offset) => {
+      const placeholders = Array.from({ length: 17 }, (_, index) => `$${offset + index}`);
+      return `(${placeholders.join(', ')}, 'PENDING', NULL, $${offset + 17}::jsonb, $${offset + 18}::jsonb, $${offset + 19}::jsonb, NOW(), NOW(), NULL)`;
+    });
 
     await client.query(
       `INSERT INTO stark_tx_raw (
@@ -463,10 +767,7 @@ async function upsertRawArtifacts(client, { emitterClassHashes, lane, normalized
            created_at,
            updated_at,
            processed_at
-       ) VALUES (
-           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-           $11, $12, $13, $14, $15, $16, $17, 'PENDING', NULL, $18::jsonb, $19::jsonb, $20::jsonb, NOW(), NOW(), NULL
-       )
+       ) VALUES ${valuesSql}
        ON CONFLICT (lane, block_number, transaction_hash)
        DO UPDATE SET
            block_hash = EXCLUDED.block_hash,
@@ -490,145 +791,128 @@ async function upsertRawArtifacts(client, { emitterClassHashes, lane, normalized
            raw_receipt = EXCLUDED.raw_receipt,
            processed_at = NULL,
            updated_at = NOW()`,
-      [
-        lane,
-        toNumericString(normalized.blockNumber, 'block number'),
-        blockHash,
-        toNumericString(transactionIndex, 'transaction index'),
-        transactionHash,
-        txType,
-        finalityStatus,
-        executionStatus,
-        senderAddress,
-        contractAddress,
-        l1SenderAddress,
-        normalizeOptionalHexText(transaction.nonce),
-        toNullableNumeric(receipt.actual_fee?.amount),
-        receipt.actual_fee?.unit ?? null,
-        toNumericString((receipt.events ?? []).length, 'events count'),
-        toNumericString((receipt.messages_sent ?? []).length, 'messages sent count'),
-        receipt.revert_reason ?? null,
-        JSON.stringify(calldata),
-        JSON.stringify(transaction),
-        JSON.stringify(receipt),
-      ],
+      params,
     );
-
-    const events = Array.isArray(receipt.events) ? receipt.events : [];
-    for (let receiptEventIndex = 0; receiptEventIndex < events.length; receiptEventIndex += 1) {
-      const rawEvent = events[receiptEventIndex];
-      const fromAddress = normalizeAddress(rawEvent.from_address, 'event.from_address');
-      const keys = normalizeHexArray(rawEvent.keys ?? [], 'event.keys');
-      const data = normalizeHexArray(rawEvent.data ?? [], 'event.data');
-      const selector = keys[0] ?? normalizeSelector(0, 'event.selector');
-      const resolvedClassHash = emitterClassHashes.get(fromAddress) ?? null;
-
-      await client.query(
-        `INSERT INTO stark_event_raw (
-             lane,
-             block_number,
-             block_hash,
-             transaction_hash,
-             transaction_index,
-             receipt_event_index,
-             finality_status,
-             transaction_execution_status,
-             from_address,
-             selector,
-             resolved_class_hash,
-             normalized_status,
-             decode_error,
-             keys,
-             data,
-             raw_event,
-             created_at,
-             updated_at,
-             processed_at
-         ) VALUES (
-             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-             $11, 'PENDING', NULL, $12::jsonb, $13::jsonb, $14::jsonb, NOW(), NOW(), NULL
-         )
-         ON CONFLICT (lane, block_number, transaction_hash, receipt_event_index)
-         DO UPDATE SET
-             block_hash = EXCLUDED.block_hash,
-             transaction_index = EXCLUDED.transaction_index,
-             finality_status = EXCLUDED.finality_status,
-             transaction_execution_status = EXCLUDED.transaction_execution_status,
-             from_address = EXCLUDED.from_address,
-             selector = EXCLUDED.selector,
-             resolved_class_hash = EXCLUDED.resolved_class_hash,
-             normalized_status = 'PENDING',
-             decode_error = NULL,
-             keys = EXCLUDED.keys,
-             data = EXCLUDED.data,
-             raw_event = EXCLUDED.raw_event,
-             processed_at = NULL,
-             updated_at = NOW()`,
-        [
-          lane,
-          toNumericString(normalized.blockNumber, 'block number'),
-          blockHash,
-          transactionHash,
-          toNumericString(transactionIndex, 'transaction index'),
-          toNumericString(receiptEventIndex, 'receipt event index'),
-          finalityStatus,
-          executionStatus,
-          fromAddress,
-          selector,
-          resolvedClassHash,
-          JSON.stringify(keys),
-          JSON.stringify(data),
-          JSON.stringify(rawEvent),
-        ],
-      );
-    }
-
-    const messages = Array.isArray(receipt.messages_sent) ? receipt.messages_sent : [];
-    for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
-      const rawMessage = messages[messageIndex];
-      const payload = normalizeHexArray(rawMessage.payload ?? [], 'message.payload');
-
-      await client.query(
-        `INSERT INTO stark_message_l2_to_l1 (
-             lane,
-             block_number,
-             block_hash,
-             transaction_hash,
-             transaction_index,
-             message_index,
-             from_address,
-             to_address,
-             payload,
-             raw_message,
-             created_at,
-             updated_at
-         ) VALUES (
-             $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, NOW(), NOW()
-         )
-         ON CONFLICT (lane, block_number, transaction_hash, message_index)
-         DO UPDATE SET
-             block_hash = EXCLUDED.block_hash,
-             transaction_index = EXCLUDED.transaction_index,
-             from_address = EXCLUDED.from_address,
-             to_address = EXCLUDED.to_address,
-             payload = EXCLUDED.payload,
-             raw_message = EXCLUDED.raw_message,
-             updated_at = NOW()`,
-        [
-          lane,
-          toNumericString(normalized.blockNumber, 'block number'),
-          blockHash,
-          transactionHash,
-          toNumericString(transactionIndex, 'transaction index'),
-          toNumericString(messageIndex, 'message index'),
-          normalizeAddress(rawMessage.from_address, 'message.from_address'),
-          normalizeAddress(rawMessage.to_address, 'message.to_address'),
-          JSON.stringify(payload),
-          JSON.stringify(rawMessage),
-        ],
-      );
-    }
   }
+}
+
+async function bulkUpsertEventRaw(client, rows) {
+  if (rows.length === 0) {
+    return;
+  }
+
+  for (const chunk of chunkRows(rows, 500)) {
+    const { params, valuesSql } = buildValuesSql(chunk, (offset) => {
+      const placeholders = Array.from({ length: 11 }, (_, index) => `$${offset + index}`);
+      return `(${placeholders.join(', ')}, 'PENDING', NULL, $${offset + 11}::jsonb, $${offset + 12}::jsonb, $${offset + 13}::jsonb, NOW(), NOW(), NULL)`;
+    });
+
+    await client.query(
+      `INSERT INTO stark_event_raw (
+           lane,
+           block_number,
+           block_hash,
+           transaction_hash,
+           transaction_index,
+           receipt_event_index,
+           finality_status,
+           transaction_execution_status,
+           from_address,
+           selector,
+           resolved_class_hash,
+           normalized_status,
+           decode_error,
+           keys,
+           data,
+           raw_event,
+           created_at,
+           updated_at,
+           processed_at
+       ) VALUES ${valuesSql}
+       ON CONFLICT (lane, block_number, transaction_hash, receipt_event_index)
+       DO UPDATE SET
+           block_hash = EXCLUDED.block_hash,
+           transaction_index = EXCLUDED.transaction_index,
+           finality_status = EXCLUDED.finality_status,
+           transaction_execution_status = EXCLUDED.transaction_execution_status,
+           from_address = EXCLUDED.from_address,
+           selector = EXCLUDED.selector,
+           resolved_class_hash = EXCLUDED.resolved_class_hash,
+           normalized_status = 'PENDING',
+           decode_error = NULL,
+           keys = EXCLUDED.keys,
+           data = EXCLUDED.data,
+           raw_event = EXCLUDED.raw_event,
+           processed_at = NULL,
+           updated_at = NOW()`,
+      params,
+    );
+  }
+}
+
+async function bulkUpsertMessages(client, rows) {
+  if (rows.length === 0) {
+    return;
+  }
+
+  for (const chunk of chunkRows(rows, 500)) {
+    const { params, valuesSql } = buildValuesSql(chunk, (offset) => {
+      const placeholders = Array.from({ length: 8 }, (_, index) => `$${offset + index}`);
+      return `(${placeholders.join(', ')}, $${offset + 8}::jsonb, $${offset + 9}::jsonb, NOW(), NOW())`;
+    });
+
+    await client.query(
+      `INSERT INTO stark_message_l2_to_l1 (
+           lane,
+           block_number,
+           block_hash,
+           transaction_hash,
+           transaction_index,
+           message_index,
+           from_address,
+           to_address,
+           payload,
+           raw_message,
+           created_at,
+           updated_at
+       ) VALUES ${valuesSql}
+       ON CONFLICT (lane, block_number, transaction_hash, message_index)
+       DO UPDATE SET
+           block_hash = EXCLUDED.block_hash,
+           transaction_index = EXCLUDED.transaction_index,
+           from_address = EXCLUDED.from_address,
+           to_address = EXCLUDED.to_address,
+           payload = EXCLUDED.payload,
+           raw_message = EXCLUDED.raw_message,
+           updated_at = NOW()`,
+      params,
+    );
+  }
+}
+
+function buildValuesSql(rows, buildValueGroup) {
+  const params = [];
+  const groups = [];
+  let offset = 1;
+
+  for (const row of rows) {
+    groups.push(buildValueGroup(offset));
+    params.push(...row);
+    offset += row.length;
+  }
+
+  return {
+    params,
+    valuesSql: groups.join(', '),
+  };
+}
+
+function chunkRows(rows, chunkSize) {
+  const chunks = [];
+  for (let index = 0; index < rows.length; index += chunkSize) {
+    chunks.push(rows.slice(index, index + chunkSize));
+  }
+  return chunks;
 }
 
 function resolveStateDiffLength(normalized) {
@@ -719,5 +1003,8 @@ function normalizeOptionalHexText(value) {
 }
 
 module.exports = {
+  fetchAcceptedBlockPayload,
+  prefetchAcceptedBlockPayloads,
   processAcceptedBlock,
+  reconcileTurboBackfillIndexes,
 };

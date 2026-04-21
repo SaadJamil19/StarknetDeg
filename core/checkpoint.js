@@ -42,6 +42,16 @@ const PHASE6_TABLES = Object.freeze([
   'stark_leaderboards',
   'stark_whale_alert_candidates',
 ]);
+const FULL_NODE_PLAN2_TABLES = Object.freeze([
+  'stark_audit_discrepancies',
+]);
+const FINANCIAL_RESILIENCE_COLUMNS = Object.freeze([
+  { table: 'stark_wallet_positions', column: 'dust_loss_usd' },
+  { table: 'stark_wallet_stats', column: 'total_dust_loss_usd' },
+]);
+const PROTOCOL_ACCURACY_COLUMNS = Object.freeze([
+  { table: 'stark_audit_discrepancies', column: 'retry_count' },
+]);
 const SCHEMA_ENHANCEMENT_TABLES = Object.freeze([
   'tokens',
 ]);
@@ -120,6 +130,18 @@ async function assertPhase6Tables(client) {
 async function assertL1Tables(client) {
   await assertTablesExist(client, L1_TABLES, 'L1 integration', 'sql/0010_l1_new_tables.sql');
   await assertColumnsExist(client, L1_COLUMNS, 'L1 integration', 'sql/0011_l1_alter_tables.sql');
+}
+
+async function assertFullNodePlan2Tables(client) {
+  await assertTablesExist(client, FULL_NODE_PLAN2_TABLES, 'Full Node Plan 2', 'sql/0014_full_node_plan2.sql');
+}
+
+async function assertFinancialResilienceColumns(client) {
+  await assertColumnsExist(client, FINANCIAL_RESILIENCE_COLUMNS, 'Financial resilience', 'sql/0015_financial_resilience.sql');
+}
+
+async function assertProtocolAccuracyColumns(client) {
+  await assertColumnsExist(client, PROTOCOL_ACCURACY_COLUMNS, 'Protocol accuracy', 'sql/0016_protocol_accuracy.sql');
 }
 
 async function assertSchemaEnhancementTables(client) {
@@ -209,6 +231,167 @@ async function ensureIndexStateRows(client, indexerKey) {
   }
 }
 
+async function getBlockJournalRange(client, { lane } = {}) {
+  const params = [];
+  const laneClause = lane ? 'WHERE lane = $1' : '';
+  if (lane) {
+    params.push(assertValidFinalityLane(lane));
+  }
+
+  const result = await client.query(
+    `SELECT lane,
+            COUNT(*) AS row_count,
+            MIN(block_number) AS min_block_number,
+            MAX(block_number) AS max_block_number,
+            COUNT(*) FILTER (WHERE is_orphaned = TRUE) AS orphaned_count
+       FROM stark_block_journal
+       ${laneClause}
+      GROUP BY lane
+      ORDER BY lane`,
+    params,
+  );
+
+  return result.rows.map((row) => ({
+    lane: row.lane,
+    maxBlockNumber: row.max_block_number === null ? null : BigInt(row.max_block_number),
+    minBlockNumber: row.min_block_number === null ? null : BigInt(row.min_block_number),
+    orphanedCount: BigInt(row.orphaned_count ?? 0),
+    rowCount: BigInt(row.row_count ?? 0),
+  }));
+}
+
+async function resolveInitialIndexerStartBlock(client, {
+  configuredStartBlock = null,
+  lane = FINALITY_LANES.ACCEPTED_ON_L2,
+  startMode = 'genesis',
+  startTargets = [],
+} = {}) {
+  if (configuredStartBlock !== null && configuredStartBlock !== undefined) {
+    return toNonNegativeBigInt(configuredStartBlock, 'configured start block');
+  }
+
+  const normalizedMode = String(startMode || 'genesis').trim().toLowerCase();
+  if (normalizedMode === 'genesis' || normalizedMode === 'block_0' || normalizedMode === 'block0') {
+    return 0n;
+  }
+
+  if (normalizedMode === 'tracked_deployment' || normalizedMode === 'deployment' || normalizedMode === 'deployments') {
+    const deploymentStartBlock = await getTrackedDeploymentStartBlock(client, {
+      lane,
+      targets: startTargets,
+    });
+    return deploymentStartBlock ?? 0n;
+  }
+
+  throw new Error(`Unsupported INDEXER_START_MODE: ${startMode}. Use genesis or tracked_deployment.`);
+}
+
+async function getTrackedDeploymentStartBlock(client, {
+  lane = FINALITY_LANES.ACCEPTED_ON_L2,
+  targets = [],
+} = {}) {
+  const validLane = assertValidFinalityLane(lane);
+  const normalizedTargets = normalizeStartTargets(targets);
+
+  if (normalizedTargets.length > 0) {
+    const result = await client.query(
+      `WITH matched_token_addresses AS (
+         SELECT lower(address) AS contract_address
+           FROM tokens
+          WHERE lower(address) = ANY($2::text[])
+             OR lower(symbol) = ANY($2::text[])
+             OR lower(name) = ANY($2::text[])
+       ),
+       matched_registry_rows AS (
+         SELECT lower(contract_address) AS contract_address,
+                valid_from_block
+           FROM stark_contract_registry
+          WHERE is_active = TRUE
+            AND contract_address IS NOT NULL
+            AND (
+                 lower(contract_address) = ANY($2::text[])
+              OR lower(protocol) = ANY($2::text[])
+              OR lower(COALESCE(role, '')) = ANY($2::text[])
+            )
+       ),
+       target_addresses AS (
+         SELECT contract_address FROM matched_token_addresses
+         UNION
+         SELECT contract_address FROM matched_registry_rows
+       ),
+       registry_start AS (
+         SELECT MIN(valid_from_block) AS block_number
+           FROM matched_registry_rows
+          WHERE valid_from_block IS NOT NULL
+            AND valid_from_block > 0
+       ),
+       observed_deployments AS (
+         SELECT MIN(state.block_number) AS block_number
+           FROM stark_block_state_updates AS state
+          CROSS JOIN LATERAL jsonb_array_elements(state.deployed_contracts) AS deploy_item
+          WHERE state.lane = $1
+            AND lower(COALESCE(deploy_item ->> 'contract_address', deploy_item ->> 'address')) IN (
+                SELECT contract_address
+                  FROM target_addresses
+            )
+       )
+       SELECT MIN(block_number) AS block_number
+         FROM (
+           SELECT block_number FROM registry_start
+           UNION ALL
+           SELECT block_number FROM observed_deployments
+         ) AS starts
+        WHERE block_number IS NOT NULL`,
+      [validLane, normalizedTargets],
+    );
+
+    const value = result.rows[0]?.block_number ?? null;
+    return value === null ? null : BigInt(value);
+  }
+
+  const result = await client.query(
+    `WITH registry_start AS (
+       SELECT MIN(valid_from_block) AS block_number
+         FROM stark_contract_registry
+        WHERE is_active = TRUE
+          AND valid_from_block IS NOT NULL
+          AND valid_from_block > 0
+     ),
+     observed_deployments AS (
+       SELECT MIN(state.block_number) AS block_number
+         FROM stark_block_state_updates AS state
+        CROSS JOIN LATERAL jsonb_array_elements(state.deployed_contracts) AS deploy_item
+        WHERE state.lane = $1
+          AND lower(COALESCE(deploy_item ->> 'contract_address', deploy_item ->> 'address')) IN (
+              SELECT lower(address) FROM tokens
+              UNION
+              SELECT lower(contract_address)
+                FROM stark_contract_registry
+               WHERE is_active = TRUE
+                 AND contract_address IS NOT NULL
+          )
+     )
+     SELECT MIN(block_number) AS block_number
+       FROM (
+         SELECT block_number FROM registry_start
+         UNION ALL
+         SELECT block_number FROM observed_deployments
+       ) AS starts
+      WHERE block_number IS NOT NULL`,
+    [validLane],
+  );
+
+  const value = result.rows[0]?.block_number ?? null;
+  return value === null ? null : BigInt(value);
+}
+
+function normalizeStartTargets(value) {
+  const rawValues = Array.isArray(value) ? value : String(value ?? '').split(',');
+  return rawValues
+    .map((item) => String(item ?? '').trim().toLowerCase())
+    .filter((item) => item.length > 0);
+}
+
 async function getCheckpoint(client, { indexerKey, lane, forUpdate = false }) {
   const validLane = assertValidFinalityLane(lane);
   const lockClause = forUpdate ? ' FOR UPDATE' : '';
@@ -274,6 +457,15 @@ function mapCheckpointRow(row) {
   };
 }
 
+function toNonNegativeBigInt(value, label) {
+  const parsed = BigInt(value);
+  if (parsed < 0n) {
+    throw new Error(`${label} cannot be negative.`);
+  }
+
+  return parsed;
+}
+
 module.exports = {
   assertFoundationTables,
   assertPhase2Tables,
@@ -281,6 +473,9 @@ module.exports = {
   assertPhase4Tables,
   assertPhase6Tables,
   assertL1Tables,
+  assertFullNodePlan2Tables,
+  assertFinancialResilienceColumns,
+  assertProtocolAccuracyColumns,
   assertSchemaEnhancementTables,
   assertSchemaEnhancementViews,
   assertMetadataSyncTables,
@@ -288,5 +483,8 @@ module.exports = {
   assertTradeChainingTables,
   advanceCheckpoint,
   ensureIndexStateRows,
+  getBlockJournalRange,
   getCheckpoint,
+  getTrackedDeploymentStartBlock,
+  resolveInitialIndexerStartBlock,
 };

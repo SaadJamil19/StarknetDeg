@@ -6,7 +6,7 @@ require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 
 const { setTimeout: sleep } = require('node:timers/promises');
 const { syncRegistryToDatabase } = require('../core/abi-registry');
-const { processAcceptedBlock } = require('../core/block-processor');
+const { prefetchAcceptedBlockPayloads, processAcceptedBlock, reconcileTurboBackfillIndexes } = require('../core/block-processor');
 const {
   assertFoundationTables,
   assertPhase2Tables,
@@ -18,7 +18,9 @@ const {
   assertPoolTaxonomyTables,
   assertTradeChainingTables,
   ensureIndexStateRows,
+  getBlockJournalRange,
   getCheckpoint,
+  resolveInitialIndexerStartBlock,
 } = require('../core/checkpoint');
 const { seedKnownTokens } = require('../core/token-registry');
 const { FINALITY_LANES, normalizeFinalityStatus } = require('../core/finality');
@@ -35,7 +37,13 @@ async function main() {
   const pollIntervalMs = parsePositiveInteger(process.env.INDEXER_POLL_INTERVAL_MS, 10_000);
   const catchupBatchSize = parsePositiveInteger(process.env.INDEXER_CATCHUP_BATCH_SIZE, 25);
   const configuredStartBlock = parseOptionalBigInt(process.env.INDEXER_START_BLOCK);
+  const startMode = process.env.INDEXER_START_MODE || 'genesis';
+  const startTargets = parseCsv(process.env.INDEXER_START_TARGETS);
+  const turboMode = parseBoolean(process.env.INDEXER_TURBO_MODE, false);
+  const turboParallelism = parsePositiveInteger(process.env.INDEXER_TURBO_PARALLELISM, 4);
+  const skipRealtime = parseBoolean(process.env.INDEXER_SKIP_REALTIME, turboMode);
   const rpcClient = new StarknetRpcClient();
+  let initialStartBlock = configuredStartBlock ?? 0n;
 
   if (lane !== FINALITY_LANES.ACCEPTED_ON_L2) {
     throw new Error(`Phase 4 start-indexer only supports ${FINALITY_LANES.ACCEPTED_ON_L2}.`);
@@ -56,17 +64,39 @@ async function main() {
     await syncRegistryToDatabase(client);
     await seedKnownTokens(client);
     await ensureIndexStateRows(client, indexerKey);
+    initialStartBlock = await resolveInitialIndexerStartBlock(client, {
+      configuredStartBlock,
+      lane,
+      startMode,
+      startTargets,
+    });
   });
 
+  const journalRanges = await withClient((client) => getBlockJournalRange(client, { lane }));
+  const rangeSummary = journalRanges.length === 0
+    ? 'empty'
+    : journalRanges.map((range) => `${range.lane}:${range.minBlockNumber?.toString() ?? 'none'}-${range.maxBlockNumber?.toString() ?? 'none'} rows=${range.rowCount.toString()}`).join(',');
+
   console.log(
-    `[phase4] StarknetDeg indexer starting indexerKey=${indexerKey} lane=${lane} previewLane=${FINALITY_LANES.PRE_CONFIRMED} anchorLane=${FINALITY_LANES.ACCEPTED_ON_L1}`,
+    `[phase4] StarknetDeg indexer starting indexerKey=${indexerKey} lane=${lane} start_mode=${startMode} start_targets=${startTargets.length === 0 ? 'all' : startTargets.join('|')} initial_start_block=${initialStartBlock.toString()} turbo=${turboMode} turbo_parallelism=${turboParallelism} skip_realtime=${skipRealtime} journal_range=${rangeSummary} previewLane=${FINALITY_LANES.PRE_CONFIRMED} anchorLane=${FINALITY_LANES.ACCEPTED_ON_L1}`,
   );
 
   while (!shuttingDown) {
     try {
       const latestAcceptedBlock = await rpcClient.getBlockNumber();
       const checkpoint = await withClient((client) => getCheckpoint(client, { indexerKey, lane }));
-      const nextBlock = determineNextBlock(checkpoint, configuredStartBlock);
+      const nextBlock = determineNextBlock(checkpoint, initialStartBlock);
+      const turboIndexSummary = await reconcileTurboBackfillIndexes({
+        blockNumber: nextBlock,
+        latestHead: latestAcceptedBlock,
+        turboMode,
+      });
+
+      if (turboIndexSummary.changed) {
+        console.log(
+          `[phase4] turbo index manager action=${turboIndexSummary.action} historical=${turboIndexSummary.historicalMode} indexes=${turboIndexSummary.indexCount}`,
+        );
+      }
 
       if (nextBlock > latestAcceptedBlock) {
         await sleep(pollIntervalMs);
@@ -75,13 +105,31 @@ async function main() {
 
       let processedInBatch = 0;
       let cursor = nextBlock;
+      let prefetchedPayloads = [];
+
+      if (turboMode) {
+        const blockNumbers = [];
+        let prefetchCursor = cursor;
+        while (prefetchCursor <= latestAcceptedBlock && blockNumbers.length < catchupBatchSize) {
+          blockNumbers.push(prefetchCursor);
+          prefetchCursor += 1n;
+        }
+        prefetchedPayloads = await prefetchAcceptedBlockPayloads({
+          blockNumbers,
+          concurrency: turboParallelism,
+          rpcClient,
+        });
+      }
 
       while (!shuttingDown && cursor <= latestAcceptedBlock && processedInBatch < catchupBatchSize) {
         const result = await processAcceptedBlock({
           blockNumber: cursor,
           indexerKey,
           lane,
+          prefetchedPayload: prefetchedPayloads[processedInBatch] ?? null,
           rpcClient,
+          skipRealtime,
+          turboMode,
         });
 
         console.log(
@@ -103,6 +151,13 @@ async function main() {
       console.error(`[phase4] indexer loop error: ${formatError(error)}`);
       await sleep(pollIntervalMs);
     }
+  }
+
+  const restoreSummary = await reconcileTurboBackfillIndexes({ forceRestore: true, turboMode: false });
+  if (restoreSummary.changed) {
+    console.log(
+      `[phase4] turbo index manager action=${restoreSummary.action} historical=${restoreSummary.historicalMode} indexes=${restoreSummary.indexCount}`,
+    );
   }
 
   await closeRedis();
@@ -128,6 +183,25 @@ function parsePositiveInteger(value, fallbackValue) {
   }
 
   return parsed;
+}
+
+function parseBoolean(value, fallbackValue = false) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return fallbackValue;
+  }
+
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+function parseCsv(value) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return [];
+  }
+
+  return String(value)
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
 }
 
 function parseOptionalBigInt(value) {
@@ -179,6 +253,12 @@ function installSignalHandlers() {
 
 main().catch(async (error) => {
   console.error(`[phase4] fatal startup error: ${formatError(error)}`);
+
+  try {
+    await reconcileTurboBackfillIndexes({ forceRestore: true, turboMode: false });
+  } catch (restoreError) {
+    console.error(`[phase4] turbo index restore error: ${formatError(restoreError)}`);
+  }
 
   try {
     await closeRedis();

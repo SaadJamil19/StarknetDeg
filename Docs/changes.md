@@ -590,3 +590,131 @@ This file lists the report-driven schema enhancement and bug-fix changes in simp
 - `stark_tx_raw.contract_address` is expected to be `NULL` for normal `INVOKE` rows; those use `sender_address`. It is populated for `L1_HANDLER` and `DEPLOY_ACCOUNT` rows in the current database.
 - `stark_tx_raw.l1_sender_address` is expected to be `NULL` for non-`L1_HANDLER` rows. Current `13` L1 handler rows have it populated.
 - `tokens.deploy_tx_hash` and `tokens.deployed_at` remain `NULL` for the current token rows because none of the token addresses in `tokens` appear in the indexed `deployed_contracts` state-diff evidence. Their deployments happened outside the indexed window or were learned from static/on-chain metadata instead of an observed deploy transaction.
+
+## Full Node Plan
+
+- Pivoted Phase 6 from snapshot/bootstrap assumptions to full-node event lineage.
+- Added start-block resolution in `core/checkpoint.js`:
+  - `INDEXER_START_MODE=genesis` starts from block `0`
+  - `INDEXER_START_MODE=tracked_deployment` starts from earliest known tracked deployment evidence and falls back to `0`
+  - optional `INDEXER_START_TARGETS=jediswap,eth,...` narrows `tracked_deployment` resolution to specific tracked symbols/protocols/addresses
+  - explicit `INDEXER_START_BLOCK` still wins over both modes
+- Added `stark_block_journal` range inspection support through `getBlockJournalRange(...)`.
+- Current indexed journal range:
+  - lane `ACCEPTED_ON_L2`
+  - `4,850` rows
+  - min block `8,911,041`
+  - max block `8,915,890`
+  - orphaned rows `0`
+- Updated `bin/start-indexer.js` startup logging to show:
+  - chosen start mode
+  - selected tracked deployment targets
+  - resolved initial start block
+  - current journal range
+  - turbo and realtime-skip settings
+- Made the decoder path soft-failing for historical/pre-deployment era blocks.
+  - event decoder exceptions now create `DECODER_SOFT_FAILED:<decoder>` audit rows instead of crashing the whole block
+  - receipt-context flush failures now create `DECODER_FLUSH_SOFT_FAILED:<decoder>` audits
+- Added turbo-mode primitives in `core/block-processor.js`.
+  - block and state update fetches can be prefetched in parallel
+  - raw transaction, raw event, and L2-to-L1 message writes now use batched multi-row inserts
+  - `INDEXER_TURBO_MODE=true` applies `SET LOCAL synchronous_commit = OFF`
+  - realtime publishing can be disabled with `INDEXER_SKIP_REALTIME=true`, and is skipped by default in turbo mode
+- Updated Phase 6 wallet PnL logic in `jobs/wallet-rollups.js`.
+  - traded inventory now uses FIFO lots
+  - each buy creates a lot from `amount_out` and `notional_usd + buy gas`
+  - sells consume external inventory first, then FIFO traded lots
+  - realized PnL uses proceeds minus original buy cost basis from consumed lots
+  - verified non-internal wallet transfers now replay into wallet positions instead of being ignored
+  - wallet-to-wallet transfers can carry relieved sender cost basis into the recipient external inventory when the sender lineage is known
+- Updated holder replay logic in `jobs/concentration-rollups.js`.
+  - full holder balances still rebuild from `stark_transfers`
+  - if a debit would make a balance negative, the job can call historical `balanceOf` and repair the replay state
+  - controlled by `PHASE6_BALANCE_RPC_REPAIR`, enabled by default when `STARKNET_RPC_URL` exists
+- Added `tools/reconcile-balances.js`.
+  - compares top holder DB balances against live Starknet `balanceOf`
+  - exposed as `npm run reconcile:balances`
+  - supports `RECONCILE_BALANCES_LIMIT`, `RECONCILE_BALANCES_CONCURRENCY`, `RECONCILE_BALANCES_BLOCK_ID`, and strict mismatch exit behavior
+- Updated `Docs/phase6_analytics.md` to document full-node indexing, FIFO PnL, turbo backfill flags, negative-balance repair, and balance reconciliation.
+
+## Full Node Plan 2
+
+- Tightened gas accounting in `jobs/wallet-rollups.js`.
+  - gas fee USD is no longer priced from the current/latest token price
+  - the job now anchors gas to the historical `stark_price_ticks` row at or before the trade lineage
+  - fee token mapping still supports historical `WEI -> ETH` and `FRI/STRK -> STRK`
+  - pending gas pricing repair now waits for historical tick availability, not just latest price availability
+- Added FIFO dust disposal in `jobs/wallet-rollups.js`.
+  - tiny remainder lots below the configurable `PHASE6_FIFO_DUST_THRESHOLD` are closed during replay
+  - position and wallet metadata now record dust lot count and dust quantity closed
+- Added discrepancy forensics with a new `stark_audit_discrepancies` table in `sql/0014_full_node_plan2.sql`.
+  - negative holder-balance gaps are now audited before any fallback repair
+  - the audit row captures transfer lineage, attempted negative balance, proxy/upgrade evidence, and final resolution
+  - concentration replay now inspects `stark_contract_security`, `stark_contract_registry`, `stark_block_state_updates.replaced_classes`, and `stark_event_raw.resolved_class_hash`
+  - proxy/upgrade-suspected rows default to decoder-review-first behavior, with RPC fallback controlled by `PHASE6_BALANCE_RPC_ON_PROXY_DISCREPANCY`
+- Added turbo backfill index management in `core/block-processor.js`.
+  - when `INDEXER_TURBO_MODE=true` and replay is more than `1000` blocks behind head, non-unique indexes on `stark_transfers` and `stark_trades` are dropped
+  - once replay reaches the live buffer, those indexes are rebuilt automatically
+  - `bin/start-indexer.js` now logs index-manager drop/rebuild transitions and restores indexes on shutdown/fatal exit
+- Updated `Docs/phase6_analytics.md` and `Docs/db.md` to document:
+  - historical gas anchoring
+  - discrepancy audit-before-RPC flow
+  - turbo index drop/rebuild behavior
+  - FIFO dust disposal
+
+## Changes 10: Financial Resilience
+
+- Hardened turbo-to-live index restoration in `core/block-processor.js`.
+  - index rebuild now runs outside the block-processing transaction
+  - rebuild uses `CREATE INDEX CONCURRENTLY`
+  - drop path uses `DROP INDEX CONCURRENTLY`
+  - invalid concurrent indexes are detected and replaced before live-head processing resumes
+  - a post-rebuild health check now blocks live-mode processing until all required indexes exist and are valid
+- Finalized dust-loss accounting in `jobs/wallet-rollups.js`.
+  - FIFO dust closures now move remaining lot cost basis into `dust_loss_usd` on `stark_wallet_positions`
+  - wallet aggregates now track `total_dust_loss_usd`
+  - `net_pnl_usd` now reconciles as `realized + unrealized - dust_loss`
+- Hardened gas-fee pricing fallback in `jobs/wallet-rollups.js`.
+  - historical gas anchor lookup now searches the closest `stark_price_ticks` within `PHASE6_GAS_PRICE_FALLBACK_WINDOW_SECONDS`
+  - repair eligibility now matches the same look-back/look-forward window instead of only earlier ticks
+  - optional fixed anchors `PHASE6_FIXED_GAS_ANCHOR_ETH_USD` and `PHASE6_FIXED_GAS_ANCHOR_STRK_USD` can price historical gas when no safe tick exists
+  - if neither a historical tick nor a configured fixed anchor exists, the job writes a `PRICE_MISSING_AUDIT` discrepancy instead of silently using current price
+- Added upgrade-aware discrepancy repair in `jobs/concentration-rollups.js`.
+  - negative balance replay gaps with `replaced_classes` evidence now trigger block-scoped transfer re-decode before RPC fallback
+  - transfer-derived rows for that block are cleared and rebuilt from raw tx/event/message tables
+  - holder replay restarts once after re-decode so the corrected transfer lineage is used before any RPC repair decision
+- Added `sql/0015_financial_resilience.sql`.
+  - asserts `dust_loss_usd` and `total_dust_loss_usd`
+  - extends discrepancy type checks to include `PRICE_MISSING_AUDIT`
+- Updated `Docs/phase6_analytics.md` and `Docs/db.md` to document:
+  - concurrent turbo index rebuild health checks
+  - dust-loss accounting
+  - gas anchor fallback window and price-missing audits
+  - upgrade-aware re-decode before RPC fallback
+
+## Changes 11: Protocol Accuracy
+
+- Refined fee-token discrimination in `jobs/wallet-rollups.js`.
+  - gas token selection still trusts receipt `actual_fee_unit` first
+  - when the unit is missing, wallet rollups now inspect transaction version plus v3 fee fields to distinguish legacy ETH-fee transactions from STRK-fee v3 transactions
+  - `WEI` anchors to ETH pricing, `FRI` anchors to STRK pricing, and version-aware fallback prevents protocol-era fee ambiguity
+  - PnL metadata and price-missing audits now record fee-token reasoning, transaction version, and fee-data availability mode
+- Added re-decode strike limits in `jobs/concentration-rollups.js`.
+  - `stark_audit_discrepancies` now keeps persistent `retry_count`
+  - upgrade-aware block re-decode increments the strike counter before each retry
+  - once a block exceeds `PHASE6_REDECODE_STRIKE_LIMIT`, the audit row is marked `FATAL_MANUAL_REVIEW` and holder replay moves on instead of stalling indefinitely
+  - repeated discrepancy detections now reuse the same audit row for the same transfer/holder/token lineage, so strikes accumulate across runs
+- Extended the schema with `sql/0016_protocol_accuracy.sql`.
+  - adds `stark_audit_discrepancies.retry_count`
+  - extends discrepancy resolution status checks to include `FATAL_MANUAL_REVIEW`
+- Added post-turbo planner refresh in `core/block-processor.js`.
+  - after concurrent index rebuild health checks pass, the worker runs `VACUUM ANALYZE` on `stark_transfers` and `stark_trades`
+  - this restores planner statistics after historical turbo replay before live-mode query traffic resumes
+- Reconfirmed Phase 6 USD math discipline.
+  - wallet PnL, gas-fee USD, dust loss, and notional handling remain on scaled `BigInt` / integer-fixed-point paths
+  - no native JavaScript float pricing path is used for trade notional or gas USD
+- Updated `Docs/phase6_analytics.md` and `Docs/db.md` to document:
+  - version-aware fee token discrimination
+  - three-strike re-decode guardrails
+  - post-turbo `VACUUM ANALYZE`
+  - persistent retry counting and `FATAL_MANUAL_REVIEW`

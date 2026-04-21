@@ -214,6 +214,32 @@ This table stores the latest reconstructed token balance for each holder.
 - `created_at`: Time when this balance row was inserted.
 - `updated_at`: Time when this balance row was last updated.
 
+## `stark_audit_discrepancies`
+
+This table stores forensic audit rows for replay mismatches that should not be silently hidden by fallback logic.
+
+- `audit_id`: Unique id for the discrepancy row.
+- `lane`: Finality lane for this audit row.
+- `discrepancy_type`: Audit type. Current values are `NEGATIVE_BALANCE_REPLAY` and `PRICE_MISSING_AUDIT`.
+- `block_number`: Block where replay divergence was detected.
+- `block_hash`: Block hash for the divergence point.
+- `transaction_hash`: Transaction tied to the divergence.
+- `transaction_index`: Transaction position inside the block.
+- `source_event_index`: Event index tied to the divergence.
+- `transfer_key`: Related `stark_transfers.transfer_key` when the discrepancy came from a transfer replay.
+- `token_address`: Token contract whose lineage drifted.
+- `holder_address`: Holder whose replayed balance went negative.
+- `balance_before`: Reconstructed balance before the bad delta was applied.
+- `delta_amount`: Signed delta that caused the mismatch.
+- `attempted_balance_after`: Replayed post-delta balance before any repair or clamp.
+- `resolved_balance`: Final balance chosen after audit handling.
+- `resolution_status`: Resolution state such as `logged`, `decoder_review_required`, `rpc_repaired`, `rpc_unavailable`, `clamped_zero`, or `FATAL_MANUAL_REVIEW`.
+- `retry_count`: Number of upgrade-aware re-decode strikes recorded for this discrepancy.
+- `suspected_cause`: Short cause hint, for example proxy upgrade history, a generic replay gap, or missing gas price history.
+- `metadata`: Extra forensic evidence such as proxy flags, replaced class history, observed event class hash, re-decode attempts, gas-anchor fallback details, and RPC fallback notes.
+- `created_at`: Time when the row was inserted.
+- `updated_at`: Time when the row was last updated.
+
 ## `stark_index_state`
 
 This table stores checkpoint state for each indexing lane.
@@ -803,6 +829,7 @@ This table stores current wallet positions by token.
 - `total_quantity`: Total quantity held in this modeled position.
 - `traded_cost_basis_usd`: Cost basis tied to traded inventory.
 - `external_cost_basis_usd`: Cost basis tied to external inventory.
+- `dust_loss_usd`: Cost basis written off when microscopic FIFO lots are closed by the dust threshold.
 - `average_traded_entry_price_usd`: Average entry price for traded inventory.
 - `last_price_usd`: Latest price used to mark the position.
 - `realized_pnl_usd`: Cumulative realized PnL for this wallet/token pair.
@@ -828,9 +855,10 @@ This table stores wallet-level summary analytics.
 - `last_trade_block_number`: Most recent block where this wallet traded.
 - `total_trades`: Total number of trades attributed to this wallet.
 - `total_volume_usd`: Total traded volume in USD.
+- `total_dust_loss_usd`: Aggregate dust write-off tracked across all wallet positions.
 - `realized_pnl_usd`: Total realized PnL in USD.
 - `unrealized_pnl_usd`: Total unrealized PnL in USD.
-- `net_pnl_usd`: Net PnL combining realized and unrealized values.
+- `net_pnl_usd`: Net PnL combining realized and unrealized values after subtracting dust loss.
 - `bridge_inflow_usd`: Total inbound bridge flow in USD.
 - `bridge_outflow_usd`: Total outbound bridge flow in USD.
 - `net_bridge_flow_usd`: Net bridge flow in USD.

@@ -1,6 +1,6 @@
 # StarknetDeg Phase 6 Analytics
 
-Date: April 6, 2026  
+Date: April 21, 2026  
 Scope: Plain-English explanation of the Phase 6 analytics layer. This phase does not change raw indexing. It reads the already-indexed Starknet data and turns it into wallet PnL, bridge flow accounting, holder concentration, whale alert candidates, and finality-aware replay protection.
 
 ## 1. What Phase 6 Actually Does
@@ -74,35 +74,53 @@ Because if we do not do that, a big bridge deposit can be mistaken for profit th
 
 This is the single most important reason Phase 6 exists.
 
-## 3. Why We Used ACB Instead Of FIFO
+## 3. Full-Node Event Lineage Model
 
-For wallet PnL, this implementation uses:
+Phase 6 now assumes the preferred production path is full-node historical indexing, not a snapshot/bootstrap seed.
 
-- `ACB` = Adjusted Cost Basis
+The model is:
 
-It does **not** use FIFO lots yet.
+1. start the canonical indexer from block `0`, or from the earliest tracked deployment block
+2. decode every relevant historical transfer, trade, bridge, and price event
+3. rebuild wallet and holder analytics from event lineage
+4. validate reconstructed balances against live `balanceOf`
 
-Why ACB was chosen:
+Snapshot seeding can still be useful for a temporary bootstrap, but it is not the source of truth for production analytics.
 
-1. It is simpler to recompute from chain history.
-2. It is deterministic under replay.
-3. It is cheaper to rebuild after a reconciliation event.
-4. It is good enough for product analytics and leaderboard logic.
+The important difference:
 
-Why not FIFO right now:
+- snapshot mode gives balances and PnL from a chosen block forward
+- full-node mode gives replayable balances and trade PnL across the indexed lifetime
 
-1. FIFO needs explicit lot storage.
-2. Replay and rollback become heavier.
-3. External bridge inventory makes lot attribution more complex.
+The canonical start block is controlled by:
 
-So the rule is:
+- `INDEXER_START_MODE=genesis`
+- `INDEXER_START_MODE=tracked_deployment`
+- optional `INDEXER_START_TARGETS=jediswap,eth,...` when you want `tracked_deployment` to resolve against specific tracked symbols/protocols/addresses
+- or explicit `INDEXER_START_BLOCK=<block_number>`
 
-- Phase 6 optimizes for correct operational analytics
-- not tax-grade lot accounting
+If `INDEXER_START_BLOCK` is present, it wins. Otherwise `genesis` starts at block `0`, while `tracked_deployment` uses the earliest known deployment evidence from the registry/state-diff tables and falls back to `0` if no evidence exists. When `INDEXER_START_TARGETS` is set, the deployment resolver narrows to those tracked targets instead of the whole tracked universe.
 
-If we skipped this choice and tried to half-build FIFO now, we would create a lot system that looks precise but is much harder to replay safely.
+Decoder behavior is soft-failing. If an old block contains an unknown or pre-deployment-era event shape, the event is audited and marked failed/unknown without crashing the whole block.
 
-## 3.1 Why Gas Fees Had To Be Added To PnL
+## 3.1 FIFO Cost Basis
+
+For wallet PnL, the implemented trade inventory now uses FIFO lots.
+
+Each DEX buy creates a lot:
+
+- quantity = `amount_out`
+- cost basis = `notional_usd + buy-side gas fee`
+- lineage = source trade key and block
+
+When the wallet sells, the traded part of the sell consumes those lots in order. Realized PnL is:
+
+- proceeds from the traded sold quantity
+- minus original buy cost basis relieved from the consumed lots
+
+External bridge inventory remains separate and is consumed before traded inventory. That prevents bridge deposits from being treated as Starknet trading profit.
+
+## 3.2 Why Gas Fees Had To Be Added To PnL
 
 Gross trade PnL is not enough for active wallets.
 
@@ -115,10 +133,12 @@ How it works:
 1. gas fee is mapped to its fee token:
    - `WEI` -> ETH
    - `FRI` -> STRK
+   - modern Starknet protocol docs say that as of **September 1, 2025** and Starknet `v0.14.0`, transaction fees are charged only in `STRK`, but historical receipts can still carry `WEI` and `FRI`, so the indexer must support both eras
 2. gas fee is converted to USD using the same metadata and price system used elsewhere
-3. if a transaction contains multiple trades, the transaction gas fee is allocated across those trades
-4. buy-side gas is added into trade cost basis
-5. sell-side gas is subtracted from sell proceeds
+3. the conversion uses the historical `stark_price_ticks` row at or before the transaction lineage, not the current/latest gas token price
+4. if a transaction contains multiple trades, the transaction gas fee is allocated across those trades
+5. buy-side gas is added into trade cost basis
+6. sell-side gas is subtracted from sell proceeds
 
 That means realized PnL is now net of fees, not just raw swap output minus cost basis.
 
@@ -464,22 +484,26 @@ This is the core PnL job.
 
 What it does:
 
-1. loads trades and bridge activity in lineage order
+1. loads the full indexed history of verified wallet transfers, trades, and bridge activity in lineage order
 2. builds wallet/token inventory state
 3. keeps two inventories per token:
    - traded inventory
-   - external bridge inventory
-4. allocates gas fees from `stark_tx_raw`
-5. calculates realized PnL only on the traded portion of sells, net of gas fees
-6. calculates unrealized PnL from current price on traded inventory
-7. includes a repair loop for pending pricing rows
-6. writes:
+   - external non-trading inventory
+4. stores traded inventory as FIFO lots
+5. carries cost basis across wallet-to-wallet transfers when the sender inventory is known
+6. prices gas from historical `stark_price_ticks` anchored to the transaction lineage
+7. allocates gas fees from `stark_tx_raw`
+8. calculates realized PnL only on the traded portion of sells, net of gas fees
+9. calculates unrealized PnL from current price on traded inventory
+10. closes FIFO dust lots below the configured threshold so replay state does not bloat forever
+11. includes a repair loop for pending pricing rows
+12. writes:
    - `stark_wallet_pnl_events`
    - `stark_wallet_positions`
    - `stark_wallet_stats`
    - wallet leaderboards
 
-This file is where the "do not treat bridge deposits as profit" rule is actually enforced.
+This file is where the "do not treat bridge deposits or plain token transfers as profit" rule is actually enforced.
 
 It is also where the "do not call gross profit real profit" rule is enforced.
 
@@ -496,7 +520,8 @@ What it does:
 5. calculates concentration ratio and basis points
 6. builds concentration leaderboards
 7. tags internal transfers when both sides are already known active traders
-8. creates whale alert candidates with `velocity_score`
+8. repairs negative replay gaps with historical `balanceOf` when RPC repair is enabled
+9. creates whale alert candidates with `velocity_score`
 
 Important note:
 
@@ -549,10 +574,10 @@ When a wallet sells on a DEX:
 Formula used for traded sells:
 
 - traded proceeds = net proceeds after sell gas times traded quantity share
-- relieved cost basis = current traded cost basis times traded quantity share
+- relieved cost basis = original buy cost basis from consumed FIFO lots
 - realized PnL = traded proceeds minus relieved cost basis
 
-This is ACB because cost is relieved proportionally from the current traded inventory.
+This is FIFO lot accounting over the indexed trade history.
 
 This means:
 
@@ -560,6 +585,16 @@ This means:
 - sell fees enter through proceeds reduction
 
 So realized PnL is net of fees from both sides over time.
+
+Gas is not marked to market with the latest ETH/STRK row.
+
+Instead:
+
+- fee quantity comes from the transaction receipt
+- fee token comes from `actual_fee_unit`
+- fee USD comes from the latest non-low-confidence `stark_price_ticks` row at or before that transaction lineage
+
+That keeps historical PnL anchored to what the chain knew around that trade, not what the market knows now.
 
 ### 6.3 Bridge In
 
@@ -581,7 +616,28 @@ When a wallet bridges tokens out:
 
 That is important because bridge out is capital movement, not market realization.
 
-### 6.5 Unrealized PnL
+### 6.5 Wallet Transfer In
+
+When a wallet receives a verified non-internal token transfer:
+
+1. quantity is added to external inventory
+2. if the sender position is already known, the relieved sender cost basis is carried forward
+3. otherwise the inbound side falls back to the priced transfer value when available
+
+No trade PnL is created.
+
+### 6.6 Wallet Transfer Out
+
+When a wallet sends a verified non-internal token transfer:
+
+1. external inventory is reduced first
+2. then traded inventory is reduced if needed
+3. any known cost basis relieved from the sender can be carried to the recipient position
+4. no trade PnL is created
+
+That keeps balances event-correct without pretending a simple wallet transfer is a realized sale.
+
+### 6.7 Unrealized PnL
 
 Unrealized PnL is calculated on traded inventory only:
 
@@ -594,7 +650,50 @@ If price or decimals are missing:
 - the row remains visible
 - but it is marked incomplete
 
-## 6.6 The Self-Healing Repair Loop
+### 6.8 FIFO Dust Disposal
+
+Genesis replay can leave microscopic residual lots after many partial sells.
+
+To stop those lots from accumulating forever:
+
+1. each position keeps a dust threshold, currently `1e-10`
+2. after inventory consumption, FIFO lots below that threshold are closed
+3. the closed dust quantity and lot count are tracked in metadata
+4. the closed lot cost basis is moved into `dust_loss_usd` and `total_dust_loss_usd`
+
+This is not a tax feature.
+
+It is a replay-state hygiene rule so tiny remainder lots do not distort storage cost and runtime.
+
+It also preserves accounting identity:
+
+- account value = inventory cost basis + realized PnL - dust loss
+
+So dust is never silently deleted from the books.
+
+### 6.9 Historical Gas Fee Anchoring
+
+Gas is not priced from the latest token price.
+
+The wallet rollup does this:
+
+1. read `actual_fee_amount` and `actual_fee_unit` from `stark_tx_raw`
+2. map fee unit historically:
+   - `WEI -> ETH`
+   - `FRI` / `STRK -> STRK`
+3. if the fee unit is missing, inspect transaction version and v3-style fee fields:
+   - legacy versions `< 3` default to ETH
+   - version `>= 3` with `resource_bounds` or `fee_data_availability_mode` defaults to STRK
+4. look for the closest `stark_price_ticks` row within `PHASE6_GAS_PRICE_FALLBACK_WINDOW_SECONDS`
+5. prefer the closest tick by timestamp, while still preferring same-lineage-or-earlier ticks on ties
+6. if no historical tick exists, optionally use configured fixed anchors:
+   - `PHASE6_FIXED_GAS_ANCHOR_ETH_USD`
+   - `PHASE6_FIXED_GAS_ANCHOR_STRK_USD`
+7. if no safe anchor exists, keep the trade pending and write a `PRICE_MISSING_AUDIT` row into `stark_audit_discrepancies`
+
+All USD math in this path stays on scaled integer arithmetic. No native JavaScript float is used for `notional_usd`, gas-fee USD, or lot cost basis.
+
+## 6.10 The Self-Healing Repair Loop
 
 The refined Phase 6 job now has a repair path.
 
@@ -608,7 +707,7 @@ The repair loop does this:
 
 1. scans `stark_wallet_positions` for `pending_pricing = TRUE`
 2. checks whether the missing token metadata or price inputs now exist
-3. if yes, triggers a clean ACB rebuild
+3. if yes, triggers a clean FIFO rebuild
 
 Current implementation choice:
 
@@ -635,6 +734,10 @@ The holder job replays every verified transfer:
 1. debit sender unless sender is zero address
 2. credit receiver unless receiver is zero address
 3. store both balance deltas and final balances
+4. if a debit would make a balance negative, first write a row to `stark_audit_discrepancies`
+5. inspect whether the token contract looks upgradeable or has historical class replacements
+6. if `replaced_classes` evidence exists, clear the transfer-derived rows for that block and re-decode the raw block before restarting replay
+7. only then consider historical `balanceOf` as a fallback repair path
 
 Then for each holder:
 
@@ -652,6 +755,32 @@ That means we can distinguish:
 - active trader to active trader internal movement
 
 without pretending that every big transfer is a sale or a bridge.
+
+## 7.1 Audit Discrepancy Flow
+
+`stark_audit_discrepancies` exists for the bad cases where replay truth and indexed truth diverge.
+
+Current flow:
+
+1. detect the negative-balance replay gap
+2. log the affected holder, token, transfer, and attempted post-delta balance
+3. inspect:
+   - `stark_contract_security`
+   - `stark_contract_registry`
+   - `stark_block_state_updates.replaced_classes`
+   - `stark_event_raw.resolved_class_hash`
+4. if `stark_block_state_updates.replaced_classes` shows upgrade history, clear the block's transfer-derived rows and re-decode the raw block
+5. each audited block gets a persistent `retry_count`
+6. after `PHASE6_REDECODE_STRIKE_LIMIT` re-decode strikes, the row is marked `FATAL_MANUAL_REVIEW` and replay moves on instead of stalling forever
+7. otherwise restart holder replay from the beginning of the lane transaction
+8. if the same gap still exists after the allowed strikes, then use proxy policy:
+   - proxy/upgrade evidence defaults to decoder-review-first
+   - otherwise historical `balanceOf` can repair the row
+9. store the final resolution on the audit row
+
+This matters because an RPC repair is evidence of a replay gap, not a substitute for decoder correctness.
+
+The system should tell us where lineage broke before it silently patches over the break.
 
 If we did not do it this way and instead tried to infer holdings from trades, we would miss:
 
@@ -723,6 +852,22 @@ That is the safest rollback boundary.
 
 If we replayed only from the first detected mismatch, we could still leave subtle derived state contamination alive before it.
 
+## 9.1 Turbo To Live Index Rebuild
+
+Turbo backfill deliberately trades query ergonomics for write speed.
+
+Current behavior:
+
+1. while replay is more than `1000` blocks behind head, non-unique indexes on `stark_transfers` and `stark_trades` are dropped
+2. when replay moves back into the live buffer, index rebuild runs on a fresh connection outside the block-processing transaction
+3. index rebuild uses:
+   - `CREATE INDEX CONCURRENTLY`
+   - `DROP INDEX CONCURRENTLY`
+4. after rebuild, the worker performs an index health check and refuses to process live-head blocks while required indexes are missing or invalid
+5. once the indexes are valid, the worker runs `VACUUM ANALYZE` on `stark_transfers` and `stark_trades`
+
+This avoids blocking live writes while still guaranteeing that live-mode queries do not run on half-restored index state.
+
 ## 10. Precision Rules In Phase 6
 
 The same precision rules from earlier phases still apply:
@@ -746,10 +891,18 @@ If we used normal JavaScript floats here, wallet analytics would drift over time
 Run each Phase 6 job from `StarknetDeg`:
 
 ```powershell
+set INDEXER_START_MODE=tracked_deployment
+set INDEXER_START_TARGETS=jediswap,eth
+set INDEXER_TURBO_MODE=true
+set PHASE6_BALANCE_RPC_ON_PROXY_DISCREPANCY=false
+set PHASE6_REDECODE_STRIKE_LIMIT=3
+set PHASE6_FIFO_DUST_THRESHOLD=0.0000000001
+set PHASE6_GAS_PRICE_FALLBACK_WINDOW_SECONDS=3600
 npm run start:bridge-accounting
 npm run start:wallet-rollups
 npm run start:concentration-rollups
 npm run start:finality-promoter
+npm run reconcile:balances
 ```
 
 Default behavior right now:
@@ -767,11 +920,12 @@ Phase 6 is strong, but it is not the end-state analytics system.
 
 It still does not do:
 
-- FIFO tax lots
+- tax-grade external-transfer cost basis
 - generalized off-chain wallet attribution
 - final user-facing whale alert delivery
 - Ethereum-side bridge event correlation sidecar
-- full per-wallet transfer-based cost basis outside bridge flows
+- exact cost basis for first-seen inbound transfers whose source inventory is outside the indexed lineage
+- automatic legacy decoder generation for old proxy implementations; audited upgrade discrepancies still need explicit follow-up decoder work
 - targeted per-wallet repair rebuilds instead of the current safe lane-wide repair trigger
 
 But for the current StarknetDeg backend, this phase now provides:

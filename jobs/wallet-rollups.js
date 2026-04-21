@@ -5,7 +5,16 @@ const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 
 const { setTimeout: sleep } = require('node:timers/promises');
-const { assertFoundationTables, assertPhase2Tables, assertPhase3Tables, assertPhase4Tables, assertPhase6Tables, assertL1Tables } = require('../core/checkpoint');
+const {
+  assertFinancialResilienceColumns,
+  assertFoundationTables,
+  assertFullNodePlan2Tables,
+  assertPhase2Tables,
+  assertPhase3Tables,
+  assertPhase4Tables,
+  assertPhase6Tables,
+  assertL1Tables,
+} = require('../core/checkpoint');
 const { FINALITY_LANES } = require('../core/finality');
 const { knownErc20Cache } = require('../core/known-erc20-cache');
 const { toJsonbString } = require('../core/protocols/shared');
@@ -35,6 +44,10 @@ const {
 } = require('./analytics-utils');
 
 let shuttingDown = false;
+const FIFO_DUST_THRESHOLD_SCALED = decimalStringToScaled(process.env.PHASE6_FIFO_DUST_THRESHOLD ?? '0.0000000001', DEFAULT_SCALE);
+const GAS_PRICE_FALLBACK_WINDOW_SECONDS = parsePositiveInteger(process.env.PHASE6_GAS_PRICE_FALLBACK_WINDOW_SECONDS, 3600);
+const FIXED_GAS_ANCHOR_ETH_USD_SCALED = parseOptionalUsdScaled(process.env.PHASE6_FIXED_GAS_ANCHOR_ETH_USD);
+const FIXED_GAS_ANCHOR_STRK_USD_SCALED = parseOptionalUsdScaled(process.env.PHASE6_FIXED_GAS_ANCHOR_STRK_USD);
 
 async function main() {
   const runOnce = parseBoolean(process.env.PHASE6_WALLET_ROLLUPS_RUN_ONCE, true);
@@ -45,7 +58,9 @@ async function main() {
   installSignalHandlers();
 
   await withClient(async (client) => {
+    await assertFinancialResilienceColumns(client);
     await assertFoundationTables(client);
+    await assertFullNodePlan2Tables(client);
     await assertPhase2Tables(client);
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
@@ -61,7 +76,7 @@ async function main() {
         const summary = await refreshWalletRollups();
         initialFullRefreshDone = true;
         console.log(
-          `[phase6] wallet-rollups mode=full lane=${summary.lane} max_block=${summary.maxBlockNumber} wallets=${summary.wallets} positions=${summary.positions} pnl_events=${summary.pnlEvents} priced_trades=${summary.pricedTrades} skipped_trades=${summary.skippedTrades}`,
+          `[phase6] wallet-rollups mode=full lane=${summary.lane} max_block=${summary.maxBlockNumber} wallets=${summary.wallets} positions=${summary.positions} pnl_events=${summary.pnlEvents} wallet_transfers=${summary.walletTransfers} priced_trades=${summary.pricedTrades} skipped_trades=${summary.skippedTrades}`,
         );
       } else {
         const summary = await repairPendingWalletPricing();
@@ -89,7 +104,9 @@ async function refreshWalletRollups({
   requireL1 = parseBoolean(process.env.PHASE6_REQUIRE_L1, false),
 } = {}) {
   return withTransaction(async (client) => {
+    await assertFinancialResilienceColumns(client);
     await assertFoundationTables(client);
+    await assertFullNodePlan2Tables(client);
     await assertPhase2Tables(client);
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
@@ -110,20 +127,26 @@ async function refreshWalletRollups({
         positions: 0,
         pricedTrades: 0,
         skippedTrades: 0,
+        walletTransfers: 0,
         wallets: 0,
       };
     }
 
     const trades = await loadTrades(client, { lane: window.lane, maxBlockNumber: window.maxBlockNumber });
     const bridges = await loadBridgeActivities(client, { lane: window.lane, maxBlockNumber: window.maxBlockNumber });
+    const transfers = await loadWalletTransfers(client, { lane: window.lane, maxBlockNumber: window.maxBlockNumber });
     const tokenContext = await loadTokenMarketContext(client, {
       lane: window.lane,
-      tokenAddresses: collectTokenAddresses(trades, bridges),
+      tokenAddresses: collectTokenAddresses(trades, bridges, transfers),
     });
-    const tradesWithGasFees = allocateGasFeesToTrades(trades, tokenContext);
+    const {
+      gasPriceAudits,
+      trades: tradesWithGasFees,
+    } = allocateGasFeesToTrades(trades, tokenContext);
     const stream = [
-      ...bridges.map((item) => ({ ...item, kind: 'bridge', sequence: 0n })),
-      ...tradesWithGasFees.map((item) => ({ ...item, kind: 'trade', sequence: 1n })),
+      ...transfers.map((item) => ({ ...item, kind: 'transfer', sequence: 0n })),
+      ...bridges.map((item) => ({ ...item, kind: 'bridge', sequence: 1n })),
+      ...tradesWithGasFees.map((item) => ({ ...item, kind: 'trade', sequence: 2n })),
     ].sort(sortByLineage);
 
     const positions = new Map();
@@ -131,8 +154,27 @@ async function refreshWalletRollups({
     const pnlEvents = [];
     let pricedTrades = 0;
     let skippedTrades = 0;
+    let walletTransfers = 0;
+
+    for (const audit of gasPriceAudits) {
+      await upsertPriceMissingAudit(client, {
+        lane: window.lane,
+        ...audit,
+      });
+    }
 
     for (const item of stream) {
+      if (item.kind === 'transfer') {
+        processTransferActivity({
+          transfer: item,
+          positions,
+          tokenContext,
+          walletStats,
+        });
+        walletTransfers += 1;
+        continue;
+      }
+
       if (item.kind === 'bridge') {
         processBridgeActivity({
           activity: item,
@@ -147,6 +189,7 @@ async function refreshWalletRollups({
         lane: window.lane,
         pnlEvents,
         positions,
+        tokenContext,
         trade: item,
         walletStats,
       });
@@ -194,6 +237,7 @@ async function refreshWalletRollups({
       positions: positionRows.length,
       pricedTrades,
       skippedTrades,
+      walletTransfers,
       wallets: walletRows.length,
     };
   });
@@ -205,7 +249,9 @@ async function repairPendingWalletPricing({
   requireL1 = parseBoolean(process.env.PHASE6_REQUIRE_L1, false),
 } = {}) {
   return withClient(async (client) => {
+    await assertFinancialResilienceColumns(client);
     await assertFoundationTables(client);
+    await assertFullNodePlan2Tables(client);
     await assertPhase2Tables(client);
     await assertPhase3Tables(client);
     await assertPhase4Tables(client);
@@ -221,6 +267,9 @@ async function repairPendingWalletPricing({
         repaired: 0,
       };
     }
+
+    const ethTokenAddress = knownErc20Cache.findBySymbol('ETH')[0]?.l2TokenAddress ?? null;
+    const strkTokenAddress = knownErc20Cache.findBySymbol('STRK')[0]?.l2TokenAddress ?? null;
 
     const result = await client.query(
       `SELECT DISTINCT position.wallet_address
@@ -243,17 +292,35 @@ async function repairPendingWalletPricing({
                    FROM stark_wallet_pnl_events AS pnl
                    JOIN stark_token_metadata AS metadata
                      ON metadata.token_address = pnl.gas_fee_token_address
-                   JOIN stark_prices AS prices
-                     ON prices.lane = pnl.lane
-                    AND prices.token_address = pnl.gas_fee_token_address
                   WHERE pnl.lane = position.lane
                     AND pnl.wallet_address = position.wallet_address
                     AND pnl.gas_fee_token_address IS NOT NULL
                     AND metadata.decimals IS NOT NULL
-                    AND prices.price_usd IS NOT NULL
+                    AND (
+                        EXISTS (
+                         SELECT 1
+                           FROM stark_price_ticks AS tick
+                          WHERE tick.lane = pnl.lane
+                            AND tick.token_address = pnl.gas_fee_token_address
+                            AND tick.low_confidence = FALSE
+                            AND tick.block_timestamp BETWEEN
+                                (pnl.block_timestamp - make_interval(secs => $2::int))
+                                AND
+                                (pnl.block_timestamp + make_interval(secs => $2::int))
+                    )
+                     OR ($3::boolean = TRUE AND $4::text IS NOT NULL AND lower(pnl.gas_fee_token_address) = lower($4))
+                     OR ($5::boolean = TRUE AND $6::text IS NOT NULL AND lower(pnl.gas_fee_token_address) = lower($6))
+                    )
                )
           )`,
-      [window.lane],
+      [
+        window.lane,
+        GAS_PRICE_FALLBACK_WINDOW_SECONDS,
+        FIXED_GAS_ANCHOR_ETH_USD_SCALED !== null,
+        ethTokenAddress,
+        FIXED_GAS_ANCHOR_STRK_USD_SCALED !== null,
+        strkTokenAddress,
+      ],
     );
 
     const eligibleWallets = result.rows.map((row) => row.wallet_address).filter(Boolean);
@@ -281,6 +348,8 @@ async function repairPendingWalletPricing({
 }
 
 async function loadTrades(client, { lane, maxBlockNumber }) {
+  const ethTokenAddress = knownErc20Cache.findBySymbol('ETH')[0]?.l2TokenAddress ?? null;
+  const strkTokenAddress = knownErc20Cache.findBySymbol('STRK')[0]?.l2TokenAddress ?? null;
   const result = await client.query(
     `SELECT trade.trade_key,
             trade.block_number,
@@ -297,38 +366,119 @@ async function loadTrades(client, { lane, maxBlockNumber }) {
             trade.notional_usd,
             trade.pending_enrichment,
             tx.actual_fee_amount,
-            tx.actual_fee_unit
+            tx.actual_fee_unit,
+            tx.raw_transaction ->> 'version' AS tx_version,
+            tx.raw_transaction ->> 'fee_data_availability_mode' AS fee_data_availability_mode,
+            CASE
+              WHEN jsonb_typeof(tx.raw_transaction -> 'resource_bounds') = 'object' THEN TRUE
+              ELSE FALSE
+            END AS tx_has_resource_bounds,
+            gas_tick.price_usd AS gas_fee_price_usd,
+            gas_tick.block_number AS gas_fee_price_block_number,
+            gas_tick.price_is_stale AS gas_fee_price_is_stale,
+            gas_tick.price_source AS gas_fee_price_source
        FROM stark_trades AS trade
        LEFT JOIN stark_tx_raw AS tx
               ON tx.lane = trade.lane
              AND tx.block_number = trade.block_number
              AND tx.transaction_hash = trade.transaction_hash
+       LEFT JOIN LATERAL (
+             SELECT tick.price_usd,
+                    tick.block_number,
+                    tick.price_is_stale,
+                    tick.price_source
+               FROM stark_price_ticks AS tick
+              WHERE tick.lane = trade.lane
+                AND tick.low_confidence = FALSE
+                AND tick.token_address = CASE
+                    WHEN UPPER(COALESCE(tx.actual_fee_unit, '')) = 'WEI' THEN $3
+                    WHEN UPPER(COALESCE(tx.actual_fee_unit, '')) IN ('FRI', 'STRK') THEN $4
+                    WHEN (
+                         LOWER(COALESCE(tx.raw_transaction ->> 'version', '')) ~ '^(0x)?[0-9a-f]+$'
+                     AND RIGHT(REGEXP_REPLACE(LOWER(COALESCE(tx.raw_transaction ->> 'version', '')), '^0x', ''), 1) IN ('3', '4', '5', '6', '7', '8', '9')
+                     AND (
+                          jsonb_typeof(tx.raw_transaction -> 'resource_bounds') = 'object'
+                       OR tx.raw_transaction ? 'fee_data_availability_mode'
+                       OR tx.raw_transaction ? 'paymaster_data'
+                     )
+                    ) THEN $4
+                    WHEN (
+                         LOWER(COALESCE(tx.raw_transaction ->> 'version', '')) ~ '^(0x)?[0-9a-f]+$'
+                     AND RIGHT(REGEXP_REPLACE(LOWER(COALESCE(tx.raw_transaction ->> 'version', '')), '^0x', ''), 1) IN ('0', '1', '2')
+                    ) THEN $3
+                    ELSE NULL
+                END
+                AND tick.block_timestamp BETWEEN
+                    (trade.block_timestamp - make_interval(secs => $5::int))
+                    AND
+                    (trade.block_timestamp + make_interval(secs => $5::int))
+              ORDER BY
+                   ABS(EXTRACT(EPOCH FROM (tick.block_timestamp - trade.block_timestamp))) ASC,
+                   CASE
+                     WHEN (
+                          tick.block_number < trade.block_number
+                       OR (
+                            tick.block_number = trade.block_number
+                        AND (
+                             tick.transaction_index < trade.transaction_index
+                          OR (
+                               tick.transaction_index = trade.transaction_index
+                           AND tick.source_event_index <= trade.source_event_index
+                          )
+                        )
+                       )
+                     ) THEN 0 ELSE 1
+                   END ASC,
+                   tick.block_number DESC,
+                   tick.transaction_index DESC,
+                   tick.source_event_index DESC
+              LIMIT 1
+       ) AS gas_tick
+         ON TRUE
       WHERE trade.lane = $1
         AND trade.block_number <= $2
         AND trade.trader_address IS NOT NULL
       ORDER BY trade.block_number ASC, trade.transaction_index ASC, trade.source_event_index ASC, trade.trade_key ASC`,
-    [lane, toNumericString(maxBlockNumber, 'wallet rollup max block')],
+    [lane, toNumericString(maxBlockNumber, 'wallet rollup max block'), ethTokenAddress, strkTokenAddress, GAS_PRICE_FALLBACK_WINDOW_SECONDS],
   );
 
-  return result.rows.map((row) => ({
-    actualFeeAmount: row.actual_fee_amount === null ? null : toBigIntStrict(row.actual_fee_amount, 'wallet trade actual fee amount'),
-    actualFeeUnit: row.actual_fee_unit === null ? null : String(row.actual_fee_unit).toUpperCase(),
-    amountIn: toBigIntStrict(row.amount_in, 'wallet trade amount in'),
-    amountOut: toBigIntStrict(row.amount_out, 'wallet trade amount out'),
-    blockHash: row.block_hash,
-    blockNumber: toBigIntStrict(row.block_number, 'wallet trade block number'),
-    blockTimestamp: starkTimestampToDate(row.block_timestamp),
-    notionalUsdScaled: row.notional_usd === null ? null : decimalStringToScaled(row.notional_usd, DEFAULT_SCALE),
-    pendingEnrichment: Boolean(row.pending_enrichment),
-    sourceEventIndex: toBigIntStrict(row.source_event_index, 'wallet trade source event index'),
-    tokenInAddress: row.token_in_address,
-    tokenOutAddress: row.token_out_address,
-    tradeKey: row.trade_key,
-    traderAddress: row.trader_address,
-    transactionHash: row.transaction_hash,
-    transactionIndex: toBigIntStrict(row.transaction_index, 'wallet trade transaction index'),
-    gasFeeTokenAddress: resolveGasFeeTokenAddress(row.actual_fee_unit),
-  }));
+  return result.rows.map((row) => {
+    const gasFeeToken = resolveGasFeeTokenContext({
+      actualFeeUnit: row.actual_fee_unit,
+      feeDataAvailabilityMode: row.fee_data_availability_mode ?? null,
+      hasResourceBounds: Boolean(row.tx_has_resource_bounds),
+      txVersionRaw: row.tx_version ?? null,
+    });
+
+    return {
+      actualFeeAmount: row.actual_fee_amount === null ? null : toBigIntStrict(row.actual_fee_amount, 'wallet trade actual fee amount'),
+      actualFeeUnit: row.actual_fee_unit === null ? null : String(row.actual_fee_unit).toUpperCase(),
+      amountIn: toBigIntStrict(row.amount_in, 'wallet trade amount in'),
+      amountOut: toBigIntStrict(row.amount_out, 'wallet trade amount out'),
+      blockHash: row.block_hash,
+      blockNumber: toBigIntStrict(row.block_number, 'wallet trade block number'),
+      blockTimestamp: starkTimestampToDate(row.block_timestamp),
+      feeDataAvailabilityMode: row.fee_data_availability_mode ?? null,
+      gasFeePriceBlockNumber: row.gas_fee_price_block_number === null ? null : toBigIntStrict(row.gas_fee_price_block_number, 'wallet trade gas fee price block'),
+      gasFeePriceIsStale: row.gas_fee_price_is_stale === null ? null : Boolean(row.gas_fee_price_is_stale),
+      gasFeePriceSource: row.gas_fee_price_source ?? null,
+      gasFeePriceUsdScaled: row.gas_fee_price_usd === null ? null : decimalStringToScaled(row.gas_fee_price_usd, DEFAULT_SCALE),
+      gasFeeTokenAddress: gasFeeToken.address,
+      gasFeeTokenReason: gasFeeToken.reason,
+      gasFeeTokenSymbol: gasFeeToken.symbol,
+      hasV3ResourceBounds: Boolean(row.tx_has_resource_bounds),
+      notionalUsdScaled: row.notional_usd === null ? null : decimalStringToScaled(row.notional_usd, DEFAULT_SCALE),
+      pendingEnrichment: Boolean(row.pending_enrichment),
+      sourceEventIndex: toBigIntStrict(row.source_event_index, 'wallet trade source event index'),
+      tokenInAddress: row.token_in_address,
+      tokenOutAddress: row.token_out_address,
+      tradeKey: row.trade_key,
+      traderAddress: row.trader_address,
+      transactionHash: row.transaction_hash,
+      transactionIndex: toBigIntStrict(row.transaction_index, 'wallet trade transaction index'),
+      txVersion: gasFeeToken.txVersion,
+    };
+  });
 }
 
 async function loadBridgeActivities(client, { lane, maxBlockNumber }) {
@@ -379,7 +529,69 @@ async function loadBridgeActivities(client, { lane, maxBlockNumber }) {
   }));
 }
 
-function collectTokenAddresses(trades, bridges) {
+async function loadWalletTransfers(client, { lane, maxBlockNumber }) {
+  const result = await client.query(
+    `SELECT transfer.transfer_key,
+            transfer.block_number,
+            transfer.block_hash,
+            transfer.transaction_hash,
+            transfer.transaction_index,
+            transfer.source_event_index,
+            transfer.token_address,
+            transfer.from_address,
+            transfer.to_address,
+            transfer.amount,
+            transfer.amount_usd,
+            transfer.transfer_type,
+            transfer.counterparty_type,
+            journal.block_timestamp
+       FROM stark_transfers AS transfer
+       LEFT JOIN stark_block_journal AS journal
+              ON journal.lane = transfer.lane
+             AND journal.block_number = transfer.block_number
+             AND journal.block_hash = transfer.block_hash
+             AND journal.is_orphaned = FALSE
+      WHERE transfer.lane = $1
+        AND transfer.block_number <= $2
+        AND COALESCE(transfer.is_internal, FALSE) = FALSE
+        AND COALESCE(transfer.transfer_type, 'standard_transfer') <> 'routing_transfer'
+        AND (transfer.from_address IS NOT NULL OR transfer.to_address IS NOT NULL)
+        AND NOT EXISTS (
+             SELECT 1
+               FROM stark_bridge_activities AS activity
+              WHERE activity.lane = transfer.lane
+                AND activity.block_number = transfer.block_number
+                AND activity.transaction_hash = transfer.transaction_hash
+                AND COALESCE(activity.source_event_index, 0) = transfer.source_event_index
+                AND activity.token_address = transfer.token_address
+                AND (
+                     activity.l2_wallet_address = transfer.from_address
+                  OR activity.l2_wallet_address = transfer.to_address
+                )
+        )
+      ORDER BY transfer.block_number ASC, transfer.transaction_index ASC, transfer.source_event_index ASC, transfer.transfer_key ASC`,
+    [lane, toNumericString(maxBlockNumber, 'wallet transfer max block')],
+  );
+
+  return result.rows.map((row) => ({
+    amount: toBigIntStrict(row.amount, 'wallet transfer amount'),
+    amountUsdScaled: row.amount_usd === null ? null : decimalStringToScaled(row.amount_usd, DEFAULT_SCALE),
+    blockHash: row.block_hash,
+    blockNumber: toBigIntStrict(row.block_number, 'wallet transfer block number'),
+    blockTimestamp: starkTimestampToDate(row.block_timestamp),
+    counterpartyType: row.counterparty_type ?? 'unknown',
+    fromAddress: row.from_address,
+    sourceEventIndex: toBigIntStrict(row.source_event_index, 'wallet transfer source event index'),
+    toAddress: row.to_address,
+    tokenAddress: row.token_address,
+    transactionHash: row.transaction_hash,
+    transactionIndex: toBigIntStrict(row.transaction_index, 'wallet transfer transaction index'),
+    transferKey: row.transfer_key,
+    transferType: row.transfer_type ?? 'standard_transfer',
+  }));
+}
+
+function collectTokenAddresses(trades, bridges, transfers = []) {
   const values = new Set();
 
   for (const trade of trades) {
@@ -396,11 +608,18 @@ function collectTokenAddresses(trades, bridges) {
     }
   }
 
+  for (const transfer of transfers) {
+    if (transfer.tokenAddress) {
+      values.add(transfer.tokenAddress);
+    }
+  }
+
   return Array.from(values);
 }
 
 function allocateGasFeesToTrades(trades, tokenContext) {
   const grouped = new Map();
+  const gasPriceAudits = [];
 
   for (const trade of trades) {
     if (!grouped.has(trade.transactionHash)) {
@@ -414,7 +633,8 @@ function allocateGasFeesToTrades(trades, tokenContext) {
   }
 
   for (const tradeGroup of grouped.values()) {
-    const referenceTrade = tradeGroup.find((item) => item.actualFeeAmount !== null);
+    const referenceTrade = tradeGroup.find((item) => item.actualFeeAmount !== null && item.gasFeePriceUsdScaled !== null)
+      ?? tradeGroup.find((item) => item.actualFeeAmount !== null);
     if (!referenceTrade || referenceTrade.actualFeeAmount === null) {
       continue;
     }
@@ -426,13 +646,36 @@ function allocateGasFeesToTrades(trades, tokenContext) {
       continue;
     }
 
-    const gasTokenInfo = tokenContext.get(referenceTrade.gasFeeTokenAddress) ?? null;
-    const totalGasFeeUsdScaled = computeUsdValueFromRawAmount(referenceTrade.actualFeeAmount, gasTokenInfo, { allowStale: true });
+    const gasTokenInfo = resolveHistoricalGasTokenInfo(referenceTrade, tokenContext);
+    let totalGasFeeUsdScaled = computeUsdValueFromRawAmount(referenceTrade.actualFeeAmount, gasTokenInfo, { allowStale: false });
+
+    if (totalGasFeeUsdScaled === null) {
+      const fixedAnchorPriceUsdScaled = resolveFixedGasAnchorPriceUsdScaled(referenceTrade);
+      if (fixedAnchorPriceUsdScaled !== null) {
+        totalGasFeeUsdScaled = computeUsdValueFromRawAmount(referenceTrade.actualFeeAmount, {
+          decimals: gasTokenInfo?.decimals ?? resolveFallbackGasTokenDecimals(referenceTrade.gasFeeTokenAddress),
+          priceIsStale: false,
+          priceSource: 'configured_fixed_gas_anchor',
+          priceUpdatedAtBlock: referenceTrade.blockNumber,
+          priceUsdScaled: fixedAnchorPriceUsdScaled,
+        }, { allowStale: false });
+
+        for (const trade of tradeGroup) {
+          trade.gasFeeAnchorMode = 'fixed_anchor';
+          trade.gasFeePriceBlockNumber = trade.blockNumber;
+          trade.gasFeePriceIsStale = false;
+          trade.gasFeePriceSource = 'configured_fixed_gas_anchor';
+          trade.gasFeePriceUsdScaled = fixedAnchorPriceUsdScaled;
+        }
+      }
+    }
 
     if (totalGasFeeUsdScaled === null) {
       for (const trade of tradeGroup) {
         trade.gasFeePending = true;
+        trade.gasFeeAnchorMode = 'missing';
       }
+      gasPriceAudits.push(buildGasPriceMissingAudit(referenceTrade));
       continue;
     }
 
@@ -465,23 +708,169 @@ function allocateGasFeesToTrades(trades, tokenContext) {
     }
   }
 
-  return Array.from(grouped.values()).flat();
+  return {
+    gasPriceAudits,
+    trades: Array.from(grouped.values()).flat(),
+  };
 }
 
-function resolveGasFeeTokenAddress(actualFeeUnit) {
+function resolveGasFeeTokenContext({
+  actualFeeUnit,
+  feeDataAvailabilityMode = null,
+  hasResourceBounds = false,
+  txVersionRaw = null,
+}) {
   const unit = actualFeeUnit === null || actualFeeUnit === undefined
     ? null
     : String(actualFeeUnit).trim().toUpperCase();
+  const txVersion = parseOptionalTransactionVersion(txVersionRaw);
+  const normalizedTxVersion = normalizeTransactionVersion(txVersion);
+  const hasV3StyleFeeFields = Boolean(hasResourceBounds || feeDataAvailabilityMode !== null);
+  const ethAddress = knownErc20Cache.findBySymbol('ETH')[0]?.l2TokenAddress ?? null;
+  const strkAddress = knownErc20Cache.findBySymbol('STRK')[0]?.l2TokenAddress ?? null;
 
   if (unit === 'WEI') {
-    return knownErc20Cache.findBySymbol('ETH')[0]?.l2TokenAddress ?? null;
+    return {
+      address: ethAddress,
+      reason: 'actual_fee_unit_wei',
+      symbol: 'ETH',
+      txVersion,
+    };
   }
 
   if (unit === 'FRI' || unit === 'STRK') {
-    return knownErc20Cache.findBySymbol('STRK')[0]?.l2TokenAddress ?? null;
+    return {
+      address: strkAddress,
+      reason: 'actual_fee_unit_fri',
+      symbol: 'STRK',
+      txVersion,
+    };
+  }
+
+  if (normalizedTxVersion !== null && normalizedTxVersion >= 3n && hasV3StyleFeeFields) {
+    return {
+      address: strkAddress,
+      reason: 'tx_v3_fee_fields',
+      symbol: 'STRK',
+      txVersion,
+    };
+  }
+
+  if (normalizedTxVersion !== null && normalizedTxVersion >= 3n) {
+    return {
+      address: strkAddress,
+      reason: 'tx_v3_version',
+      symbol: 'STRK',
+      txVersion,
+    };
+  }
+
+  if (normalizedTxVersion !== null && normalizedTxVersion < 3n) {
+    return {
+      address: ethAddress,
+      reason: 'legacy_tx_version',
+      symbol: 'ETH',
+      txVersion,
+    };
+  }
+
+  return {
+    address: null,
+    reason: 'unresolved',
+    symbol: null,
+    txVersion,
+  };
+}
+
+function parseOptionalTransactionVersion(value) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return null;
+  }
+
+  return toBigIntStrict(String(value).trim(), 'wallet trade tx version');
+}
+
+function normalizeTransactionVersion(version) {
+  if (version === null || version === undefined) {
+    return null;
+  }
+
+  return version & 0xffn;
+}
+
+function resolveHistoricalGasTokenInfo(trade, tokenContext) {
+  if (!trade.gasFeeTokenAddress || trade.gasFeePriceUsdScaled === null || trade.gasFeePriceUsdScaled === undefined) {
+    return null;
+  }
+
+  const gasTokenInfo = tokenContext.get(trade.gasFeeTokenAddress) ?? null;
+  if (!gasTokenInfo) {
+    return null;
+  }
+
+  return {
+    ...gasTokenInfo,
+    priceIsStale: Boolean(trade.gasFeePriceIsStale),
+    priceSource: trade.gasFeePriceSource ?? gasTokenInfo.priceSource ?? null,
+    priceUpdatedAtBlock: trade.gasFeePriceBlockNumber ?? gasTokenInfo.priceUpdatedAtBlock ?? null,
+    priceUsdScaled: trade.gasFeePriceUsdScaled,
+  };
+}
+
+function resolveFixedGasAnchorPriceUsdScaled(trade) {
+  if (!trade?.gasFeeTokenAddress) {
+    return null;
+  }
+
+  const normalized = String(trade.gasFeeTokenAddress).toLowerCase();
+  const ethAddress = knownErc20Cache.findBySymbol('ETH')[0]?.l2TokenAddress?.toLowerCase() ?? null;
+  const strkAddress = knownErc20Cache.findBySymbol('STRK')[0]?.l2TokenAddress?.toLowerCase() ?? null;
+
+  if (ethAddress && normalized === ethAddress) {
+    return FIXED_GAS_ANCHOR_ETH_USD_SCALED;
+  }
+
+  if (strkAddress && normalized === strkAddress) {
+    return FIXED_GAS_ANCHOR_STRK_USD_SCALED;
   }
 
   return null;
+}
+
+function resolveFallbackGasTokenDecimals(tokenAddress) {
+  if (!tokenAddress) {
+    return null;
+  }
+
+  const knownToken = knownErc20Cache.getToken(tokenAddress);
+  return knownToken?.decimals ?? null;
+}
+
+function buildGasPriceMissingAudit(trade) {
+  return {
+    blockHash: trade.blockHash,
+    blockNumber: trade.blockNumber,
+    blockTimestamp: trade.blockTimestamp,
+    gasFeeAmount: trade.actualFeeAmount,
+    gasFeeTokenAddress: trade.gasFeeTokenAddress,
+    holderAddress: trade.traderAddress,
+    sourceEventIndex: trade.sourceEventIndex,
+    tokenAddress: trade.gasFeeTokenAddress ?? trade.tokenInAddress,
+    tradeKey: trade.tradeKey,
+    transactionHash: trade.transactionHash,
+    transactionIndex: trade.transactionIndex,
+    metadata: {
+      audit_reason: 'historical_gas_price_missing',
+      fallback_window_seconds: GAS_PRICE_FALLBACK_WINDOW_SECONDS,
+      fee_data_availability_mode: trade.feeDataAvailabilityMode ?? null,
+      fee_unit: trade.actualFeeUnit ?? null,
+      fixed_anchor_eth_configured: FIXED_GAS_ANCHOR_ETH_USD_SCALED !== null,
+      fixed_anchor_strk_configured: FIXED_GAS_ANCHOR_STRK_USD_SCALED !== null,
+      gas_fee_token_reason: trade.gasFeeTokenReason ?? null,
+      gas_fee_token_symbol: trade.gasFeeTokenSymbol ?? null,
+      tx_version: trade.txVersion === null ? null : trade.txVersion.toString(10),
+    },
+  };
 }
 
 function processBridgeActivity({ activity, positions, tokenContext, walletStats }) {
@@ -492,6 +881,7 @@ function processBridgeActivity({ activity, positions, tokenContext, walletStats 
   const position = ensurePosition(positions, activity.walletAddress, activity.tokenAddress);
   const stats = ensureWalletStats(walletStats, activity.walletAddress);
   const tokenInfo = tokenContext.get(activity.tokenAddress) ?? null;
+  applyTokenInfoToPosition(position, tokenInfo);
   const usdValueScaled = activity.amount === null ? null : computeUsdValueFromRawAmount(activity.amount, tokenInfo, { allowStale: true });
 
   updateActivityMarkers(position, activity.blockNumber, activity.blockTimestamp);
@@ -554,7 +944,47 @@ function processBridgeActivity({ activity, positions, tokenContext, walletStats 
   }
 }
 
-function processTrade({ lane, pnlEvents, positions, trade, walletStats }) {
+function processTransferActivity({ positions, tokenContext, transfer, walletStats }) {
+  if (!transfer.tokenAddress) {
+    return;
+  }
+
+  const tokenInfo = tokenContext.get(transfer.tokenAddress) ?? null;
+  const usdValueScaled = transfer.amountUsdScaled ?? computeUsdValueFromRawAmount(transfer.amount, tokenInfo, { allowStale: true });
+  let transferredCostBasisUsdScaled = null;
+
+  if (transfer.fromAddress && transfer.fromAddress !== ZERO_ADDRESS) {
+    const outboundPosition = ensurePosition(positions, transfer.fromAddress, transfer.tokenAddress);
+    const outboundStats = ensureWalletStats(walletStats, transfer.fromAddress);
+    applyTokenInfoToPosition(outboundPosition, tokenInfo);
+    updateActivityMarkers(outboundPosition, transfer.blockNumber, transfer.blockTimestamp);
+    outboundPosition.metadata.transfer_out_count += 1;
+    outboundStats.metadata.transfer_out_count += 1;
+    const consumed = consumeInventoryWithoutPnl(outboundPosition, transfer.amount, outboundStats);
+    transferredCostBasisUsdScaled = consumed.costBasisUsdScaled;
+  }
+
+  if (transfer.toAddress && transfer.toAddress !== ZERO_ADDRESS) {
+    const inboundPosition = ensurePosition(positions, transfer.toAddress, transfer.tokenAddress);
+    const inboundStats = ensureWalletStats(walletStats, transfer.toAddress);
+    applyTokenInfoToPosition(inboundPosition, tokenInfo);
+    updateActivityMarkers(inboundPosition, transfer.blockNumber, transfer.blockTimestamp);
+    inboundPosition.externalQuantity += transfer.amount;
+    inboundPosition.metadata.transfer_in_count += 1;
+    inboundStats.metadata.transfer_in_count += 1;
+
+    if (transferredCostBasisUsdScaled !== null) {
+      inboundPosition.externalCostBasisUsdScaled += transferredCostBasisUsdScaled;
+    } else if (usdValueScaled !== null) {
+      inboundPosition.externalCostBasisUsdScaled += usdValueScaled;
+    } else {
+      inboundPosition.metadata.transfer_pricing_gaps += 1;
+      inboundStats.metadata.transfer_pricing_gaps += 1;
+    }
+  }
+}
+
+function processTrade({ lane, pnlEvents, positions, tokenContext, trade, walletStats }) {
   if (!trade.traderAddress || trade.tokenInAddress === trade.tokenOutAddress) {
     return false;
   }
@@ -562,6 +992,8 @@ function processTrade({ lane, pnlEvents, positions, trade, walletStats }) {
   const stats = ensureWalletStats(walletStats, trade.traderAddress);
   const sellPosition = ensurePosition(positions, trade.traderAddress, trade.tokenInAddress);
   const buyPosition = ensurePosition(positions, trade.traderAddress, trade.tokenOutAddress);
+  applyTokenInfoToPosition(sellPosition, tokenContext.get(trade.tokenInAddress) ?? null);
+  applyTokenInfoToPosition(buyPosition, tokenContext.get(trade.tokenOutAddress) ?? null);
 
   if (trade.notionalUsdScaled === null) {
     sellPosition.pendingPricing = true;
@@ -603,7 +1035,7 @@ function processTrade({ lane, pnlEvents, positions, trade, walletStats }) {
   const sellResult = consumeTradeSellInventory(sellPosition, {
     amountSold: trade.amountIn,
     proceedsUsdScaled: sellProceedsUsdScaled,
-  });
+  }, stats);
 
   if (sellResult.realizedPnlUsdScaled !== null) {
     sellPosition.realizedPnlUsdScaled += sellResult.realizedPnlUsdScaled;
@@ -627,8 +1059,12 @@ function processTrade({ lane, pnlEvents, positions, trade, walletStats }) {
     stats.metadata.inventory_gap_qty += Number(sellResult.inventoryGap);
   }
 
-  buyPosition.tradedQuantity += trade.amountOut;
-  buyPosition.tradedCostBasisUsdScaled += buyCostBasisUsdScaled;
+  addTradeLot(buyPosition, {
+    blockNumber: trade.blockNumber,
+    costBasisUsdScaled: buyCostBasisUsdScaled,
+    quantity: trade.amountOut,
+    tradeKey: trade.tradeKey,
+  });
 
   pnlEvents.push(buildPnlEvent({
     blockHash: trade.blockHash,
@@ -641,8 +1077,17 @@ function processTrade({ lane, pnlEvents, positions, trade, walletStats }) {
     gasFeeUsdScaled: hasGasFee ? gasFeeUsdScaled : null,
     lane,
     metadata: {
+      fee_data_availability_mode: trade.feeDataAvailabilityMode ?? null,
+      gas_fee_token_reason: trade.gasFeeTokenReason ?? null,
+      gas_fee_token_symbol: trade.gasFeeTokenSymbol ?? null,
+      gas_fee_unit: trade.actualFeeUnit ?? null,
+      gas_price_anchor_mode: trade.gasFeeAnchorMode ?? 'historical_tick',
       gas_fee_pending: trade.gasFeePending,
+      gas_price_anchor_block_number: trade.gasFeePriceBlockNumber === null ? null : trade.gasFeePriceBlockNumber.toString(10),
+      gas_price_is_stale: Boolean(trade.gasFeePriceIsStale),
+      gas_price_source: trade.gasFeePriceSource ?? null,
       pending_enrichment: trade.pendingEnrichment,
+      tx_version: trade.txVersion === null ? null : trade.txVersion.toString(10),
       trade_side: 'buy',
     },
     pnlEventKey: `${trade.tradeKey}:${trade.tokenOutAddress}:buy`,
@@ -672,9 +1117,18 @@ function processTrade({ lane, pnlEvents, positions, trade, walletStats }) {
     gasFeeUsdScaled: hasGasFee ? gasFeeUsdScaled : null,
     lane,
     metadata: {
+      fee_data_availability_mode: trade.feeDataAvailabilityMode ?? null,
+      gas_fee_token_reason: trade.gasFeeTokenReason ?? null,
+      gas_fee_token_symbol: trade.gasFeeTokenSymbol ?? null,
+      gas_fee_unit: trade.actualFeeUnit ?? null,
+      gas_price_anchor_mode: trade.gasFeeAnchorMode ?? 'historical_tick',
       gas_fee_pending: trade.gasFeePending,
+      gas_price_anchor_block_number: trade.gasFeePriceBlockNumber === null ? null : trade.gasFeePriceBlockNumber.toString(10),
+      gas_price_is_stale: Boolean(trade.gasFeePriceIsStale),
+      gas_price_source: trade.gasFeePriceSource ?? null,
       inventory_gap_qty: sellResult.inventoryGap.toString(10),
       pending_enrichment: trade.pendingEnrichment,
+      tx_version: trade.txVersion === null ? null : trade.txVersion.toString(10),
       trade_side: 'sell',
     },
     pnlEventKey: `${trade.tradeKey}:${trade.tokenInAddress}:sell`,
@@ -741,7 +1195,14 @@ function buildWalletPositionRows({ lane, positions, tokenContext, walletStats })
       stats.metadata.pending_pricing_positions += 1;
     }
 
-    if (totalQuantity === 0n && position.realizedPnlUsdScaled === 0n && position.tradeCount === 0n && position.bridgeInCount === 0n && position.bridgeOutCount === 0n) {
+    if (
+      totalQuantity === 0n
+      && position.realizedPnlUsdScaled === 0n
+      && position.dustLossUsdScaled === 0n
+      && position.tradeCount === 0n
+      && position.bridgeInCount === 0n
+      && position.bridgeOutCount === 0n
+    ) {
       continue;
     }
 
@@ -749,6 +1210,7 @@ function buildWalletPositionRows({ lane, positions, tokenContext, walletStats })
       averageTradedEntryPriceUsdScaled,
       bridgeInCount: position.bridgeInCount,
       bridgeOutCount: position.bridgeOutCount,
+      dustLossUsdScaled: position.dustLossUsdScaled,
       externalCostBasisUsdScaled: position.externalCostBasisUsdScaled,
       externalQuantity,
       firstActivityBlockNumber: position.firstActivityBlockNumber,
@@ -778,9 +1240,17 @@ function finalizeWalletStats(stats) {
   return {
     ...stats,
     netBridgeFlowUsdScaled: stats.bridgeInflowUsdScaled - stats.bridgeOutflowUsdScaled,
-    netPnlUsdScaled: stats.realizedPnlUsdScaled + stats.unrealizedPnlUsdScaled,
+    netPnlUsdScaled: stats.realizedPnlUsdScaled + stats.unrealizedPnlUsdScaled - stats.totalDustLossUsdScaled,
     winRateScaled: closedTrades === 0n ? null : scaledRatio(stats.winningTradeCount, closedTrades, 0, DEFAULT_SCALE),
   };
+}
+
+function applyTokenInfoToPosition(position, tokenInfo) {
+  if (!tokenInfo || tokenInfo.decimals === null || tokenInfo.decimals === undefined) {
+    return;
+  }
+
+  position.tokenDecimals = tokenInfo.decimals;
 }
 
 function ensurePosition(positions, walletAddress, tokenAddress) {
@@ -792,6 +1262,7 @@ function ensurePosition(positions, walletAddress, tokenAddress) {
   const position = {
     bridgeInCount: 0n,
     bridgeOutCount: 0n,
+    dustLossUsdScaled: 0n,
     externalCostBasisUsdScaled: 0n,
     externalQuantity: 0n,
     firstActivityBlockNumber: null,
@@ -799,7 +1270,13 @@ function ensurePosition(positions, walletAddress, tokenAddress) {
     lastActivityTimestamp: null,
     metadata: {
       bridge_pricing_gaps: 0,
+      transfer_in_count: 0,
+      transfer_out_count: 0,
+      transfer_pricing_gaps: 0,
       bridge_without_amount: 0,
+      cost_basis_method: 'fifo_lifetime_event_lineage',
+      fifo_dust_closed_lots: 0,
+      fifo_dust_closed_qty: '0',
       inventory_gap_qty: 0,
       pending_gas_fee_trades: 0,
       skipped_unpriced_trades: 0,
@@ -807,7 +1284,9 @@ function ensurePosition(positions, walletAddress, tokenAddress) {
     pendingPricing: false,
     realizedPnlUsdScaled: 0n,
     tokenAddress,
+    tokenDecimals: null,
     tradeCount: 0n,
+    tradeLots: [],
     tradedCostBasisUsdScaled: 0n,
     tradedQuantity: 0n,
     walletAddress,
@@ -842,12 +1321,18 @@ function ensureWalletStats(walletStats, walletAddress) {
     metadata: {
       bridge_pricing_gaps: 0,
       bridge_without_amount: 0,
+      fifo_dust_closed_lots: 0,
+      fifo_dust_closed_qty: '0',
       inventory_gap_qty: 0,
       pending_gas_fee_trades: 0,
       pending_pricing_positions: 0,
       skipped_unpriced_trades: 0,
+      transfer_in_count: 0,
+      transfer_out_count: 0,
+      transfer_pricing_gaps: 0,
     },
     realizedPnlUsdScaled: 0n,
+    totalDustLossUsdScaled: 0n,
     totalGasFeesUsdScaled: 0n,
     totalTrades: 0n,
     totalVolumeUsdScaled: 0n,
@@ -871,6 +1356,10 @@ function updateActivityMarkers(position, blockNumber, blockTimestamp) {
 
 function consumeInventoryWithoutPnl(position, amount, stats) {
   let remaining = amount;
+  let externalCostBasisRelieved = 0n;
+  let tradedCostBasisRelieved = 0n;
+  let externalQuantityConsumed = 0n;
+  let tradedQuantityConsumed = 0n;
 
   if (position.externalQuantity > 0n) {
     const externalQtyBefore = position.externalQuantity;
@@ -879,15 +1368,15 @@ function consumeInventoryWithoutPnl(position, amount, stats) {
     position.externalQuantity -= externalConsumed;
     position.externalCostBasisUsdScaled -= externalCostRelieved;
     remaining -= externalConsumed;
+    externalQuantityConsumed += externalConsumed;
+    externalCostBasisRelieved += externalCostRelieved;
   }
 
   if (remaining > 0n && position.tradedQuantity > 0n) {
-    const tradedQtyBefore = position.tradedQuantity;
-    const tradedConsumed = minBigInt(remaining, tradedQtyBefore);
-    const tradedCostRelieved = proportionalShare(position.tradedCostBasisUsdScaled, tradedConsumed, tradedQtyBefore);
-    position.tradedQuantity -= tradedConsumed;
-    position.tradedCostBasisUsdScaled -= tradedCostRelieved;
-    remaining -= tradedConsumed;
+    const consumed = consumeTradeLots(position, remaining);
+    remaining -= consumed.quantity;
+    tradedQuantityConsumed += consumed.quantity;
+    tradedCostBasisRelieved += consumed.costBasisUsdScaled;
   }
 
   if (remaining > 0n) {
@@ -895,9 +1384,20 @@ function consumeInventoryWithoutPnl(position, amount, stats) {
     position.metadata.inventory_gap_qty += Number(remaining);
     stats.metadata.inventory_gap_qty += Number(remaining);
   }
+
+  trimDustLots(position, stats);
+
+  return {
+    costBasisUsdScaled: externalCostBasisRelieved + tradedCostBasisRelieved,
+    externalCostBasisRelieved,
+    externalQuantityConsumed,
+    inventoryGap: remaining,
+    tradedCostBasisRelieved,
+    tradedQuantityConsumed,
+  };
 }
 
-function consumeTradeSellInventory(position, { amountSold, proceedsUsdScaled }) {
+function consumeTradeSellInventory(position, { amountSold, proceedsUsdScaled }, stats) {
   let remaining = amountSold;
   let externalQuantitySold = 0n;
   let tradedQuantitySold = 0n;
@@ -914,11 +1414,9 @@ function consumeTradeSellInventory(position, { amountSold, proceedsUsdScaled }) 
   }
 
   if (remaining > 0n && position.tradedQuantity > 0n) {
-    const tradedQtyBefore = position.tradedQuantity;
-    tradedQuantitySold = minBigInt(remaining, tradedQtyBefore);
-    tradedCostBasisRelieved = proportionalShare(position.tradedCostBasisUsdScaled, tradedQuantitySold, tradedQtyBefore);
-    position.tradedQuantity -= tradedQuantitySold;
-    position.tradedCostBasisUsdScaled -= tradedCostBasisRelieved;
+    const consumed = consumeTradeLots(position, remaining);
+    tradedQuantitySold = consumed.quantity;
+    tradedCostBasisRelieved = consumed.costBasisUsdScaled;
     remaining -= tradedQuantitySold;
 
     const proceedsForTraded = amountSold === 0n
@@ -927,12 +1425,113 @@ function consumeTradeSellInventory(position, { amountSold, proceedsUsdScaled }) 
     realizedPnlUsdScaled = proceedsForTraded - tradedCostBasisRelieved;
   }
 
+  trimDustLots(position, stats);
+
   return {
     externalQuantitySold,
     inventoryGap: remaining,
     realizedPnlUsdScaled,
     tradedCostBasisRelieved,
     tradedQuantitySold,
+  };
+}
+
+function addTradeLot(position, { blockNumber, costBasisUsdScaled, quantity, tradeKey }) {
+  if (quantity <= 0n) {
+    return;
+  }
+
+  position.tradedQuantity += quantity;
+  position.tradedCostBasisUsdScaled += costBasisUsdScaled;
+  position.tradeLots.push({
+    blockNumber,
+    costBasisUsdScaled,
+    quantity,
+    tradeKey,
+  });
+}
+
+function trimDustLots(position, stats) {
+  const dustThresholdRaw = resolveDustThresholdRaw(position.tokenDecimals);
+  if (dustThresholdRaw <= 0n || position.tradeLots.length === 0) {
+    return;
+  }
+
+  const remainingLots = [];
+  let trimmedCostBasisUsdScaled = 0n;
+  let trimmedLotCount = 0;
+  let trimmedQuantity = 0n;
+
+  for (const lot of position.tradeLots) {
+    if (lot.quantity > 0n && lot.quantity <= dustThresholdRaw) {
+      trimmedLotCount += 1;
+      trimmedQuantity += lot.quantity;
+      trimmedCostBasisUsdScaled += lot.costBasisUsdScaled;
+      continue;
+    }
+
+    remainingLots.push(lot);
+  }
+
+  if (trimmedLotCount === 0) {
+    return;
+  }
+
+  position.tradeLots = remainingLots;
+  position.tradedQuantity = maxBigInt(0n, position.tradedQuantity - trimmedQuantity);
+  const boundedDustLossUsdScaled = minBigInt(trimmedCostBasisUsdScaled, position.tradedCostBasisUsdScaled);
+  position.tradedCostBasisUsdScaled = maxBigInt(0n, position.tradedCostBasisUsdScaled - boundedDustLossUsdScaled);
+  position.dustLossUsdScaled += boundedDustLossUsdScaled;
+  position.metadata.fifo_dust_closed_lots += trimmedLotCount;
+  appendMetadataBigInt(position.metadata, 'fifo_dust_closed_qty', trimmedQuantity);
+
+  if (stats) {
+    stats.totalDustLossUsdScaled += boundedDustLossUsdScaled;
+    stats.metadata.fifo_dust_closed_lots += trimmedLotCount;
+    appendMetadataBigInt(stats.metadata, 'fifo_dust_closed_qty', trimmedQuantity);
+  }
+}
+
+function consumeTradeLots(position, amount) {
+  let remaining = amount;
+  let consumedQuantity = 0n;
+  let consumedCostBasisUsdScaled = 0n;
+
+  while (remaining > 0n && position.tradeLots.length > 0) {
+    const lot = position.tradeLots[0];
+    const lotQuantityBefore = lot.quantity;
+    const lotConsumed = minBigInt(remaining, lotQuantityBefore);
+    const lotCostRelieved = proportionalShare(lot.costBasisUsdScaled, lotConsumed, lotQuantityBefore);
+
+    lot.quantity -= lotConsumed;
+    lot.costBasisUsdScaled -= lotCostRelieved;
+    remaining -= lotConsumed;
+    consumedQuantity += lotConsumed;
+    consumedCostBasisUsdScaled += lotCostRelieved;
+
+    if (lot.quantity === 0n) {
+      position.tradeLots.shift();
+    }
+  }
+
+  const fallbackAvailable = position.tradedQuantity - consumedQuantity;
+  if (remaining > 0n && fallbackAvailable > 0n) {
+    const fallbackConsumed = minBigInt(remaining, fallbackAvailable);
+    const fallbackCostAvailable = position.tradedCostBasisUsdScaled - consumedCostBasisUsdScaled;
+    const fallbackCostRelieved = proportionalShare(fallbackCostAvailable, fallbackConsumed, fallbackAvailable);
+
+    remaining -= fallbackConsumed;
+    consumedQuantity += fallbackConsumed;
+    consumedCostBasisUsdScaled += fallbackCostRelieved;
+  }
+
+  const boundedCostBasis = minBigInt(consumedCostBasisUsdScaled, position.tradedCostBasisUsdScaled);
+  position.tradedQuantity -= consumedQuantity;
+  position.tradedCostBasisUsdScaled -= boundedCostBasis;
+
+  return {
+    costBasisUsdScaled: boundedCostBasis,
+    quantity: consumedQuantity,
   };
 }
 
@@ -950,6 +1549,112 @@ function proportionalShare(totalScaled, portionRaw, totalRaw) {
 
 function minBigInt(left, right) {
   return compareBigInt(left, right) <= 0 ? left : right;
+}
+
+function maxBigInt(left, right) {
+  return compareBigInt(left, right) >= 0 ? left : right;
+}
+
+function appendMetadataBigInt(metadata, key, delta) {
+  const current = BigInt(metadata[key] ?? '0');
+  metadata[key] = (current + delta).toString(10);
+}
+
+function resolveDustThresholdRaw(tokenDecimals) {
+  if (tokenDecimals === null || tokenDecimals === undefined) {
+    return 0n;
+  }
+
+  const decimals = BigInt(tokenDecimals);
+  if (decimals >= BigInt(DEFAULT_SCALE)) {
+    return FIFO_DUST_THRESHOLD_SCALED * (10n ** (decimals - BigInt(DEFAULT_SCALE)));
+  }
+
+  return FIFO_DUST_THRESHOLD_SCALED / (10n ** (BigInt(DEFAULT_SCALE) - decimals));
+}
+
+function parseOptionalUsdScaled(value) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return null;
+  }
+
+  return decimalStringToScaled(String(value).trim(), DEFAULT_SCALE);
+}
+
+async function upsertPriceMissingAudit(client, audit) {
+  const existing = await client.query(
+    `SELECT audit_id
+       FROM stark_audit_discrepancies
+      WHERE lane = $1
+        AND discrepancy_type = 'PRICE_MISSING_AUDIT'
+        AND transaction_hash = $2
+        AND source_event_index = $3
+        AND token_address = $4
+        AND holder_address = $5
+      ORDER BY audit_id DESC
+      LIMIT 1`,
+    [
+      audit.lane,
+      audit.transactionHash,
+      toNumericString(audit.sourceEventIndex, 'price audit source event index'),
+      audit.tokenAddress,
+      audit.holderAddress,
+    ],
+  );
+
+  if (existing.rowCount > 0) {
+    await client.query(
+      `UPDATE stark_audit_discrepancies
+          SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
+              updated_at = NOW()
+        WHERE audit_id = $1`,
+      [existing.rows[0].audit_id, toJsonbString(audit.metadata ?? {})],
+    );
+    return;
+  }
+
+  await client.query(
+    `INSERT INTO stark_audit_discrepancies (
+         lane,
+         discrepancy_type,
+         block_number,
+         block_hash,
+         transaction_hash,
+         transaction_index,
+         source_event_index,
+         transfer_key,
+         token_address,
+         holder_address,
+         balance_before,
+         delta_amount,
+         attempted_balance_after,
+         resolved_balance,
+         resolution_status,
+         suspected_cause,
+         metadata,
+         created_at,
+         updated_at
+     ) VALUES (
+         $1, 'PRICE_MISSING_AUDIT', $2, $3, $4, $5, $6, NULL, $7, $8,
+         0, 0, 0, 0, 'logged', 'missing_historical_gas_price_anchor', $9::jsonb, NOW(), NOW()
+     )`,
+    [
+      audit.lane,
+      toNumericString(audit.blockNumber, 'price audit block number'),
+      audit.blockHash,
+      audit.transactionHash,
+      toNumericString(audit.transactionIndex, 'price audit transaction index'),
+      toNumericString(audit.sourceEventIndex, 'price audit source event index'),
+      audit.tokenAddress,
+      audit.holderAddress,
+      toJsonbString({
+        ...audit.metadata,
+        gas_fee_amount: audit.gasFeeAmount === null || audit.gasFeeAmount === undefined ? null : audit.gasFeeAmount.toString(10),
+        gas_fee_token_address: audit.gasFeeTokenAddress ?? null,
+        trade_key: audit.tradeKey ?? null,
+      }),
+    ],
+  );
 }
 
 async function insertWalletPnlEvent(client, event) {
@@ -1026,6 +1731,7 @@ async function upsertWalletPosition(client, row) {
          total_quantity,
          traded_cost_basis_usd,
          external_cost_basis_usd,
+         dust_loss_usd,
          average_traded_entry_price_usd,
          last_price_usd,
          realized_pnl_usd,
@@ -1042,7 +1748,7 @@ async function upsertWalletPosition(client, row) {
          updated_at
      ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, NOW(), NOW()
+         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21::jsonb, NOW(), NOW()
      )`,
     [
       row.lane,
@@ -1053,6 +1759,7 @@ async function upsertWalletPosition(client, row) {
       toNumericString(row.totalQuantity, 'wallet position total quantity'),
       scaledToNumericString(row.tradedCostBasisUsdScaled, DEFAULT_SCALE),
       scaledToNumericString(row.externalCostBasisUsdScaled, DEFAULT_SCALE),
+      scaledToNumericString(row.dustLossUsdScaled, DEFAULT_SCALE),
       scaledOrNullToNumeric(row.averageTradedEntryPriceUsdScaled),
       scaledOrNullToNumeric(row.lastPriceUsdScaled),
       scaledToNumericString(row.realizedPnlUsdScaled, DEFAULT_SCALE),
@@ -1079,6 +1786,7 @@ async function upsertWalletStats(client, row) {
          total_trades,
          total_volume_usd,
          total_gas_fees_usd,
+         total_dust_loss_usd,
          realized_pnl_usd,
          unrealized_pnl_usd,
          net_pnl_usd,
@@ -1105,7 +1813,7 @@ async function upsertWalletStats(client, row) {
      ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
          $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-         $21, $22, $23, $24, $25, $26, $27, $28::jsonb, NOW(), NOW()
+         $21, $22, $23, $24, $25, $26, $27, $28, $29::jsonb, NOW(), NOW()
      )`,
     [
       row.lane,
@@ -1115,6 +1823,7 @@ async function upsertWalletStats(client, row) {
       toNumericString(row.totalTrades, 'wallet stats total trades'),
       scaledToNumericString(row.totalVolumeUsdScaled, DEFAULT_SCALE),
       scaledToNumericString(row.totalGasFeesUsdScaled, DEFAULT_SCALE),
+      scaledToNumericString(row.totalDustLossUsdScaled, DEFAULT_SCALE),
       scaledToNumericString(row.realizedPnlUsdScaled, DEFAULT_SCALE),
       scaledToNumericString(row.unrealizedPnlUsdScaled, DEFAULT_SCALE),
       scaledToNumericString(row.netPnlUsdScaled, DEFAULT_SCALE),
