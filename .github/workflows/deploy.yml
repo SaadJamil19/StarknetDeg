@@ -1,0 +1,140 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      sha_tag: ${{ steps.image.outputs.sha_tag }}
+      latest_tag: ${{ steps.image.outputs.latest_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image tags
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${image}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${image}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ vars.GHCR_USER || github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: production
+          push: true
+          tags: |
+            ${{ steps.image.outputs.sha_tag }}
+            ${{ steps.image.outputs.latest_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    if: ${{ vars.ENABLE_PRODUCTION_DEPLOY == 'true' }}
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    environment: production
+    steps:
+      - name: Deploy over SSH
+        shell: bash
+        env:
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SERVER_SSH_HOST_KEY: ${{ secrets.SERVER_SSH_HOST_KEY }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GHCR_USER: ${{ vars.GHCR_USER || github.repository_owner }}
+          STARKNETDEG_IMAGE: ${{ needs.build.outputs.latest_tag }}
+          SERVER_APP_DIR: ${{ vars.SERVER_APP_DIR }}
+        run: |
+          set -euo pipefail
+
+          for required_var in SERVER_IP SERVER_USER SSH_PRIVATE_KEY GHCR_TOKEN; do
+            if [ -z "${!required_var}" ]; then
+              echo "::error::${required_var} is required for production deploys."
+              exit 1
+            fi
+          done
+
+          if [ -z "$SERVER_SSH_HOST_KEY" ]; then
+            echo "::error::SERVER_SSH_HOST_KEY is required. Do not disable SSH host-key checking for production deploys."
+            exit 1
+          fi
+
+          key_file="$(mktemp)"
+          known_hosts_file="$(mktemp)"
+          trap 'rm -f "$key_file" "$known_hosts_file"' EXIT
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$key_file"
+          chmod 600 "$key_file"
+          printf '%s\n' "$SERVER_SSH_HOST_KEY" > "$known_hosts_file"
+
+          remote_app_dir="${SERVER_APP_DIR:-~/StarknetDeg}"
+
+          ssh \
+            -i "$key_file" \
+            -o IdentitiesOnly=yes \
+            -o UserKnownHostsFile="$known_hosts_file" \
+            -o StrictHostKeyChecking=yes \
+            "${SERVER_USER}@${SERVER_IP}" \
+            bash -s -- "$remote_app_dir" "$STARKNETDEG_IMAGE" "$GHCR_USER" <<REMOTE_SCRIPT
+          set -euo pipefail
+
+          app_dir="\$1"
+          image="\$2"
+          ghcr_user="\$3"
+
+          case "\$app_dir" in
+            "~") app_dir="\$HOME" ;;
+            "~/"*) app_dir="\$HOME/\${app_dir#~/}" ;;
+          esac
+
+          cd "\$app_dir"
+
+          if [ ! -f docker-compose.yml ]; then
+            echo "docker-compose.yml not found in \$app_dir"
+            exit 1
+          fi
+
+          if [ ! -f .env ]; then
+            echo ".env not found in \$app_dir"
+            exit 1
+          fi
+
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "\$ghcr_user" --password-stdin
+
+          if grep -q '^STARKNETDEG_IMAGE=' .env; then
+            sed -i "s|^STARKNETDEG_IMAGE=.*|STARKNETDEG_IMAGE=\$image|" .env
+          else
+            printf '\nSTARKNETDEG_IMAGE=%s\n' "\$image" >> .env
+          fi
+
+          docker compose --profile workers --profile l1 pull && docker compose --profile workers --profile l1 up -d
+          docker image prune -f
+          REMOTE_SCRIPT

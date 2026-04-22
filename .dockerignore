@@ -1,0 +1,12 @@
+.git
+.env
+node_modules
+npm-debug.log
+Dockerfile
+docker-compose.yml
+_analysis_report
+*.zip
+*.docx
+err.txt
+output*.txt
+tmp_*.txt
