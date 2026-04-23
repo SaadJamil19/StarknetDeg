@@ -1,0 +1,46 @@
+module.exports = {
+  apps: [
+    {
+      name: 'main-indexer',
+      script: 'bin/start-indexer.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      time: true,
+    },
+    {
+      name: 'phase4-workers',
+      script: 'tools/run-group.js',
+      args: 'phase4',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      time: true,
+    },
+    {
+      name: 'phase6-workers',
+      script: 'tools/run-group.js',
+      args: 'phase6',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      time: true,
+    },
+    {
+      name: 'l1-indexer',
+      script: 'bin/start-l1-starkgate-indexer.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      time: true,
+    },
+    {
+      name: 'l1-matcher',
+      script: 'jobs/l1-cross-chain-matcher.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      time: true,
+    },
+  ],
+};

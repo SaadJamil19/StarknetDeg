@@ -135,6 +135,6 @@ jobs:
             printf '\nSTARKNETDEG_IMAGE=%s\n' "\$image" >> .env
           fi
 
-          docker compose --profile workers --profile l1 pull && docker compose --profile workers --profile l1 up -d
+          docker compose pull && docker compose up -d
           docker image prune -f
           REMOTE_SCRIPT

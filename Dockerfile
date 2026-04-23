@@ -10,12 +10,17 @@ FROM node:18-alpine AS production
 ENV NODE_ENV=production
 WORKDIR /app
 
+RUN apk add --no-cache postgresql-client \
+  && npm install -g pm2@5.4.3 \
+  && npm cache clean --force
+
 COPY --from=deps /app/node_modules ./node_modules
 COPY --chown=node:node . .
 
-RUN chmod +x docker/entrypoint.sh
+RUN sed -i 's/\r$//' docker/entrypoint.sh \
+  && chmod +x docker/entrypoint.sh
 
 USER node
 
-ENTRYPOINT ["/app/docker/entrypoint.sh"]
-CMD ["npm", "run", "start:indexer"]
+ENTRYPOINT ["sh", "/app/docker/entrypoint.sh"]
+CMD ["pm2-runtime", "ecosystem.config.js"]

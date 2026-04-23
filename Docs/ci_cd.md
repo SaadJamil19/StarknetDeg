@@ -10,21 +10,17 @@ When code is pushed to the `main` branch:
 2. GitHub pushes the image to GitHub Container Registry, also called GHCR.
 3. GitHub connects to the production server with SSH.
 4. The server pulls the newest image.
-5. Docker Compose restarts the full stack:
-   - main Starknet indexer
-   - Phase 4 workers
-   - Phase 6 workers
-   - L1 indexer
-   - L1 matcher
-   - Postgres stays attached to the same persistent volume
+5. Docker Compose restarts the two production containers:
+   - `app`, the `starknet-app` container that runs the main indexer, Phase 4, Phase 6, L1 indexer, and L1 matcher under PM2
+   - `db`, which keeps Postgres data in the same persistent volume
 
 The deploy command used on the server is:
 
 ```bash
-docker compose --profile workers --profile l1 pull && docker compose --profile workers --profile l1 up -d
+docker compose pull && docker compose up -d
 ```
 
-Those profile names match `docker-compose.yml`.
+The production `docker-compose.yml` does not use profiles.
 
 ## GitHub Secrets To Add
 
@@ -165,7 +161,7 @@ On the server:
 5. Confirm Docker works:
 
 ```bash
-docker compose --profile workers --profile l1 up -d
+docker compose up -d
 ```
 
 After that, GitHub Actions can deploy automatically.
@@ -197,11 +193,11 @@ Common failure reasons:
 On the server, check running containers:
 
 ```bash
-docker compose --profile workers --profile l1 ps
+docker compose ps
 ```
 
 Check logs:
 
 ```bash
-docker compose --profile workers --profile l1 logs -f
+docker compose logs -f
 ```

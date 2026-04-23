@@ -1,6 +1,17 @@
 # StarknetDeg Docker Deployment
 
-This repo ships a Docker setup for the StarknetDeg indexer and PostgreSQL.
+This repo uses a simple two-container production model:
+
+- `db`: PostgreSQL with persistent Docker volume storage
+- `app`: one Node.js container named `starknet-app`, supervised by PM2
+
+The app container starts these five processes:
+
+- main Starknet indexer
+- Phase 4 workers
+- Phase 6 workers
+- L1 StarkGate indexer
+- L1 matcher
 
 ## 1. Prepare `.env`
 
@@ -13,63 +24,70 @@ cp .env.example .env
 Required values:
 
 - `STARKNET_RPC_URL`
-- `ETH_RPC_URL` if L1 StarkGate indexing is enabled
-- `PGDATABASE`, `PGUSER`, `PGPASSWORD`
+- `ETH_RPC_URL`
+- `PGDATABASE`
+- `PGUSER`
+- `PGPASSWORD`
 
-When running through Docker Compose, `PGHOST` is automatically overridden to the internal `postgres` service.
-Do not set `DATABASE_URL` unless you intentionally want the app container to use an external database; `DATABASE_URL` takes precedence over `PGHOST`.
+For Docker Compose, keep:
 
-## 2. Start the L2 indexer and database
+```env
+PGHOST=db
+PGPORT=5432
+RUN_MIGRATIONS=true
+```
+
+Do not set `DATABASE_URL` for the two-container setup. The compose file clears `DATABASE_URL` inside the app container so the app always uses the internal `db` service.
+
+## 2. Start Production Stack
 
 ```bash
 docker compose up -d --build
 ```
 
-This starts:
+This starts only:
 
-- `postgres`
-- `indexer`
+- `db`
+- `app`
 
-The `postgres_data` Docker volume persists database files across container restarts.
+Postgres is not published to the host. It is reachable only from the app container through the private Docker network.
 
 ## 3. Migrations
 
-The app container runs SQL migrations automatically before starting the Node process.
+The app entrypoint waits for Postgres, runs:
+
+```bash
+npm run migrate
+```
+
+Then it starts PM2.
+
+Migrations are read from `sql/` and applied in numeric order, so `0010_l1_new_tables.sql` runs after `009_trade_chaining.sql`.
 
 Manual migration command:
 
 ```bash
-docker compose run --rm indexer npm run migrate
+docker compose run --rm app npm run migrate
 ```
 
-Migrations are read from `sql/` and applied in numeric order, so `0010_l1_new_tables.sql` runs after `009_trade_chaining.sql`.
+## 4. Logs and Operations
 
-## 4. Optional workers
-
-Start Phase 4 and Phase 6 background workers:
+View all logs:
 
 ```bash
-docker compose --profile workers up -d --build
+docker compose logs -f
 ```
 
-Start L1 StarkGate indexer and matcher:
+View app logs only:
 
 ```bash
-docker compose --profile l1 up -d --build
+docker compose logs -f app
 ```
 
-You can combine profiles:
+Check containers:
 
 ```bash
-docker compose --profile workers --profile l1 up -d --build
-```
-
-## 5. Logs and operations
-
-View logs:
-
-```bash
-docker compose logs -f indexer
+docker compose ps
 ```
 
 Stop services without deleting data:

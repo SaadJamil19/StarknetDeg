@@ -1,78 +1,59 @@
-x-starknetdeg-app: &starknetdeg-app
-  image: ${STARKNETDEG_IMAGE:-starknetdeg-indexer:latest}
-  build:
-    context: .
-    target: production
-  restart: unless-stopped
-  env_file:
-    - .env
-  environment: &starknetdeg-env
-    NODE_ENV: production
-    PGHOST: postgres
-    PGPORT: 5432
-    PGDATABASE: ${PGDATABASE:-StarknetDeg}
-    PGUSER: ${PGUSER:-postgres}
-    PGPASSWORD: ${PGPASSWORD:-postgres}
-    RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
-    MIGRATION_RETRIES: ${MIGRATION_RETRIES:-60}
-    MIGRATION_RETRY_DELAY_MS: ${MIGRATION_RETRY_DELAY_MS:-1000}
-  depends_on:
-    postgres:
-      condition: service_healthy
-  networks:
-    - starknetdeg
-
 services:
-  postgres:
+  db:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${PGDATABASE:-StarknetDeg}
       POSTGRES_USER: ${PGUSER:-postgres}
       POSTGRES_PASSWORD: ${PGPASSWORD:-postgres}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Keep SQL migrations available to the DB container, but let the app
+      # migration runner apply them in the repository's numeric order.
+      - ./sql:/docker-entrypoint-initdb.d/sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-postgres} -d ${PGDATABASE:-StarknetDeg}"]
       interval: 10s
       timeout: 5s
       retries: 10
     networks:
-      - starknetdeg
+      - db_internal
 
-  indexer:
-    <<: *starknetdeg-app
-    command: ["npm", "run", "start:indexer"]
-
-  phase4-workers:
-    <<: *starknetdeg-app
-    profiles:
-      - workers
-    command: ["npm", "run", "start:phase4"]
-
-  phase6-workers:
-    <<: *starknetdeg-app
-    profiles:
-      - workers
-    command: ["npm", "run", "start:phase6"]
-
-  l1-indexer:
-    <<: *starknetdeg-app
-    profiles:
-      - l1
-    command: ["npm", "run", "start:l1-indexer"]
-
-  l1-matcher:
-    <<: *starknetdeg-app
-    profiles:
-      - l1
-    command: ["npm", "run", "start:l1-matcher"]
+  app:
+    container_name: starknet-app
+    image: ${STARKNETDEG_IMAGE:-starknetdeg-app:latest}
+    build:
+      context: .
+      target: production
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ""
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: ${PGDATABASE:-StarknetDeg}
+      PGUSER: ${PGUSER:-postgres}
+      PGPASSWORD: ${PGPASSWORD:-postgres}
+      RUN_MIGRATIONS: "true"
+      DB_WAIT_RETRIES: ${DB_WAIT_RETRIES:-60}
+      DB_WAIT_DELAY_SECONDS: ${DB_WAIT_DELAY_SECONDS:-2}
+      MIGRATION_RETRIES: ${MIGRATION_RETRIES:-60}
+      MIGRATION_RETRY_DELAY_MS: ${MIGRATION_RETRY_DELAY_MS:-1000}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - app_network
+      - db_internal
 
 networks:
-  starknetdeg:
+  app_network:
     driver: bridge
+  db_internal:
+    driver: bridge
+    internal: true
 
 volumes:
   postgres_data:
