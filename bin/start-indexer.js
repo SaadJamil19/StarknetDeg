@@ -24,7 +24,7 @@ const {
 } = require('../core/checkpoint');
 const { seedKnownTokens } = require('../core/token-registry');
 const { FINALITY_LANES, normalizeFinalityStatus } = require('../core/finality');
-const { closePool, withClient, withTransaction } = require('../lib/db');
+const { closePool, isFatalDatabaseError, withClient, withTransaction } = require('../lib/db');
 const { closeRedis } = require('../lib/redis');
 const { StarknetRpcClient } = require('../lib/starknet-rpc');
 const { toBigIntStrict } = require('../lib/cairo/bigint');
@@ -35,14 +35,24 @@ async function main() {
   const indexerKey = process.env.INDEXER_KEY || 'starknetdeg-mainnet';
   const lane = normalizeFinalityStatus(process.env.INDEXER_LANE || FINALITY_LANES.ACCEPTED_ON_L2);
   const pollIntervalMs = parsePositiveInteger(process.env.INDEXER_POLL_INTERVAL_MS, 10_000);
-  const catchupBatchSize = parsePositiveInteger(process.env.INDEXER_CATCHUP_BATCH_SIZE, 25);
+  const catchupBatchSize = parsePositiveInteger(process.env.INDEXER_CATCHUP_BATCH_SIZE, 50);
+  const prefetchWindowSize = parsePositiveInteger(process.env.INDEXER_PREFETCH_WINDOW_SIZE, 50);
+  const prefetchWindowMax = parsePositiveInteger(process.env.INDEXER_PREFETCH_WINDOW_MAX, 400);
+  const smallBlockTxThreshold = parsePositiveInteger(process.env.INDEXER_SMALL_BLOCK_TX_THRESHOLD, 5);
+  const smallBlockGrowthFactor = parsePositiveInteger(process.env.INDEXER_SMALL_BLOCK_GROWTH_FACTOR, 2);
   const configuredStartBlock = parseOptionalBigInt(process.env.INDEXER_START_BLOCK);
   const startMode = process.env.INDEXER_START_MODE || 'genesis';
   const startTargets = parseCsv(process.env.INDEXER_START_TARGETS);
   const turboMode = parseBoolean(process.env.INDEXER_TURBO_MODE, false);
   const turboParallelism = parsePositiveInteger(process.env.INDEXER_TURBO_PARALLELISM, 4);
+  const prefetchConcurrency = Math.min(
+    parsePositiveInteger(process.env.INDEXER_PREFETCH_CONCURRENCY, 10),
+    turboParallelism,
+    10,
+  );
   const skipRealtime = parseBoolean(process.env.INDEXER_SKIP_REALTIME, turboMode);
   const rpcClient = new StarknetRpcClient();
+  let adaptivePrefetchWindow = Math.min(prefetchWindowSize, prefetchWindowMax);
   let initialStartBlock = configuredStartBlock ?? 0n;
 
   if (lane !== FINALITY_LANES.ACCEPTED_ON_L2) {
@@ -78,7 +88,7 @@ async function main() {
     : journalRanges.map((range) => `${range.lane}:${range.minBlockNumber?.toString() ?? 'none'}-${range.maxBlockNumber?.toString() ?? 'none'} rows=${range.rowCount.toString()}`).join(',');
 
   console.log(
-    `[phase4] StarknetDeg indexer starting indexerKey=${indexerKey} lane=${lane} start_mode=${startMode} start_targets=${startTargets.length === 0 ? 'all' : startTargets.join('|')} initial_start_block=${initialStartBlock.toString()} turbo=${turboMode} turbo_parallelism=${turboParallelism} skip_realtime=${skipRealtime} journal_range=${rangeSummary} previewLane=${FINALITY_LANES.PRE_CONFIRMED} anchorLane=${FINALITY_LANES.ACCEPTED_ON_L1}`,
+    `[phase4] StarknetDeg indexer starting indexerKey=${indexerKey} lane=${lane} start_mode=${startMode} start_targets=${startTargets.length === 0 ? 'all' : startTargets.join('|')} initial_start_block=${initialStartBlock.toString()} turbo=${turboMode} turbo_parallelism=${turboParallelism} prefetch_concurrency=${prefetchConcurrency} skip_realtime=${skipRealtime} catchup_batch=${catchupBatchSize} prefetch_window=${adaptivePrefetchWindow}/${prefetchWindowMax} small_block_tx_threshold=${smallBlockTxThreshold} journal_range=${rangeSummary} previewLane=${FINALITY_LANES.PRE_CONFIRMED} anchorLane=${FINALITY_LANES.ACCEPTED_ON_L1}`,
   );
 
   while (!shuttingDown) {
@@ -105,23 +115,28 @@ async function main() {
 
       let processedInBatch = 0;
       let cursor = nextBlock;
+      let smallBlocksInBatch = 0;
       let prefetchedPayloads = [];
+      const batchStartedAt = Date.now();
+      const effectiveBatchSize = turboMode
+        ? Math.max(1, Math.min(catchupBatchSize, adaptivePrefetchWindow))
+        : catchupBatchSize;
 
       if (turboMode) {
         const blockNumbers = [];
         let prefetchCursor = cursor;
-        while (prefetchCursor <= latestAcceptedBlock && blockNumbers.length < catchupBatchSize) {
+        while (prefetchCursor <= latestAcceptedBlock && blockNumbers.length < effectiveBatchSize) {
           blockNumbers.push(prefetchCursor);
           prefetchCursor += 1n;
         }
         prefetchedPayloads = await prefetchAcceptedBlockPayloads({
           blockNumbers,
-          concurrency: turboParallelism,
+          concurrency: prefetchConcurrency,
           rpcClient,
         });
       }
 
-      while (!shuttingDown && cursor <= latestAcceptedBlock && processedInBatch < catchupBatchSize) {
+      while (!shuttingDown && cursor <= latestAcceptedBlock && processedInBatch < effectiveBatchSize) {
         const result = await processAcceptedBlock({
           blockNumber: cursor,
           indexerKey,
@@ -139,9 +154,38 @@ async function main() {
         if (result.realtimeError) {
           console.error(`[phase4] realtime publish warning: ${result.realtimeError}`);
         }
+        if (turboMode && Number(result.summary.total ?? 0) < smallBlockTxThreshold) {
+          smallBlocksInBatch += 1;
+        }
 
         cursor += 1n;
         processedInBatch += 1;
+      }
+
+      if (turboMode && processedInBatch > 0) {
+        if (smallBlocksInBatch === processedInBatch && adaptivePrefetchWindow < prefetchWindowMax) {
+          const grownWindow = Math.min(prefetchWindowMax, adaptivePrefetchWindow * smallBlockGrowthFactor);
+          if (grownWindow !== adaptivePrefetchWindow) {
+            adaptivePrefetchWindow = grownWindow;
+            console.log(`[phase4] turbo window increased to ${adaptivePrefetchWindow} due to low-activity blocks`);
+          }
+        } else if (smallBlocksInBatch < Math.ceil(processedInBatch / 2) && adaptivePrefetchWindow > prefetchWindowSize) {
+          const reducedWindow = Math.max(prefetchWindowSize, Math.floor(adaptivePrefetchWindow / smallBlockGrowthFactor));
+          if (reducedWindow !== adaptivePrefetchWindow) {
+            adaptivePrefetchWindow = reducedWindow;
+            console.log(`[phase4] turbo window reduced to ${adaptivePrefetchWindow} due to higher-activity blocks`);
+          }
+        }
+      }
+
+      if (processedInBatch > 0) {
+        const elapsedSeconds = Math.max((Date.now() - batchStartedAt) / 1000, 0.001);
+        const currentBlock = cursor - 1n;
+        const remainingLag = latestAcceptedBlock > currentBlock ? latestAcceptedBlock - currentBlock : 0n;
+        const batchBps = processedInBatch / elapsedSeconds;
+        console.log(
+          `[phase4] progress current=${currentBlock.toString()} head=${latestAcceptedBlock.toString()} remaining_lag=${remainingLag.toString()} bps=${batchBps.toFixed(3)} processed=${processedInBatch}`,
+        );
       }
 
       if (processedInBatch === 0) {
@@ -149,6 +193,10 @@ async function main() {
       }
     } catch (error) {
       console.error(`[phase4] indexer loop error: ${formatError(error)}`);
+      if (isFatalDatabaseError(error)) {
+        console.error('[phase4] fatal database connectivity issue detected; exiting for supervisor restart.');
+        throw error;
+      }
       await sleep(pollIntervalMs);
     }
   }

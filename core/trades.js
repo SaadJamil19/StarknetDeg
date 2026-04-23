@@ -86,8 +86,6 @@ async function persistTradesForBlock(client, { blockHash, blockNumber, blockTime
     if (!trade) {
       continue;
     }
-
-    await upsertTrade(client, trade);
     trades.push(trade);
 
     if (trade.pendingEnrichment) {
@@ -111,6 +109,8 @@ async function persistTradesForBlock(client, { blockHash, blockNumber, blockTime
       priceCandidates.push(candidate);
     }
   }
+
+  await bulkUpsertTrades(client, trades);
 
   if (pendingMetadataTokenAddresses.size > 0) {
     await enqueueTokenMetadataRefresh(client, {
@@ -1193,174 +1193,214 @@ async function loadSwapActions(client, { blockNumber, lane }) {
 }
 
 async function upsertTrade(client, trade) {
-  await client.query(
-    `INSERT INTO stark_trades (
-         trade_key,
-         lane,
-         block_number,
-         block_hash,
-         block_timestamp,
-         transaction_hash,
-         transaction_index,
-         source_event_index,
-         protocol,
-         router_protocol,
-         execution_protocol,
-         pool_id,
-         route_group_key,
-         sequence_id,
-         is_multi_hop,
-         hop_index,
-         total_hops,
-         trader_address,
-         locker_address,
-         token0_address,
-         token1_address,
-         token_in_address,
-         token_out_address,
-         amount0_delta,
-         amount1_delta,
-         volume_token0,
-         volume_token1,
-         amount_in,
-         amount_out,
-         amount_in_human,
-         amount_out_human,
-         liquidity_after,
-         sqrt_ratio_after,
-         tick_after,
-         tick_spacing,
-         fee_tier,
-         extension_address,
-         price_raw_execution,
-         price_raw_token1_per_token0,
-         price_raw_token0_per_token1,
-         price_token1_per_token0,
-         price_token0_per_token1,
-         price_deviation_pct,
-         price_is_decimals_normalized,
-         pending_enrichment,
-         hops_from_stable,
-         is_aggregator_derived,
-         price_source,
-         notional_usd,
-         bucket_1m,
-         metadata,
-         created_at,
-         updated_at
-     ) VALUES (
-         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-         $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
-         $31, $32, $33, $34, $35, $36, $37, $38, $39, $40,
-         $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51::jsonb, NOW(), NOW()
-     )
-     ON CONFLICT (transaction_hash, source_event_index)
-     DO UPDATE SET
-         trade_key = EXCLUDED.trade_key,
-         lane = EXCLUDED.lane,
-         block_number = EXCLUDED.block_number,
-         block_hash = EXCLUDED.block_hash,
-         block_timestamp = EXCLUDED.block_timestamp,
-         transaction_index = EXCLUDED.transaction_index,
-         protocol = EXCLUDED.protocol,
-         router_protocol = EXCLUDED.router_protocol,
-         execution_protocol = EXCLUDED.execution_protocol,
-         pool_id = EXCLUDED.pool_id,
-         route_group_key = EXCLUDED.route_group_key,
-         sequence_id = EXCLUDED.sequence_id,
-         is_multi_hop = EXCLUDED.is_multi_hop,
-         hop_index = EXCLUDED.hop_index,
-         total_hops = EXCLUDED.total_hops,
-         trader_address = EXCLUDED.trader_address,
-         locker_address = EXCLUDED.locker_address,
-         token0_address = EXCLUDED.token0_address,
-         token1_address = EXCLUDED.token1_address,
-         token_in_address = EXCLUDED.token_in_address,
-         token_out_address = EXCLUDED.token_out_address,
-         amount0_delta = EXCLUDED.amount0_delta,
-         amount1_delta = EXCLUDED.amount1_delta,
-         volume_token0 = EXCLUDED.volume_token0,
-         volume_token1 = EXCLUDED.volume_token1,
-         amount_in = EXCLUDED.amount_in,
-         amount_out = EXCLUDED.amount_out,
-         amount_in_human = EXCLUDED.amount_in_human,
-         amount_out_human = EXCLUDED.amount_out_human,
-         liquidity_after = EXCLUDED.liquidity_after,
-         sqrt_ratio_after = EXCLUDED.sqrt_ratio_after,
-         tick_after = EXCLUDED.tick_after,
-         tick_spacing = EXCLUDED.tick_spacing,
-         fee_tier = EXCLUDED.fee_tier,
-         extension_address = EXCLUDED.extension_address,
-         price_raw_execution = EXCLUDED.price_raw_execution,
-         price_raw_token1_per_token0 = EXCLUDED.price_raw_token1_per_token0,
-         price_raw_token0_per_token1 = EXCLUDED.price_raw_token0_per_token1,
-         price_token1_per_token0 = EXCLUDED.price_token1_per_token0,
-         price_token0_per_token1 = EXCLUDED.price_token0_per_token1,
-         price_deviation_pct = EXCLUDED.price_deviation_pct,
-         price_is_decimals_normalized = EXCLUDED.price_is_decimals_normalized,
-         pending_enrichment = EXCLUDED.pending_enrichment,
-         hops_from_stable = EXCLUDED.hops_from_stable,
-         is_aggregator_derived = EXCLUDED.is_aggregator_derived,
-         price_source = EXCLUDED.price_source,
-         notional_usd = EXCLUDED.notional_usd,
-         bucket_1m = EXCLUDED.bucket_1m,
-         metadata = EXCLUDED.metadata,
-         updated_at = NOW()`,
-    [
-      trade.tradeKey,
-      trade.lane,
-      toNumericString(trade.blockNumber, 'trade block number'),
-      trade.blockHash,
-      trade.blockTimestampDate,
-      trade.transactionHash,
-      toNumericString(trade.transactionIndex, 'trade transaction index'),
-      toNumericString(trade.sourceEventIndex, 'trade source event index'),
-      trade.protocol,
-      trade.routerProtocol ?? null,
-      trade.executionProtocol,
-      trade.poolId,
-      trade.routeGroupKey ?? null,
-      trade.sequenceId === null || trade.sequenceId === undefined ? null : toNumericString(trade.sequenceId, 'trade sequence id'),
-      trade.isMultiHop,
-      trade.hopIndex === null || trade.hopIndex === undefined ? null : toNumericString(trade.hopIndex, 'trade hop index'),
-      trade.totalHops === null || trade.totalHops === undefined ? null : toNumericString(trade.totalHops, 'trade total hops'),
-      trade.traderAddress ?? null,
-      trade.lockerAddress ?? null,
-      trade.token0Address,
-      trade.token1Address,
-      trade.tokenInAddress,
-      trade.tokenOutAddress,
-      toNumericString(trade.amount0Delta, 'trade amount0 delta'),
-      toNumericString(trade.amount1Delta, 'trade amount1 delta'),
-      toNumericString(trade.volumeToken0, 'trade volume token0'),
-      toNumericString(trade.volumeToken1, 'trade volume token1'),
-      toNumericString(trade.amountIn, 'trade amount in'),
-      toNumericString(trade.amountOut, 'trade amount out'),
-      trade.amountInHumanScaled === null ? null : scaledToNumericString(trade.amountInHumanScaled, DEFAULT_SCALE),
-      trade.amountOutHumanScaled === null ? null : scaledToNumericString(trade.amountOutHumanScaled, DEFAULT_SCALE),
-      trade.liquidityAfter === null ? null : toNumericString(trade.liquidityAfter, 'trade liquidity after'),
-      trade.sqrtRatioAfter === null ? null : toNumericString(trade.sqrtRatioAfter, 'trade sqrt ratio after'),
-      trade.tickAfter === null ? null : toNumericString(trade.tickAfter, 'trade tick after'),
-      trade.tickSpacing === null || trade.tickSpacing === undefined ? null : toNumericString(trade.tickSpacing, 'trade tick spacing'),
-      trade.feeTier === null || trade.feeTier === undefined ? null : toNumericString(trade.feeTier, 'trade fee tier'),
-      trade.extensionAddress ?? null,
-      trade.priceRawExecutionScaled === null ? null : scaledToNumericString(trade.priceRawExecutionScaled, DEFAULT_SCALE),
-      scaledToNumericString(trade.priceRawToken1PerToken0Scaled, DEFAULT_SCALE),
-      scaledToNumericString(trade.priceRawToken0PerToken1Scaled, DEFAULT_SCALE),
-      scaledToNumericString(trade.priceToken1PerToken0Scaled, DEFAULT_SCALE),
-      scaledToNumericString(trade.priceToken0PerToken1Scaled, DEFAULT_SCALE),
-      trade.priceDeviationPctScaled === null ? null : scaledToNumericString(trade.priceDeviationPctScaled, DEFAULT_SCALE),
-      trade.priceIsDecimalsNormalized,
-      trade.pendingEnrichment,
-      trade.hopsFromStable === null || trade.hopsFromStable === undefined ? null : toNumericString(trade.hopsFromStable, 'trade hops from stable'),
-      trade.isAggregatorDerived,
-      trade.priceSource,
-      trade.notionalUsdScaled === null ? null : scaledToNumericString(trade.notionalUsdScaled, DEFAULT_SCALE),
-      trade.bucketStart,
-      toJsonbString(trade.metadata),
-    ],
-  );
+  await bulkUpsertTrades(client, [trade]);
+}
+
+async function bulkUpsertTrades(client, trades) {
+  if (!Array.isArray(trades) || trades.length === 0) {
+    return;
+  }
+
+  const chunkSize = parsePositiveInteger(process.env.INDEXER_TRADE_UPSERT_BATCH_SIZE, 1000);
+  for (const chunk of chunkRows(trades, chunkSize)) {
+    const rows = chunk.map((trade) => buildTradeUpsertRow(trade));
+    const { params, valuesSql } = buildValuesSql(rows, (offset) => {
+      const placeholders = Array.from({ length: 50 }, (_, index) => `$${offset + index}`);
+      return `(${placeholders.join(', ')}, $${offset + 50}::jsonb, NOW(), NOW())`;
+    });
+
+    await client.query(
+      `INSERT INTO stark_trades (
+           trade_key,
+           lane,
+           block_number,
+           block_hash,
+           block_timestamp,
+           transaction_hash,
+           transaction_index,
+           source_event_index,
+           protocol,
+           router_protocol,
+           execution_protocol,
+           pool_id,
+           route_group_key,
+           sequence_id,
+           is_multi_hop,
+           hop_index,
+           total_hops,
+           trader_address,
+           locker_address,
+           token0_address,
+           token1_address,
+           token_in_address,
+           token_out_address,
+           amount0_delta,
+           amount1_delta,
+           volume_token0,
+           volume_token1,
+           amount_in,
+           amount_out,
+           amount_in_human,
+           amount_out_human,
+           liquidity_after,
+           sqrt_ratio_after,
+           tick_after,
+           tick_spacing,
+           fee_tier,
+           extension_address,
+           price_raw_execution,
+           price_raw_token1_per_token0,
+           price_raw_token0_per_token1,
+           price_token1_per_token0,
+           price_token0_per_token1,
+           price_deviation_pct,
+           price_is_decimals_normalized,
+           pending_enrichment,
+           hops_from_stable,
+           is_aggregator_derived,
+           price_source,
+           notional_usd,
+           bucket_1m,
+           metadata,
+           created_at,
+           updated_at
+       ) VALUES ${valuesSql}
+       ON CONFLICT (transaction_hash, source_event_index)
+       DO UPDATE SET
+           trade_key = EXCLUDED.trade_key,
+           lane = EXCLUDED.lane,
+           block_number = EXCLUDED.block_number,
+           block_hash = EXCLUDED.block_hash,
+           block_timestamp = EXCLUDED.block_timestamp,
+           transaction_index = EXCLUDED.transaction_index,
+           protocol = EXCLUDED.protocol,
+           router_protocol = EXCLUDED.router_protocol,
+           execution_protocol = EXCLUDED.execution_protocol,
+           pool_id = EXCLUDED.pool_id,
+           route_group_key = EXCLUDED.route_group_key,
+           sequence_id = EXCLUDED.sequence_id,
+           is_multi_hop = EXCLUDED.is_multi_hop,
+           hop_index = EXCLUDED.hop_index,
+           total_hops = EXCLUDED.total_hops,
+           trader_address = EXCLUDED.trader_address,
+           locker_address = EXCLUDED.locker_address,
+           token0_address = EXCLUDED.token0_address,
+           token1_address = EXCLUDED.token1_address,
+           token_in_address = EXCLUDED.token_in_address,
+           token_out_address = EXCLUDED.token_out_address,
+           amount0_delta = EXCLUDED.amount0_delta,
+           amount1_delta = EXCLUDED.amount1_delta,
+           volume_token0 = EXCLUDED.volume_token0,
+           volume_token1 = EXCLUDED.volume_token1,
+           amount_in = EXCLUDED.amount_in,
+           amount_out = EXCLUDED.amount_out,
+           amount_in_human = EXCLUDED.amount_in_human,
+           amount_out_human = EXCLUDED.amount_out_human,
+           liquidity_after = EXCLUDED.liquidity_after,
+           sqrt_ratio_after = EXCLUDED.sqrt_ratio_after,
+           tick_after = EXCLUDED.tick_after,
+           tick_spacing = EXCLUDED.tick_spacing,
+           fee_tier = EXCLUDED.fee_tier,
+           extension_address = EXCLUDED.extension_address,
+           price_raw_execution = EXCLUDED.price_raw_execution,
+           price_raw_token1_per_token0 = EXCLUDED.price_raw_token1_per_token0,
+           price_raw_token0_per_token1 = EXCLUDED.price_raw_token0_per_token1,
+           price_token1_per_token0 = EXCLUDED.price_token1_per_token0,
+           price_token0_per_token1 = EXCLUDED.price_token0_per_token1,
+           price_deviation_pct = EXCLUDED.price_deviation_pct,
+           price_is_decimals_normalized = EXCLUDED.price_is_decimals_normalized,
+           pending_enrichment = EXCLUDED.pending_enrichment,
+           hops_from_stable = EXCLUDED.hops_from_stable,
+           is_aggregator_derived = EXCLUDED.is_aggregator_derived,
+           price_source = EXCLUDED.price_source,
+           notional_usd = EXCLUDED.notional_usd,
+           bucket_1m = EXCLUDED.bucket_1m,
+           metadata = EXCLUDED.metadata,
+           updated_at = NOW()`,
+      params,
+    );
+  }
+}
+
+function buildTradeUpsertRow(trade) {
+  return [
+    trade.tradeKey,
+    trade.lane,
+    toNumericString(trade.blockNumber, 'trade block number'),
+    trade.blockHash,
+    trade.blockTimestampDate,
+    trade.transactionHash,
+    toNumericString(trade.transactionIndex, 'trade transaction index'),
+    toNumericString(trade.sourceEventIndex, 'trade source event index'),
+    trade.protocol,
+    trade.routerProtocol ?? null,
+    trade.executionProtocol,
+    trade.poolId,
+    trade.routeGroupKey ?? null,
+    trade.sequenceId === null || trade.sequenceId === undefined ? null : toNumericString(trade.sequenceId, 'trade sequence id'),
+    trade.isMultiHop,
+    trade.hopIndex === null || trade.hopIndex === undefined ? null : toNumericString(trade.hopIndex, 'trade hop index'),
+    trade.totalHops === null || trade.totalHops === undefined ? null : toNumericString(trade.totalHops, 'trade total hops'),
+    trade.traderAddress ?? null,
+    trade.lockerAddress ?? null,
+    trade.token0Address,
+    trade.token1Address,
+    trade.tokenInAddress,
+    trade.tokenOutAddress,
+    toNumericString(trade.amount0Delta, 'trade amount0 delta'),
+    toNumericString(trade.amount1Delta, 'trade amount1 delta'),
+    toNumericString(trade.volumeToken0, 'trade volume token0'),
+    toNumericString(trade.volumeToken1, 'trade volume token1'),
+    toNumericString(trade.amountIn, 'trade amount in'),
+    toNumericString(trade.amountOut, 'trade amount out'),
+    trade.amountInHumanScaled === null ? null : scaledToNumericString(trade.amountInHumanScaled, DEFAULT_SCALE),
+    trade.amountOutHumanScaled === null ? null : scaledToNumericString(trade.amountOutHumanScaled, DEFAULT_SCALE),
+    trade.liquidityAfter === null ? null : toNumericString(trade.liquidityAfter, 'trade liquidity after'),
+    trade.sqrtRatioAfter === null ? null : toNumericString(trade.sqrtRatioAfter, 'trade sqrt ratio after'),
+    trade.tickAfter === null ? null : toNumericString(trade.tickAfter, 'trade tick after'),
+    trade.tickSpacing === null || trade.tickSpacing === undefined ? null : toNumericString(trade.tickSpacing, 'trade tick spacing'),
+    trade.feeTier === null || trade.feeTier === undefined ? null : toNumericString(trade.feeTier, 'trade fee tier'),
+    trade.extensionAddress ?? null,
+    trade.priceRawExecutionScaled === null ? null : scaledToNumericString(trade.priceRawExecutionScaled, DEFAULT_SCALE),
+    scaledToNumericString(trade.priceRawToken1PerToken0Scaled, DEFAULT_SCALE),
+    scaledToNumericString(trade.priceRawToken0PerToken1Scaled, DEFAULT_SCALE),
+    scaledToNumericString(trade.priceToken1PerToken0Scaled, DEFAULT_SCALE),
+    scaledToNumericString(trade.priceToken0PerToken1Scaled, DEFAULT_SCALE),
+    trade.priceDeviationPctScaled === null ? null : scaledToNumericString(trade.priceDeviationPctScaled, DEFAULT_SCALE),
+    trade.priceIsDecimalsNormalized,
+    trade.pendingEnrichment,
+    trade.hopsFromStable === null || trade.hopsFromStable === undefined ? null : toNumericString(trade.hopsFromStable, 'trade hops from stable'),
+    trade.isAggregatorDerived,
+    trade.priceSource,
+    trade.notionalUsdScaled === null ? null : scaledToNumericString(trade.notionalUsdScaled, DEFAULT_SCALE),
+    trade.bucketStart,
+    toJsonbString(trade.metadata),
+  ];
+}
+
+function buildValuesSql(rows, buildValueGroup) {
+  const params = [];
+  const groups = [];
+  let offset = 1;
+
+  for (const row of rows) {
+    groups.push(buildValueGroup(offset));
+    params.push(...row);
+    offset += row.length;
+  }
+
+  return {
+    params,
+    valuesSql: groups.join(', '),
+  };
+}
+
+function chunkRows(rows, chunkSize) {
+  const chunks = [];
+  for (let index = 0; index < rows.length; index += chunkSize) {
+    chunks.push(rows.slice(index, index + chunkSize));
+  }
+  return chunks;
 }
 
 async function repricePendingEnrichmentTrades(client, { tokenAddresses }) {
@@ -1406,6 +1446,7 @@ async function repricePendingEnrichmentTrades(client, { tokenAddresses }) {
       lane,
       poolIds: items.map((item) => item.poolId),
     });
+    const laneTrades = [];
 
     for (const item of items) {
       const trade = deriveTrade(item, {
@@ -1424,14 +1465,16 @@ async function repricePendingEnrichmentTrades(client, { tokenAddresses }) {
         continue;
       }
 
-      await upsertTrade(client, trade);
+      laneTrades.push(trade);
       affectedBuckets.set(`${lane}:${trade.poolId}:${trade.bucketStart.toISOString()}`, {
         bucketStart: trade.bucketStart,
         lane,
         poolId: trade.poolId,
       });
-      repricedTrades += 1;
     }
+
+    await bulkUpsertTrades(client, laneTrades);
+    repricedTrades += laneTrades.length;
   }
 
   return {
@@ -1565,6 +1608,19 @@ function parseBoolean(value, fallbackValue) {
   }
 
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+function parsePositiveInteger(value, fallbackValue) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return fallbackValue;
+  }
+
+  const parsed = Number.parseInt(String(value).trim(), 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return fallbackValue;
+  }
+
+  return parsed;
 }
 
 function parseNonNegativeBigInt(value, fallbackValue) {

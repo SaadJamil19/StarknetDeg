@@ -3,16 +3,23 @@ services:
     image: postgres:16-alpine
     container_name: starknet-db-1
     restart: unless-stopped
-    # This maps the host's local port 5438 to the container's 5432
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - work_mem=16MB
     ports:
-      - "127.0.0.1:5438:5432"
+      - "${PGHOST_BIND_ADDRESS:-127.0.0.1}:${PGHOST_PORT:-5438}:5432"
     environment:
       POSTGRES_DB: ${PGDATABASE:-StarknetDeg}
       POSTGRES_USER: ${PGUSER:-postgres}
       POSTGRES_PASSWORD: ${PGPASSWORD:-postgres}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./sql:/docker-entrypoint-initdb.d/sql:ro
+      - ./sql:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-postgres} -d ${PGDATABASE:-StarknetDeg}"]
       interval: 10s
@@ -43,6 +50,67 @@ services:
       DB_WAIT_DELAY_SECONDS: ${DB_WAIT_DELAY_SECONDS:-2}
       MIGRATION_RETRIES: ${MIGRATION_RETRIES:-60}
       MIGRATION_RETRY_DELAY_MS: ${MIGRATION_RETRY_DELAY_MS:-1000}
+      PGSTATEMENT_TIMEOUT_MS: ${PGSTATEMENT_TIMEOUT_MS:-60000}
+      PGQUERY_TIMEOUT_MS: ${PGQUERY_TIMEOUT_MS:-65000}
+      PGIDLE_TIMEOUT_MS: ${PGIDLE_TIMEOUT_MS:-10000}
+      DB_POOL_MAX: ${DB_POOL_MAX_MAIN:-10}
+      HEALTHCHECK_PORT: ${HEALTHCHECK_PORT:-3100}
+      HEALTHCHECK_PM2_TIMEOUT_MS: ${HEALTHCHECK_PM2_TIMEOUT_MS:-3000}
+      PM2_REQUIRED_PROCESSES: ${PM2_REQUIRED_PROCESSES:-main-indexer,phase4-workers,phase6-workers,l1-indexer,l1-matcher}
+      EXIT_ON_DB_DISCONNECT: ${EXIT_ON_DB_DISCONNECT:-true}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:${HEALTHCHECK_PORT:-3100}/healthz > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - app_network
+
+  backfill-worker:
+    image: ${STARKNETDEG_IMAGE:-starknetdeg-app:latest}
+    build:
+      context: .
+      target: production
+    profiles:
+      - backfill
+    restart: on-failure
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ""
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: ${PGDATABASE:-StarknetDeg}
+      PGUSER: ${PGUSER:-postgres}
+      PGPASSWORD: ${PGPASSWORD:-postgres}
+      RUN_MIGRATIONS: "false"
+      DB_WAIT_RETRIES: ${DB_WAIT_RETRIES:-60}
+      DB_WAIT_DELAY_SECONDS: ${DB_WAIT_DELAY_SECONDS:-2}
+      PGSTATEMENT_TIMEOUT_MS: ${PGSTATEMENT_TIMEOUT_MS:-60000}
+      PGQUERY_TIMEOUT_MS: ${PGQUERY_TIMEOUT_MS:-65000}
+      PGIDLE_TIMEOUT_MS: ${PGIDLE_TIMEOUT_MS:-10000}
+      BACKFILL_WORKER_MODE: "true"
+      DB_POOL_MAX: ${DB_POOL_MAX_BACKFILL:-5}
+      INDEXER_TURBO_MODE: ${INDEXER_TURBO_MODE:-true}
+      INDEXER_SKIP_REALTIME: "true"
+      BACKFILL_TOTAL_WORKERS: ${BACKFILL_TOTAL_WORKERS:-1}
+      BACKFILL_CHUNK_SIZE: ${BACKFILL_CHUNK_SIZE:-2000000}
+      BACKFILL_WINDOW_SIZE: ${BACKFILL_WINDOW_SIZE:-50}
+      BACKFILL_WINDOW_MAX: ${BACKFILL_WINDOW_MAX:-800}
+      BACKFILL_PARALLELISM: ${BACKFILL_PARALLELISM:-8}
+      BACKFILL_POLL_INTERVAL_MS: ${BACKFILL_POLL_INTERVAL_MS:-1000}
+      BACKFILL_SMALL_BLOCK_TX_THRESHOLD: ${BACKFILL_SMALL_BLOCK_TX_THRESHOLD:-5}
+      BACKFILL_SMALL_BLOCK_GROWTH_FACTOR: ${BACKFILL_SMALL_BLOCK_GROWTH_FACTOR:-2}
+      BACKFILL_INDEXER_KEY_PREFIX: ${BACKFILL_INDEXER_KEY_PREFIX:-starknetdeg-mainnet-backfill}
+      BACKFILL_INDEX_LEADER: ${BACKFILL_INDEX_LEADER:-true}
+      INDEXER_TURBO_REBUILD_AT_LAG: ${INDEXER_TURBO_REBUILD_AT_LAG:-10000}
+      INDEXER_TURBO_LOCAL_PREFETCH_SIZE: ${INDEXER_TURBO_LOCAL_PREFETCH_SIZE:-32MB}
+    command: ["node", "scripts/turbo-backfill.js"]
     depends_on:
       db:
         condition: service_healthy

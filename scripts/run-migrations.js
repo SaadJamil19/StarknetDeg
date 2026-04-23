@@ -61,10 +61,22 @@ async function main() {
 
 function buildClientConfig() {
   const ssl = resolveSslConfig();
+  const statementTimeoutMs = parseNonNegativeInteger(
+    process.env.PGSTATEMENT_TIMEOUT_MS,
+    60_000,
+    'PGSTATEMENT_TIMEOUT_MS',
+  );
+  const queryTimeoutMs = parseNonNegativeInteger(
+    process.env.PGQUERY_TIMEOUT_MS,
+    statementTimeoutMs + 5_000,
+    'PGQUERY_TIMEOUT_MS',
+  );
 
   if (process.env.DATABASE_URL) {
     return {
       connectionString: process.env.DATABASE_URL,
+      query_timeout: queryTimeoutMs,
+      statement_timeout: statementTimeoutMs,
       ssl,
     };
   }
@@ -74,6 +86,8 @@ function buildClientConfig() {
     host: process.env.PGHOST || '127.0.0.1',
     password: process.env.PGPASSWORD || 'postgres',
     port: parsePositiveInteger(process.env.PGPORT, 5432),
+    query_timeout: queryTimeoutMs,
+    statement_timeout: statementTimeoutMs,
     ssl,
     user: process.env.PGUSER || 'postgres',
   };
@@ -168,6 +182,19 @@ function parsePositiveInteger(value, fallbackValue) {
   const parsed = Number.parseInt(String(value).trim(), 10);
   if (!Number.isInteger(parsed) || parsed <= 0) {
     throw new Error(`Expected a positive integer but received: ${value}`);
+  }
+
+  return parsed;
+}
+
+function parseNonNegativeInteger(value, fallbackValue, label) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return fallbackValue;
+  }
+
+  const parsed = Number.parseInt(String(value).trim(), 10);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${label} must be a non-negative integer, received: ${value}`);
   }
 
   return parsed;

@@ -10,7 +10,7 @@ FROM node:18-alpine AS production
 ENV NODE_ENV=production
 WORKDIR /app
 
-RUN apk add --no-cache postgresql-client \
+RUN apk add --no-cache postgresql-client curl \
   && npm install -g pm2@5.4.3 \
   && npm cache clean --force
 

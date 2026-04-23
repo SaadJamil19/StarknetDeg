@@ -23,8 +23,17 @@ while ! pg_isready -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" >/dev
 done
 
 echo "[entrypoint] postgres is ready"
-echo "[entrypoint] running migrations"
-npm run migrate
-echo "[entrypoint] migrations complete"
+
+run_migrations="$(printf '%s' "${RUN_MIGRATIONS:-true}" | tr '[:upper:]' '[:lower:]')"
+case "$run_migrations" in
+  1|true|yes|on)
+    echo "[entrypoint] running migrations"
+    npm run migrate
+    echo "[entrypoint] migrations complete"
+    ;;
+  *)
+    echo "[entrypoint] skipping migrations (RUN_MIGRATIONS=${RUN_MIGRATIONS:-false})"
+    ;;
+esac
 
 exec "$@"

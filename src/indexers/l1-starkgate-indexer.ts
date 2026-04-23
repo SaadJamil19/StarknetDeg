@@ -5,7 +5,7 @@ require('dotenv').config({ path: path.resolve(__dirname, '..', '..', '.env') });
 
 const { setTimeout: sleep } = require('node:timers/promises');
 const { assertL1Tables } = require('../../core/checkpoint');
-const { closePool, withClient, withTransaction } = require('../../lib/db');
+const { closePool, isFatalDatabaseError, withClient, withTransaction } = require('../../lib/db');
 const { EthereumRpcClient } = require('../../lib/ethereum-rpc');
 const { decodeStarkgateLog, STARKGATE_L1_CONTRACTS, normalizeEthAddress } = require('../../lib/l1-starkgate');
 
@@ -55,6 +55,10 @@ async function main() {
       );
     } catch (error) {
       console.error(`[phase5] l1-starkgate-indexer error: ${formatError(error)}`);
+      if (isFatalDatabaseError(error)) {
+        console.error('[phase5] l1-starkgate-indexer fatal database connectivity issue detected; exiting for supervisor restart.');
+        throw error;
+      }
       await sleep(pollIntervalMs);
     }
   }

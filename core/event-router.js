@@ -282,9 +282,7 @@ async function persistResultBundle(client, tx, bundle) {
     await upsertAction(client, tx, action);
   }
 
-  for (const transfer of bundle.transfers ?? []) {
-    await upsertTransfer(client, tx, transfer);
-  }
+  await bulkUpsertTransfers(client, tx, bundle.transfers ?? []);
 
   for (const bridge of bundle.bridges ?? []) {
     await upsertBridge(client, tx, bridge);
@@ -292,6 +290,86 @@ async function persistResultBundle(client, tx, bundle) {
 
   for (const audit of bundle.audits ?? []) {
     await insertAudit(client, audit);
+  }
+}
+
+async function bulkUpsertTransfers(client, tx, transfers) {
+  if (!Array.isArray(transfers) || transfers.length === 0) {
+    return;
+  }
+
+  const chunkSize = parsePositiveInteger(process.env.INDEXER_TRANSFER_UPSERT_BATCH_SIZE, 1000);
+  for (const chunk of chunkRows(transfers, chunkSize)) {
+    const rows = chunk.map((transfer) => [
+      transfer.transferKey,
+      tx.lane,
+      toNumericString(tx.blockNumber, 'block number'),
+      tx.blockHash,
+      tx.transactionHash,
+      toNumericString(tx.transactionIndex, 'transaction index'),
+      toNumericString(transfer.sourceEventIndex, 'source event index'),
+      transfer.tokenAddress,
+      transfer.fromAddress,
+      transfer.toAddress,
+      toNumericString(transfer.amount, 'transfer amount'),
+      transfer.amountHumanScaled === undefined || transfer.amountHumanScaled === null ? null : scaledToNumericString(transfer.amountHumanScaled, DEFAULT_SCALE),
+      transfer.amountUsdScaled === undefined || transfer.amountUsdScaled === null ? null : scaledToNumericString(transfer.amountUsdScaled, DEFAULT_SCALE),
+      transfer.tokenSymbol ?? null,
+      transfer.tokenName ?? null,
+      transfer.tokenDecimals === undefined || transfer.tokenDecimals === null ? null : toNumericString(transfer.tokenDecimals, 'transfer token decimals'),
+      transfer.transferType ?? 'standard_transfer',
+      Boolean(transfer.isInternal),
+      transfer.counterpartyType ?? 'unknown',
+      transfer.protocol,
+      toJsonbString(transfer.metadata ?? {}),
+    ]);
+
+    const { params, valuesSql } = buildValuesSql(rows, (offset) => {
+      const placeholders = Array.from({ length: 20 }, (_, index) => `$${offset + index}`);
+      return `(${placeholders.join(', ')}, $${offset + 20}::jsonb, NOW(), NOW())`;
+    });
+
+    await client.query(
+      `INSERT INTO stark_transfers (
+           transfer_key,
+           lane,
+           block_number,
+           block_hash,
+           transaction_hash,
+           transaction_index,
+           source_event_index,
+           token_address,
+           from_address,
+           to_address,
+           amount,
+           amount_human,
+           amount_usd,
+           token_symbol,
+           token_name,
+           token_decimals,
+           transfer_type,
+           is_internal,
+           counterparty_type,
+           protocol,
+           metadata,
+           created_at,
+           updated_at
+       ) VALUES ${valuesSql}
+       ON CONFLICT (transfer_key)
+       DO UPDATE SET
+           amount = EXCLUDED.amount,
+           amount_human = EXCLUDED.amount_human,
+           amount_usd = EXCLUDED.amount_usd,
+           token_symbol = EXCLUDED.token_symbol,
+           token_name = EXCLUDED.token_name,
+           token_decimals = EXCLUDED.token_decimals,
+           transfer_type = EXCLUDED.transfer_type,
+           is_internal = EXCLUDED.is_internal,
+           counterparty_type = EXCLUDED.counterparty_type,
+           metadata = EXCLUDED.metadata,
+           updated_at = NOW()`,
+      params,
+    );
   }
 }
 
@@ -692,6 +770,44 @@ function createReceiptContextController() {
 
     return result;
   }
+}
+
+function buildValuesSql(rows, buildValueGroup) {
+  const params = [];
+  const groups = [];
+  let offset = 1;
+
+  for (const row of rows) {
+    groups.push(buildValueGroup(offset));
+    params.push(...row);
+    offset += row.length;
+  }
+
+  return {
+    params,
+    valuesSql: groups.join(', '),
+  };
+}
+
+function chunkRows(rows, chunkSize) {
+  const chunks = [];
+  for (let index = 0; index < rows.length; index += chunkSize) {
+    chunks.push(rows.slice(index, index + chunkSize));
+  }
+  return chunks;
+}
+
+function parsePositiveInteger(value, fallbackValue) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return fallbackValue;
+  }
+
+  const parsed = Number.parseInt(String(value).trim(), 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`Expected a positive integer but received: ${value}`);
+  }
+
+  return parsed;
 }
 
 function buildDecoderFlushFailureAudit({ error, protocol, tx }) {

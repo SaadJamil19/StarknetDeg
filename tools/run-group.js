@@ -24,13 +24,19 @@ const GROUPS = Object.freeze({
     },
     {
       name: 'wallet-rollups',
-      script: 'jobs/wallet-rollups.js',
-      env: { PHASE6_WALLET_ROLLUPS_RUN_ONCE: 'false' },
+      script: 'scripts/defer-until-live.js',
+      args: ['jobs/wallet-rollups.js'],
+      env: {
+        PHASE6_WALLET_ROLLUPS_RUN_ONCE: 'false',
+      },
     },
     {
       name: 'concentration-rollups',
-      script: 'jobs/concentration-rollups.js',
-      env: { PHASE6_CONCENTRATION_RUN_ONCE: 'false' },
+      script: 'scripts/defer-until-live.js',
+      args: ['jobs/concentration-rollups.js'],
+      env: {
+        PHASE6_CONCENTRATION_RUN_ONCE: 'false',
+      },
     },
     {
       name: 'finality-promoter',
@@ -60,7 +66,7 @@ async function main() {
   console.log(`[launcher:${phase}] starting ${jobs.length} job(s) in one terminal`);
 
   for (const job of jobs) {
-    const child = spawn(process.execPath, [job.script], {
+    const child = spawn(process.execPath, [job.script, ...(Array.isArray(job.args) ? job.args : [])], {
       cwd: projectRoot,
       env: {
         ...process.env,

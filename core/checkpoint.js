@@ -429,6 +429,18 @@ async function getCheckpoint(client, { indexerKey, lane, forUpdate = false }) {
 
 async function advanceCheckpoint(client, payload) {
   const validLane = assertValidFinalityLane(payload.lane);
+  const lockResult = await client.query(
+    `SELECT 1
+       FROM stark_index_state
+      WHERE indexer_key = $1
+        AND lane = $2
+      FOR UPDATE`,
+    [payload.indexerKey, validLane],
+  );
+
+  if (lockResult.rowCount === 0) {
+    throw new Error(`Checkpoint row does not exist for ${payload.indexerKey}/${validLane}. Ensure ensureIndexStateRows ran first.`);
+  }
 
   await client.query(
     `UPDATE stark_index_state

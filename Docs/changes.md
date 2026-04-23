@@ -791,3 +791,40 @@ This file lists the report-driven schema enhancement and bug-fix changes in simp
   - orphan-safe pending re-decode fences
   - equal gas splitting across multi-event swap transactions
   - turbo management of audit-trail indexes
+
+## Changes 15: Worker Turbo Sync and Stability (Easy Summary)
+
+This section summarizes the latest worker/backfill updates in simple words:
+
+- Deployment model is now clearer:
+  - one main app container runs core processes with PM2
+  - optional `backfill-worker` containers are used only for fast historical sync
+- Backfill workers are parallel by chunk/range:
+  - each worker gets its own block range
+  - each worker uses its own `stark_index_state` key (`...-w1`, `...-w2`, etc.)
+  - this avoids checkpoint row contention between workers
+- Backfill checkpoint promotion is now safer:
+  - promotion validates range coverage before moving main checkpoint
+  - overlap/gap protection was added to reduce bad promotions
+- RPC fetch concurrency is now capped (no unbounded `Promise.all`):
+  - block prefetch and fallback requests use controlled concurrency
+  - this protects memory and RPC stability under load
+- DB session guardrails were added for long-running sync:
+  - statement/query timeout defaults added for stuck-query protection
+  - fail-fast option on DB disconnect so supervisor can restart cleanly
+- Pool-level connection caps were added:
+  - main indexer pool target: `10`
+  - backfill worker pool target: `5` each
+  - idle connections are released quickly (`idleTimeoutMillis=10000`)
+- Progress logs are more operator-friendly:
+  - logs now include `remaining_lag` and `bps`
+  - easier to see "distance to live" during catch-up
+- Container health visibility was improved:
+  - PM2 process state checks are documented
+  - health endpoint checks are documented for runtime verification
+- Postgres write-heavy tuning was applied in compose:
+  - `max_connections=200`
+  - `shared_buffers=1GB`
+  - `work_mem=16MB`
+- Runbook/docs were updated for production flow:
+  - first boot, health checks, backfill scale-up, promotion, and index rebuild guidance

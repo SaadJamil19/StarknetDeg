@@ -14,7 +14,11 @@ const { persistPriceDataForBlock, resetLatestPricesForBlock } = require('./price
 const { persistOhlcvForBlock } = require('./ohlcv');
 const { publishBlockRealtimeUpdates } = require('./realtime');
 
-const TURBO_BACKFILL_LIVE_BUFFER_BLOCKS = 1000n;
+const TURBO_BACKFILL_LIVE_BUFFER_BLOCKS = parseNonNegativeBigInt(
+  process.env.INDEXER_TURBO_REBUILD_AT_LAG,
+  10_000n,
+  'INDEXER_TURBO_REBUILD_AT_LAG',
+);
 const TURBO_BACKFILL_INDEX_DEFS = Object.freeze([
   { tableName: 'stark_transfers', name: 'stark_transfers_block_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_transfers_block_idx ON stark_transfers (lane, block_number, transaction_index, source_event_index)' },
   { tableName: 'stark_transfers', name: 'stark_transfers_token_idx', createSql: 'CREATE INDEX CONCURRENTLY IF NOT EXISTS stark_transfers_token_idx ON stark_transfers (token_address, block_number)' },
@@ -45,6 +49,8 @@ const turboBackfillMaintenanceState = {
 const TURBO_MAINTENANCE_WAIT_MS = 10 * 60 * 1000;
 const TURBO_MAINTENANCE_WAL_GROWTH_BYTES = parseNonNegativeBigInt(process.env.INDEXER_TURBO_WAL_GROWTH_BYTES, 268435456n, 'INDEXER_TURBO_WAL_GROWTH_BYTES');
 const TURBO_MAINTENANCE_WAL_SLEEP_MS = 60_000;
+const TURBO_LOCAL_PREFETCH_SIZE = String(process.env.INDEXER_TURBO_LOCAL_PREFETCH_SIZE ?? '32MB').trim();
+let turboLocalPrefetchSupported = null;
 
 function parseNonNegativeBigInt(value, fallbackValue, label) {
   if (value === undefined || value === null || String(value).trim() === '') {
@@ -57,6 +63,10 @@ function parseNonNegativeBigInt(value, fallbackValue, label) {
   }
 
   return parsed;
+}
+
+function escapeSqlStringLiteral(value) {
+  return String(value).replace(/'/g, "''");
 }
 
 async function processAcceptedBlock({
@@ -225,12 +235,14 @@ async function processAcceptedBlock({
   };
 }
 
-async function fetchAcceptedBlockPayload({ rpcClient, blockNumber }) {
+async function fetchAcceptedBlockPayload({ rpcClient, blockNumber, prefetched = null }) {
   const requestedBlockNumber = toBigIntStrict(blockNumber, 'block number');
-  const [block, stateUpdate] = await Promise.all([
-    rpcClient.getBlockWithReceipts(requestedBlockNumber),
-    rpcClient.getStateUpdate(requestedBlockNumber),
-  ]);
+  const [block, stateUpdate] = prefetched
+    ? [prefetched.block, prefetched.stateUpdate]
+    : await Promise.all([
+      rpcClient.getBlockWithReceipts(requestedBlockNumber),
+      rpcClient.getStateUpdate(requestedBlockNumber),
+    ]);
 
   const normalized = normalizeFetchedBlock({ block, requestedBlockNumber, stateUpdate });
   const emitterClassHashes = await resolveEmitterClassHashes({
@@ -245,13 +257,20 @@ async function fetchAcceptedBlockPayload({ rpcClient, blockNumber }) {
 async function prefetchAcceptedBlockPayloads({ blockNumbers, concurrency = 4, rpcClient }) {
   const numbers = Array.from(blockNumbers ?? []);
   const results = new Array(numbers.length);
+  const prefetchedRawPayloads = typeof rpcClient?.getBlockAndStateUpdateBatch === 'function'
+    ? await rpcClient.getBlockAndStateUpdateBatch(numbers)
+    : null;
   let cursor = 0;
 
   const workers = Array.from({ length: Math.max(1, Math.min(concurrency, numbers.length || 1)) }, async () => {
     while (cursor < numbers.length) {
       const index = cursor;
       cursor += 1;
-      results[index] = await fetchAcceptedBlockPayload({ blockNumber: numbers[index], rpcClient });
+      results[index] = await fetchAcceptedBlockPayload({
+        blockNumber: numbers[index],
+        prefetched: prefetchedRawPayloads ? prefetchedRawPayloads[index] : null,
+        rpcClient,
+      });
     }
   });
 
@@ -261,6 +280,23 @@ async function prefetchAcceptedBlockPayloads({ blockNumbers, concurrency = 4, rp
 
 async function applyTurboSessionSettings(client) {
   await client.query('SET LOCAL synchronous_commit = OFF');
+
+  if (!TURBO_LOCAL_PREFETCH_SIZE || turboLocalPrefetchSupported === false) {
+    return;
+  }
+
+  try {
+    await client.query(`SET LOCAL local_prefetch_size = '${escapeSqlStringLiteral(TURBO_LOCAL_PREFETCH_SIZE)}'`);
+    turboLocalPrefetchSupported = true;
+  } catch (error) {
+    const message = String(error?.message || '').toLowerCase();
+    if (message.includes('unrecognized configuration parameter')) {
+      turboLocalPrefetchSupported = false;
+      return;
+    }
+
+    throw error;
+  }
 }
 
 async function reconcileTurboBackfillIndexes({
