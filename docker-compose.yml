@@ -1,15 +1,17 @@
 services:
   db:
     image: postgres:16-alpine
+    container_name: starknet-db-1
     restart: unless-stopped
+    # This maps the host's local port 5438 to the container's 5432
+    ports:
+      - "127.0.0.1:5438:5432"
     environment:
       POSTGRES_DB: ${PGDATABASE:-StarknetDeg}
       POSTGRES_USER: ${PGUSER:-postgres}
       POSTGRES_PASSWORD: ${PGPASSWORD:-postgres}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # Keep SQL migrations available to the DB container, but let the app
-      # migration runner apply them in the repository's numeric order.
       - ./sql:/docker-entrypoint-initdb.d/sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-postgres} -d ${PGDATABASE:-StarknetDeg}"]
@@ -17,7 +19,7 @@ services:
       timeout: 5s
       retries: 10
     networks:
-      - db_internal
+      - app_network
 
   app:
     container_name: starknet-app
@@ -46,14 +48,10 @@ services:
         condition: service_healthy
     networks:
       - app_network
-      - db_internal
 
 networks:
   app_network:
     driver: bridge
-  db_internal:
-    driver: bridge
-    internal: true
 
 volumes:
   postgres_data:
