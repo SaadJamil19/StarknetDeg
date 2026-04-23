@@ -828,3 +828,7 @@ This section summarizes the latest worker/backfill updates in simple words:
   - `work_mem=16MB`
 - Runbook/docs were updated for production flow:
   - first boot, health checks, backfill scale-up, promotion, and index rebuild guidance
+- Fixed first-boot DB initialization instability in Docker Compose:
+  - `./sql` mount moved from `/docker-entrypoint-initdb.d` to `/docker-entrypoint-initdb.d/sql`
+  - this prevents Postgres from auto-executing mixed-order SQL files during `initdb`
+  - schema creation remains owned by app migrations for deterministic startup

@@ -19,7 +19,11 @@ services:
       POSTGRES_PASSWORD: ${PGPASSWORD:-postgres}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./sql:/docker-entrypoint-initdb.d:ro
+      # Keep SQL files mounted for operator access/debugging only.
+      # We intentionally do not mount directly at /docker-entrypoint-initdb.d
+      # because mixed filename ordering can break first-boot initialization.
+      # Schema creation is owned by app migrations (npm run migrate).
+      - ./sql:/docker-entrypoint-initdb.d/sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-postgres} -d ${PGDATABASE:-StarknetDeg}"]
       interval: 10s

@@ -43,6 +43,12 @@ What this does:
 - runs migrations
 - starts PM2 processes
 
+Important:
+
+- `./sql` is mounted at `/docker-entrypoint-initdb.d/sql` for reference/debug only.
+- Postgres auto-init execution from `/docker-entrypoint-initdb.d` is intentionally avoided.
+- Schema ownership is migration-driven (`npm run migrate`) to prevent first-boot failures from SQL filename ordering.
+
 ## 2) Check host sizing (for turbo tuning)
 
 ```bash
