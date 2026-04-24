@@ -885,3 +885,6 @@ This section summarizes the latest worker/backfill updates in simple words:
 - Confirmed high-throughput DB write pattern remains multi-row SQL.
   - transfer/trade persistence already uses chunked multi-row `VALUES` SQL generation
   - replay chunk defaults increased (`5000`) to reduce per-row query overhead during turbo backfill
+- Follow-up compatibility fix:
+  - removed `--optimize-for-size` from `NODE_OPTIONS` defaults because Node rejects this flag when passed via env
+  - the flag remains valid for direct CLI usage where needed

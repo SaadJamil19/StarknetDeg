@@ -23,7 +23,7 @@ Recommended production worker values:
 
 - `DB_POOL_MAX_MAIN=10`
 - `DB_POOL_MAX_BACKFILL=5`
-- `NODE_OPTIONS=--max-old-space-size=4096 --max-semi-space-size=128 --optimize-for-size`
+- `NODE_OPTIONS=--max-old-space-size=4096 --max-semi-space-size=128`
 - `ULIMIT_NOFILE=65535`
 - `PGSTATEMENT_TIMEOUT_MS=60000`
 - `PGQUERY_TIMEOUT_MS=65000`

@@ -57,10 +57,30 @@ async function main() {
     1,
     '--workers/BACKFILL_TOTAL_WORKERS',
   );
-  const workerIndex = resolveWorkerIndex(
+  const indexerKeyPrefix = String(process.env.BACKFILL_INDEXER_KEY_PREFIX || `${process.env.INDEXER_KEY || 'starknetdeg-mainnet'}-backfill`).trim();
+  const configuredWorkerIndex = resolveConfiguredWorkerIndex(
     cli.workerIndex ?? process.env.BACKFILL_WORKER_INDEX,
     totalWorkers,
   );
+  const claimTtlMs = parsePositiveInteger(
+    process.env.BACKFILL_WORKER_CLAIM_TTL_MS,
+    120_000,
+    'BACKFILL_WORKER_CLAIM_TTL_MS',
+  );
+  const claimRetryMs = parsePositiveInteger(
+    process.env.BACKFILL_WORKER_CLAIM_RETRY_MS,
+    1_000,
+    'BACKFILL_WORKER_CLAIM_RETRY_MS',
+  );
+  const workerOwnerId = `${os.hostname()}-${process.pid}-${Date.now()}`;
+  const workerIndex = configuredWorkerIndex ?? await claimWorkerIndexFromDb({
+    claimRetryMs,
+    claimTtlMs,
+    indexerKeyPrefix,
+    lane,
+    ownerId: workerOwnerId,
+    totalWorkers,
+  });
   const chunkSize = parsePositiveBigInt(
     cli.chunkSize ?? process.env.BACKFILL_CHUNK_SIZE,
     2_000_000n,
@@ -114,18 +134,22 @@ async function main() {
     workerIndex,
   });
   if (!chunkRange) {
+    if (configuredWorkerIndex === null) {
+      await releaseWorkerClaim({
+        indexerKeyPrefix,
+        lane,
+        ownerId: workerOwnerId,
+        workerIndex,
+      });
+    }
     console.log(
       `[turbo-backfill] worker ${workerIndex}/${totalWorkers} has no assigned range. start=${startBlock.toString()} end=${endBlock.toString()} chunk_size=${chunkSize.toString()}`,
     );
     return;
   }
 
-  const indexerKeyPrefix = String(process.env.BACKFILL_INDEXER_KEY_PREFIX || `${process.env.INDEXER_KEY || 'starknetdeg-mainnet'}-backfill`).trim();
   const indexerKey = `${indexerKeyPrefix}-w${workerIndex}`;
-  const indexLeader = parseBoolean(
-    process.env.BACKFILL_INDEX_LEADER,
-    workerIndex === 1,
-  );
+  const indexLeader = resolveIndexLeader(process.env.BACKFILL_INDEX_LEADER, workerIndex);
   const fastHeaderOnly = parseBoolean(process.env.BACKFILL_FAST_HEADER_ONLY, true);
   const useUnloggedTables = parseBoolean(process.env.BACKFILL_USE_UNLOGGED_TABLES, true);
   const restoreLoggedOnComplete = parseBoolean(process.env.BACKFILL_RESTORE_LOGGED_ON_COMPLETE, false);
@@ -164,6 +188,27 @@ async function main() {
     process.exit(staleWorkerExitCode);
   }, heartbeatIntervalMs);
   heartbeatMonitor.unref?.();
+  const claimHeartbeatIntervalMs = Math.max(5_000, Math.floor(claimTtlMs / 3));
+  const claimHeartbeatMonitor = configuredWorkerIndex === null
+    ? setInterval(async () => {
+      if (shuttingDown) {
+        return;
+      }
+
+      try {
+        await refreshWorkerClaim({
+          indexerKeyPrefix,
+          lane,
+          ownerId: workerOwnerId,
+          workerIndex,
+        });
+      } catch (error) {
+        console.error(`[turbo-backfill] worker=${workerIndex} claim heartbeat failed: ${formatError(error)}`);
+        process.exit(staleWorkerExitCode);
+      }
+    }, claimHeartbeatIntervalMs)
+    : null;
+  claimHeartbeatMonitor?.unref?.();
 
   try {
     await withTransaction(async (client) => {
@@ -310,6 +355,21 @@ async function main() {
     }
   } finally {
     clearInterval(heartbeatMonitor);
+    if (claimHeartbeatMonitor) {
+      clearInterval(claimHeartbeatMonitor);
+    }
+    if (configuredWorkerIndex === null) {
+      try {
+        await releaseWorkerClaim({
+          indexerKeyPrefix,
+          lane,
+          ownerId: workerOwnerId,
+          workerIndex,
+        });
+      } catch (error) {
+        console.error(`[turbo-backfill] worker=${workerIndex} release claim error: ${formatError(error)}`);
+      }
+    }
   }
 }
 
@@ -394,25 +454,136 @@ function resolveChunkRange({ startBlock, endBlock, chunkSize, workerIndex }) {
   return { start: rangeStart, end: rangeEnd };
 }
 
-function resolveWorkerIndex(value, totalWorkers) {
+function resolveConfiguredWorkerIndex(value, totalWorkers) {
   const explicit = value === undefined || value === null || String(value).trim() === ''
     ? null
     : parsePositiveInteger(value, null, '--worker-index/BACKFILL_WORKER_INDEX');
 
+  if (explicit !== null) {
+    if (explicit > totalWorkers) {
+      throw new Error(`Worker index ${explicit} exceeds total workers ${totalWorkers}`);
+    }
+    return explicit;
+  }
+
   const hostname = String(process.env.HOSTNAME || '').trim();
   const hostMatch = hostname.match(/-(\d+)$/);
   const fromHostname = hostMatch ? Number.parseInt(hostMatch[1], 10) : null;
-  const workerIndex = explicit ?? fromHostname ?? 1;
-
-  if (!Number.isInteger(workerIndex) || workerIndex <= 0) {
-    throw new Error(`Invalid worker index: ${workerIndex}`);
+  if (Number.isInteger(fromHostname) && fromHostname > 0 && fromHostname <= totalWorkers) {
+    return fromHostname;
   }
 
-  if (workerIndex > totalWorkers) {
-    throw new Error(`Worker index ${workerIndex} exceeds total workers ${totalWorkers}`);
+  return null;
+}
+
+async function claimWorkerIndexFromDb({
+  lane,
+  indexerKeyPrefix,
+  totalWorkers,
+  ownerId,
+  claimTtlMs,
+  claimRetryMs,
+}) {
+  const ttlSeconds = Math.max(1, Math.ceil(claimTtlMs / 1000));
+  const ttlInterval = `${ttlSeconds} seconds`;
+
+  while (!shuttingDown) {
+    const claimedWorkerIndex = await withTransaction(async (client) => {
+      await ensureWorkerClaimTable(client);
+      await client.query(
+        `DELETE FROM stark_backfill_worker_claims
+          WHERE lane = $1
+            AND indexer_key_prefix = $2
+            AND updated_at < NOW() - ($3::text)::interval`,
+        [lane, indexerKeyPrefix, ttlInterval],
+      );
+
+      for (let workerIndex = 1; workerIndex <= totalWorkers; workerIndex += 1) {
+        const claimed = await client.query(
+          `INSERT INTO stark_backfill_worker_claims (
+               lane,
+               indexer_key_prefix,
+               worker_slot,
+               owner_id,
+               claimed_at,
+               updated_at
+           ) VALUES ($1, $2, $3, $4, NOW(), NOW())
+           ON CONFLICT DO NOTHING
+           RETURNING worker_slot`,
+          [lane, indexerKeyPrefix, workerIndex, ownerId],
+        );
+        if (claimed.rowCount > 0) {
+          return workerIndex;
+        }
+      }
+
+      return null;
+    });
+
+    if (claimedWorkerIndex !== null) {
+      return claimedWorkerIndex;
+    }
+
+    await sleep(claimRetryMs);
   }
 
-  return workerIndex;
+  throw new Error('Worker claim interrupted by shutdown.');
+}
+
+async function refreshWorkerClaim({ lane, indexerKeyPrefix, workerIndex, ownerId }) {
+  await withClient(async (client) => {
+    const refreshed = await client.query(
+      `UPDATE stark_backfill_worker_claims
+          SET updated_at = NOW()
+        WHERE lane = $1
+          AND indexer_key_prefix = $2
+          AND worker_slot = $3
+          AND owner_id = $4`,
+      [lane, indexerKeyPrefix, workerIndex, ownerId],
+    );
+
+    if (refreshed.rowCount === 0) {
+      throw new Error(`worker claim lost lane=${lane} indexer_key_prefix=${indexerKeyPrefix} worker_slot=${workerIndex}`);
+    }
+  });
+}
+
+async function releaseWorkerClaim({ lane, indexerKeyPrefix, workerIndex, ownerId }) {
+  await withClient((client) => client.query(
+    `DELETE FROM stark_backfill_worker_claims
+      WHERE lane = $1
+        AND indexer_key_prefix = $2
+        AND worker_slot = $3
+        AND owner_id = $4`,
+    [lane, indexerKeyPrefix, workerIndex, ownerId],
+  ));
+}
+
+async function ensureWorkerClaimTable(client) {
+  await client.query(
+    `CREATE TABLE IF NOT EXISTS stark_backfill_worker_claims (
+       lane TEXT NOT NULL,
+       indexer_key_prefix TEXT NOT NULL,
+       worker_slot INTEGER NOT NULL,
+       owner_id TEXT NOT NULL,
+       claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       PRIMARY KEY (lane, indexer_key_prefix, worker_slot)
+     )`,
+  );
+}
+
+function resolveIndexLeader(value, workerIndex) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return workerIndex === 1;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (normalized === 'auto' || normalized === 'primary' || normalized === 'worker-1') {
+    return workerIndex === 1;
+  }
+
+  return parseBoolean(value, false);
 }
 
 function parseCliArgs(argv) {

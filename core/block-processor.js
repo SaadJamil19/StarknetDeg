@@ -80,6 +80,18 @@ function escapeSqlStringLiteral(value) {
   return String(value).replace(/'/g, "''");
 }
 
+async function runOptionalLocalSetting(client, statement) {
+  await client.query('SAVEPOINT turbo_optional_setting');
+  try {
+    await client.query(statement);
+    await client.query('RELEASE SAVEPOINT turbo_optional_setting');
+  } catch (error) {
+    await client.query('ROLLBACK TO SAVEPOINT turbo_optional_setting');
+    await client.query('RELEASE SAVEPOINT turbo_optional_setting');
+    throw error;
+  }
+}
+
 async function processAcceptedBlock({
   rpcClient,
   indexerKey,
@@ -495,7 +507,7 @@ async function applyTurboSessionSettings(client) {
 
   if (TURBO_SESSION_FSYNC_OFF && turboFsyncSessionSupported !== false) {
     try {
-      await client.query('SET LOCAL fsync = OFF');
+      await runOptionalLocalSetting(client, 'SET LOCAL fsync = OFF');
       turboFsyncSessionSupported = true;
     } catch (error) {
       const message = String(error?.message || '').toLowerCase();
@@ -516,7 +528,10 @@ async function applyTurboSessionSettings(client) {
   }
 
   try {
-    await client.query(`SET LOCAL local_prefetch_size = '${escapeSqlStringLiteral(TURBO_LOCAL_PREFETCH_SIZE)}'`);
+    await runOptionalLocalSetting(
+      client,
+      `SET LOCAL local_prefetch_size = '${escapeSqlStringLiteral(TURBO_LOCAL_PREFETCH_SIZE)}'`,
+    );
     turboLocalPrefetchSupported = true;
   } catch (error) {
     const message = String(error?.message || '').toLowerCase();
