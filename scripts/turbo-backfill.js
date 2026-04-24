@@ -40,6 +40,7 @@ async function main() {
 
   const cli = parseCliArgs(process.argv.slice(2));
   const lane = normalizeFinalityStatus(process.env.INDEXER_LANE || FINALITY_LANES.ACCEPTED_ON_L2);
+  const turboSkipSharedMarketState = parseBoolean(process.env.INDEXER_TURBO_SKIP_SHARED_MARKET_STATE, false);
   const rpcClient = new StarknetRpcClient();
 
   if (lane !== FINALITY_LANES.ACCEPTED_ON_L2) {
@@ -212,17 +213,19 @@ async function main() {
 
   try {
     await withTransaction(async (client) => {
-      await assertFoundationTables(client);
-      await assertPhase2Tables(client);
-      await assertPhase3Tables(client);
-      await assertPhase4Tables(client);
-      await assertMetadataSyncTables(client);
-      await assertSchemaEnhancementTables(client);
-      await assertSchemaEnhancementViews(client);
-      await assertPoolTaxonomyTables(client);
-      await assertTradeChainingTables(client);
-      await syncRegistryToDatabase(client);
-      await seedKnownTokens(client);
+      if (!turboSkipSharedMarketState) {
+        await assertFoundationTables(client);
+        await assertPhase2Tables(client);
+        await assertPhase3Tables(client);
+        await assertPhase4Tables(client);
+        await assertMetadataSyncTables(client);
+        await assertSchemaEnhancementTables(client);
+        await assertSchemaEnhancementViews(client);
+        await assertPoolTaxonomyTables(client);
+        await assertTradeChainingTables(client);
+        await syncRegistryToDatabase(client);
+        await seedKnownTokens(client);
+      }
       await ensureIndexStateRow(client, indexerKey, lane);
     });
 
@@ -262,6 +265,7 @@ async function main() {
             prefetchConcurrency,
             preferHeaderProbe: fastHeaderOnly,
             rpcClient,
+            skipEmitterClassHashResolve: turboSkipSharedMarketState,
             windowSize: adaptiveWindow,
           });
         bufferedBatch = null;
@@ -273,11 +277,13 @@ async function main() {
         const { blockNumbers, latestHead, rangeEnd, prefetchedPayloads } = batch;
 
         if (indexLeader) {
-          await reconcileTurboBackfillIndexes({
-            blockNumber: cursor,
-            latestHead,
-            turboMode: true,
-          });
+          if (!turboSkipSharedMarketState) {
+            await reconcileTurboBackfillIndexes({
+              blockNumber: cursor,
+              latestHead,
+              turboMode: true,
+            });
+          }
         }
 
         const nextCursor = rangeEnd + 1n;
@@ -289,6 +295,7 @@ async function main() {
             prefetchConcurrency,
             preferHeaderProbe: fastHeaderOnly,
             rpcClient,
+            skipEmitterClassHashResolve: turboSkipSharedMarketState,
             windowSize: adaptiveWindow,
           });
         }
@@ -333,6 +340,10 @@ async function main() {
         const currentBlock = blockNumbers[blockNumbers.length - 1];
         const remainingLag = latestHead > currentBlock ? latestHead - currentBlock : 0n;
         const elapsedSeconds = Math.max((Date.now() - batchStartedAt) / 1000, 0.001);
+        if (elapsedSeconds > 10 && adaptiveWindow > 1) {
+          adaptiveWindow = Math.max(1, Math.floor(adaptiveWindow / 2));
+          console.log(`[turbo-backfill] worker=${workerIndex} reduced window to ${adaptiveWindow} after slow commit (${elapsedSeconds.toFixed(2)}s)`);
+        }
         const batchBps = blockNumbers.length / elapsedSeconds;
         console.log(
           `[turbo-backfill] worker=${workerIndex} committed range=${blockNumbers[0].toString()}-${currentBlock.toString()} blocks=${blockNumbers.length} tx=${totalTx} small_blocks=${smallBlocks} header_only_blocks=${headerOnlyBlocks} remaining_lag=${remainingLag.toString()} bps=${batchBps.toFixed(3)} next_window=${adaptiveWindow}`,
@@ -369,8 +380,13 @@ async function main() {
         }
 
         const errorMessage = String(error?.message || '').toLowerCase();
-        if ((errorMessage.includes('statement timeout') || errorMessage.includes('deadlock')) && adaptiveWindow > baseWindow) {
-          adaptiveWindow = Math.max(baseWindow, Math.floor(adaptiveWindow / 2));
+        if (
+          (errorMessage.includes('statement timeout')
+          || errorMessage.includes('deadlock')
+          || errorMessage.includes('current transaction is aborted'))
+          && adaptiveWindow > 1
+        ) {
+          adaptiveWindow = Math.max(1, Math.floor(adaptiveWindow / 2));
           console.log(`[turbo-backfill] worker=${workerIndex} reduced window to ${adaptiveWindow} after transient db contention`);
         }
 
@@ -415,6 +431,7 @@ async function loadPrefetchBatch({
   windowSize,
   prefetchConcurrency,
   preferHeaderProbe,
+  skipEmitterClassHashResolve = false,
   rpcClient,
 }) {
   const latestHead = await rpcClient.getBlockNumber();
@@ -436,6 +453,7 @@ async function loadPrefetchBatch({
     blockNumbers,
     concurrency: prefetchConcurrency,
     preferHeaderProbe,
+    skipEmitterClassHashResolve,
     rpcClient,
   });
 

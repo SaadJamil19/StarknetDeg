@@ -126,6 +126,8 @@ Set:
 - `BACKFILL_STALE_WORKER_EXIT_CODE=86`
 - `INDEXER_TRANSFER_UPSERT_BATCH_SIZE=5000`
 - `INDEXER_TRADE_UPSERT_BATCH_SIZE=5000`
+- `INDEXER_TURBO_SKIP_SHARED_MARKET_STATE=true` (recommended for high-concurrency backfill to avoid deadlocks on shared latest-state tables)
+- `INDEXER_MINIMAL_TRANSFER_UPSERT_BATCH_SIZE=1000` (used only in minimal backfill path)
 
 Worker formula:
 
@@ -149,8 +151,10 @@ What this does:
 - checkpoint writes are namespaced with advisory locks per `(indexer_key, lane)`
 - enables double-buffer prefetch (fetch next range while current range is committing)
 - enables fast-header-only path for zero-tx blocks
+- when `INDEXER_TURBO_SKIP_SHARED_MARKET_STATE=true`, block processing is reduced to checkpoint + `stark_block_journal` + `stark_transfers` writes only
 - leader worker can switch configured tables to `UNLOGGED` mode for faster write-heavy replay
 - stale-worker heartbeat exits unhealthy workers so Docker restarts them automatically
+- worker window auto-halves after slow commits (>10s) and after transient DB contention
 
 ### 5.3 Monitor progress
 
@@ -290,3 +294,11 @@ BACKFILL_INDEXER_KEY_PREFIX=starknetdeg-mainnet-backfill-v4
 ```
 
 Then relaunch workers. This prevents mixing old checkpoint rows with a new shard plan.
+
+5. If you see repeated timeout/deadlock on `stark_pool_registry`, `stark_pool_latest`, or `stark_prices`, run backfill with:
+
+```env
+INDEXER_TURBO_SKIP_SHARED_MARKET_STATE=true
+```
+
+Then recreate backfill workers so the new env is applied.

@@ -915,3 +915,41 @@ This section summarizes the latest worker/backfill updates in simple words:
 - Kept UNLOGGED mode switching outside block-processing transactions.
   - `ALTER TABLE ... SET UNLOGGED/LOGGED` is still executed on a separate `withClient` path.
   - This prevents transaction-abort cascades inside per-block processing transactions.
+
+## Changes 19: Backfill Shared-State Contention Guard
+
+- Added `INDEXER_TURBO_SKIP_SHARED_MARKET_STATE` in `core/block-processor.js`.
+  - When enabled with `turboMode=true`, backfill keeps canonical block/trade progress but skips shared latest-state writes that become global hotspots under sharded replay:
+    - `stark_pool_latest`
+    - `stark_prices`
+    - OHLCV write path for the same transaction cycle
+- Why this was added:
+  - high-concurrency workers were timing out/deadlocking on `INSERT ... ON CONFLICT` against shared latest-state tables
+  - transaction abort cascades (`current transaction is aborted`) were side-effects of the first timeout/deadlock in that transaction
+- Operational intent:
+  - use this flag during deep parallel backfill for stability and throughput
+  - after catch-up, run normal app workers to continue live/latest-state updates
+
+## Changes 20: Transaction-Abort Loop Elimination and Minimal Turbo Path
+
+- Removed unsupported PostgreSQL session flag usage from turbo transactions.
+  - Deleted all `SET LOCAL local_prefetch_size` logic from `core/block-processor.js`.
+  - Removed `INDEXER_TURBO_LOCAL_PREFETCH_SIZE` from `.env.example` and `docker-compose.yml`.
+- Hardened transaction retry behavior in `lib/db.js`.
+  - `withTransaction(...)` now retries on:
+    - deadlock (`40P01`)
+    - statement timeout (`57014` / timeout message)
+    - aborted transaction (`25P02` / `current transaction is aborted`)
+  - retry backoff is `1s -> 2s -> 4s`.
+  - retry paths force-release the current client and acquire a fresh pool client for the next attempt.
+- Extended minimal shared-state skip mode in `core/block-processor.js`.
+  - when `INDEXER_TURBO_SKIP_SHARED_MARKET_STATE=true`, per-block writes are reduced to:
+    - `stark_block_journal`
+    - `stark_transfers`
+    - checkpoint/index-state progression
+  - shared market-state persistence paths are skipped (`trades`, `pool_latest/history`, `prices`, `ohlcv`, raw decode artifacts).
+- Added worker-local adaptive slowdown in `scripts/turbo-backfill.js`.
+  - if a batch commit cycle takes more than `10s`, next worker window is reduced by `50%` in memory.
+  - timeout/deadlock/aborted-transaction errors also reduce window by `50%` for faster stabilization.
+- Lean startup behavior for minimal backfill mode.
+  - when `INDEXER_TURBO_SKIP_SHARED_MARKET_STATE=true`, turbo backfill skips non-essential schema/registry/token sync checks and only ensures its own checkpoint row before processing.

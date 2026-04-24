@@ -4,6 +4,8 @@ const { setTimeout: sleep } = require('node:timers/promises');
 const { toBigIntStrict, toNumericString } = require('../lib/cairo/bigint');
 const { withClient, withTransaction } = require('../lib/db');
 const { normalizeL1HandlerSender } = require('./bridge');
+const { SELECTORS } = require('../lib/registry/dex-registry');
+const { buildTransferKey } = require('./protocols/shared');
 const {
   acquireCheckpointAdvisoryLock,
   advanceCheckpoint,
@@ -12,7 +14,13 @@ const {
 } = require('./checkpoint');
 const { decodeBlockFromRaw } = require('./event-router');
 const { FINALITY_LANES, assertValidFinalityLane, normalizeFinalityStatus, summarizeBlockReceipts } = require('./finality');
-const { normalizeAddress, normalizeHexArray, normalizeOptionalAddress, normalizeSelector } = require('./normalize');
+const {
+  normalizeAddress,
+  normalizeHexArray,
+  normalizeOptionalAddress,
+  normalizeSelector,
+  parseU256FromArray,
+} = require('./normalize');
 const { persistTradesForBlock } = require('./trades');
 const { persistPoolStateForBlock, resetPoolStateForBlock } = require('./pool-state');
 const { persistPriceDataForBlock, resetLatestPricesForBlock } = require('./prices');
@@ -54,10 +62,14 @@ const turboBackfillMaintenanceState = {
 const TURBO_MAINTENANCE_WAIT_MS = 10 * 60 * 1000;
 const TURBO_MAINTENANCE_WAL_GROWTH_BYTES = parseNonNegativeBigInt(process.env.INDEXER_TURBO_WAL_GROWTH_BYTES, 268435456n, 'INDEXER_TURBO_WAL_GROWTH_BYTES');
 const TURBO_MAINTENANCE_WAL_SLEEP_MS = 60_000;
-const TURBO_LOCAL_PREFETCH_SIZE = String(process.env.INDEXER_TURBO_LOCAL_PREFETCH_SIZE ?? '32MB').trim();
 const TURBO_SESSION_FSYNC_OFF = parseBoolean(process.env.INDEXER_TURBO_SESSION_FSYNC_OFF, true);
 const FAST_HEADER_PROBE_ENABLED = parseBoolean(process.env.INDEXER_FAST_HEADER_PROBE, true);
-let turboLocalPrefetchSupported = null;
+const TURBO_SKIP_SHARED_MARKET_STATE = parseBoolean(process.env.INDEXER_TURBO_SKIP_SHARED_MARKET_STATE, false);
+const MINIMAL_TRANSFER_UPSERT_BATCH_SIZE = parsePositiveInteger(
+  process.env.INDEXER_MINIMAL_TRANSFER_UPSERT_BATCH_SIZE,
+  1000,
+  'INDEXER_MINIMAL_TRANSFER_UPSERT_BATCH_SIZE',
+);
 let turboFsyncSessionSupported = null;
 
 function parseNonNegativeBigInt(value, fallbackValue, label) {
@@ -81,8 +93,17 @@ function parseBoolean(value, fallbackValue = false) {
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
 }
 
-function escapeSqlStringLiteral(value) {
-  return String(value).replace(/'/g, "''");
+function parsePositiveInteger(value, fallbackValue, label) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return fallbackValue;
+  }
+
+  const parsed = Number.parseInt(String(value).trim(), 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${label} must be a positive integer, received: ${value}`);
+  }
+
+  return parsed;
 }
 
 async function runOptionalLocalSetting(client, statement) {
@@ -95,6 +116,193 @@ async function runOptionalLocalSetting(client, statement) {
     await client.query('RELEASE SAVEPOINT turbo_optional_setting');
     throw error;
   }
+}
+
+function buildMinimalTransferMetadata() {
+  return {
+    amount_encoding: 'u256',
+    minimal_turbo_path: true,
+    standard: 'erc20',
+  };
+}
+
+function extractMinimalTransfersFromNormalizedBlock({ lane, normalized }) {
+  const transfers = [];
+  const transactions = Array.isArray(normalized?.block?.transactions)
+    ? normalized.block.transactions
+    : [];
+
+  for (let transactionIndex = 0; transactionIndex < transactions.length; transactionIndex += 1) {
+    const item = transactions[transactionIndex] ?? {};
+    const transaction = item.transaction ?? {};
+    const transactionHash = transaction.transaction_hash ?? null;
+    if (!transactionHash) {
+      continue;
+    }
+
+    const events = Array.isArray(item?.receipt?.events) ? item.receipt.events : [];
+    for (let receiptEventIndex = 0; receiptEventIndex < events.length; receiptEventIndex += 1) {
+      const rawEvent = events[receiptEventIndex] ?? {};
+      const keys = Array.isArray(rawEvent.keys) ? rawEvent.keys : [];
+      const data = Array.isArray(rawEvent.data) ? rawEvent.data : [];
+      if (keys.length < 3 || data.length < 2) {
+        continue;
+      }
+
+      let selector;
+      try {
+        selector = normalizeSelector(keys[0], 'minimal transfer selector');
+      } catch (error) {
+        continue;
+      }
+
+      if (selector !== SELECTORS.ERC20_TRANSFER) {
+        continue;
+      }
+
+      try {
+        const tokenAddress = normalizeAddress(rawEvent.from_address, 'minimal transfer token');
+        const fromAddress = normalizeAddress(keys[1], 'minimal transfer from');
+        const toAddress = normalizeAddress(keys[2], 'minimal transfer to');
+        const amount = parseU256FromArray(data, 0, 'minimal transfer amount');
+        const sourceEventIndex = BigInt(receiptEventIndex);
+        transfers.push({
+          amount,
+          amountHumanScaled: null,
+          amountUsdScaled: null,
+          counterpartyType: 'unknown',
+          fromAddress,
+          metadata: buildMinimalTransferMetadata(),
+          protocol: 'erc20',
+          sourceEventIndex,
+          tokenAddress,
+          tokenDecimals: null,
+          tokenName: null,
+          tokenSymbol: null,
+          toAddress,
+          transactionHash,
+          transactionIndex: BigInt(transactionIndex),
+          transferType: 'standard_transfer',
+          transferKey: buildTransferKey({
+            lane,
+            sourceEventIndex,
+            transactionHash,
+          }),
+        });
+      } catch (error) {
+        // Invalid transfer shape/value: ignore this raw event in minimal mode.
+      }
+    }
+  }
+
+  return transfers;
+}
+
+function compareTextKey(left, right) {
+  const normalizedLeft = String(left ?? '');
+  const normalizedRight = String(right ?? '');
+  if (normalizedLeft < normalizedRight) {
+    return -1;
+  }
+  if (normalizedLeft > normalizedRight) {
+    return 1;
+  }
+  return 0;
+}
+
+function chunkRows(rows, chunkSize) {
+  const chunks = [];
+  for (let index = 0; index < rows.length; index += chunkSize) {
+    chunks.push(rows.slice(index, index + chunkSize));
+  }
+  return chunks;
+}
+
+function buildValuesSql(rows, buildValueGroup) {
+  const params = [];
+  const groups = [];
+  let offset = 1;
+
+  for (const row of rows) {
+    groups.push(buildValueGroup(offset));
+    params.push(...row);
+    offset += row.length;
+  }
+
+  return {
+    params,
+    valuesSql: groups.join(', '),
+  };
+}
+
+async function bulkUpsertMinimalTransfersForBlock(client, {
+  blockHash,
+  blockNumber,
+  lane,
+  transfers,
+}) {
+  if (!Array.isArray(transfers) || transfers.length === 0) {
+    return 0;
+  }
+
+  const sortedTransfers = [...transfers].sort((left, right) => compareTextKey(left?.transferKey, right?.transferKey));
+  for (const chunk of chunkRows(sortedTransfers, MINIMAL_TRANSFER_UPSERT_BATCH_SIZE)) {
+    const rows = chunk.map((transfer) => [
+      transfer.transferKey,
+      lane,
+      toNumericString(blockNumber, 'block number'),
+      blockHash,
+      transfer.transactionHash,
+      toNumericString(transfer.transactionIndex, 'transaction index'),
+      toNumericString(transfer.sourceEventIndex, 'source event index'),
+      transfer.tokenAddress,
+      transfer.fromAddress,
+      transfer.toAddress,
+      toNumericString(transfer.amount, 'transfer amount'),
+      transfer.transferType ?? 'standard_transfer',
+      transfer.counterpartyType ?? 'unknown',
+      transfer.protocol ?? 'erc20',
+      JSON.stringify(transfer.metadata ?? {}),
+    ]);
+
+    const { params, valuesSql } = buildValuesSql(rows, (offset) => {
+      const placeholders = Array.from({ length: 14 }, (_, index) => `$${offset + index}`);
+      return `(${placeholders.join(', ')}, $${offset + 14}::jsonb, NOW(), NOW())`;
+    });
+
+    await client.query(
+      `INSERT INTO stark_transfers (
+           transfer_key,
+           lane,
+           block_number,
+           block_hash,
+           transaction_hash,
+           transaction_index,
+           source_event_index,
+           token_address,
+           from_address,
+           to_address,
+           amount,
+           transfer_type,
+           counterparty_type,
+           protocol,
+           metadata,
+           created_at,
+           updated_at
+       ) VALUES ${valuesSql}
+       ON CONFLICT (transfer_key)
+       DO UPDATE SET
+           amount = EXCLUDED.amount,
+           transfer_type = EXCLUDED.transfer_type,
+           counterparty_type = EXCLUDED.counterparty_type,
+           protocol = EXCLUDED.protocol,
+           metadata = EXCLUDED.metadata,
+           updated_at = NOW()`,
+      params,
+    );
+  }
+
+  return sortedTransfers.length;
 }
 
 async function processAcceptedBlock({
@@ -119,10 +327,12 @@ async function processAcceptedBlock({
     throw new Error(`Phase 3 canonical processor only supports ${FINALITY_LANES.ACCEPTED_ON_L2}. Received ${canonicalLane}.`);
   }
 
+  const skipSharedMarketState = Boolean(turboMode && TURBO_SKIP_SHARED_MARKET_STATE);
   const payload = prefetchedPayload ?? await fetchAcceptedBlockPayload({
     blockNumber: requestedBlockNumber,
     preferHeaderProbe: headerOnlyOnEmpty,
     rpcClient,
+    skipEmitterClassHashResolve: skipSharedMarketState,
   });
   const { emitterClassHashes, normalized } = payload;
   const headerOnlyMode = Boolean(headerOnlyOnEmpty && Number(normalized.summary?.total ?? 0) === 0);
@@ -153,27 +363,31 @@ async function processAcceptedBlock({
       blockHash: normalized.block.block_hash,
       blockNumber: normalized.blockNumber,
       lane: canonicalLane,
+      minimalMode: skipSharedMarketState,
     });
 
     await clearBlockDerivedRows(client, {
       blockNumber: normalized.blockNumber,
       lane: canonicalLane,
+      minimalMode: skipSharedMarketState,
     });
 
     await upsertBlockJournal(client, {
       lane: canonicalLane,
       normalized,
     });
-    await upsertBlockStateUpdate(client, {
-      lane: canonicalLane,
-      normalized,
-    });
+    if (!skipSharedMarketState) {
+      await upsertBlockStateUpdate(client, {
+        lane: canonicalLane,
+        normalized,
+      });
 
-    await upsertRawArtifacts(client, {
-      emitterClassHashes,
-      lane: canonicalLane,
-      normalized,
-    });
+      await upsertRawArtifacts(client, {
+        emitterClassHashes,
+        lane: canonicalLane,
+        normalized,
+      });
+    }
 
     if (headerOnlyMode) {
       await advanceCheckpoint(client, {
@@ -229,37 +443,90 @@ async function processAcceptedBlock({
       };
     }
 
-    const decodeSummary = await decodeBlockFromRaw(client, {
-      blockHash: normalized.block.block_hash,
-      blockNumber: normalized.blockNumber,
-      lane: canonicalLane,
-      rpcClient,
-    });
+    let decodeSummary;
+    let phase3Summary;
+    let realtimePayload;
+    if (skipSharedMarketState) {
+      const minimalTransfers = extractMinimalTransfersFromNormalizedBlock({
+        lane: canonicalLane,
+        normalized,
+      });
+      const transferCount = await bulkUpsertMinimalTransfersForBlock(client, {
+        blockHash: normalized.block.block_hash,
+        blockNumber: normalized.blockNumber,
+        lane: canonicalLane,
+        transfers: minimalTransfers,
+      });
 
-    const blockTimestampDate = normalized.block.timestamp === undefined || normalized.block.timestamp === null
-      ? new Date(0)
-      : new Date(Number(toBigIntStrict(normalized.block.timestamp, 'block timestamp')) * 1000);
-    const tradesResult = await persistTradesForBlock(client, {
-      blockHash: normalized.block.block_hash,
-      blockNumber: normalized.blockNumber,
-      blockTimestamp: normalized.block.timestamp,
-      lane: canonicalLane,
-    });
-    const poolStateResult = await persistPoolStateForBlock(client, {
-      blockNumber: normalized.blockNumber,
-      blockTimestampDate,
-      lane: canonicalLane,
-      latestUsdByToken: tradesResult.latestUsdByToken,
-    });
-    const pricesResult = await persistPriceDataForBlock(client, {
-      priceCandidates: tradesResult.priceCandidates,
-    });
-    const ohlcvResult = await persistOhlcvForBlock(client, {
-      blockHash: normalized.block.block_hash,
-      blockNumber: normalized.blockNumber,
-      lane: canonicalLane,
-      trades: tradesResult.trades,
-    });
+      decodeSummary = {
+        actions: 0,
+        transfers: transferCount,
+        unknownEvents: 0,
+      };
+      phase3Summary = {
+        candles: 0,
+        fullRebuildCandles: 0,
+        latestPrices: 0,
+        poolHistoryRows: 0,
+        poolLatestRows: 0,
+        priceTicks: 0,
+        seededCandles: 0,
+        stalePrices: 0,
+        trades: 0,
+      };
+      realtimePayload = {
+        candles: [],
+        trades: [],
+      };
+    } else {
+      decodeSummary = await decodeBlockFromRaw(client, {
+        blockHash: normalized.block.block_hash,
+        blockNumber: normalized.blockNumber,
+        lane: canonicalLane,
+        rpcClient,
+      });
+
+      const blockTimestampDate = normalized.block.timestamp === undefined || normalized.block.timestamp === null
+        ? new Date(0)
+        : new Date(Number(toBigIntStrict(normalized.block.timestamp, 'block timestamp')) * 1000);
+      const tradesResult = await persistTradesForBlock(client, {
+        blockHash: normalized.block.block_hash,
+        blockNumber: normalized.blockNumber,
+        blockTimestamp: normalized.block.timestamp,
+        lane: canonicalLane,
+      });
+      const poolStateResult = await persistPoolStateForBlock(client, {
+        blockNumber: normalized.blockNumber,
+        blockTimestampDate,
+        lane: canonicalLane,
+        latestUsdByToken: tradesResult.latestUsdByToken,
+      });
+      const pricesResult = await persistPriceDataForBlock(client, {
+        priceCandidates: tradesResult.priceCandidates,
+      });
+      const ohlcvResult = await persistOhlcvForBlock(client, {
+        blockHash: normalized.block.block_hash,
+        blockNumber: normalized.blockNumber,
+        lane: canonicalLane,
+        trades: tradesResult.trades,
+      });
+
+      phase3Summary = {
+        candles: ohlcvResult.summary.touchedCandles,
+        fullRebuildCandles: ohlcvResult.summary.fullRebuildCandles,
+        latestPrices: pricesResult.summary.latestPrices,
+        poolHistoryRows: poolStateResult.summary.poolHistoryRows,
+        poolLatestRows: poolStateResult.summary.poolLatestRows,
+        priceTicks: pricesResult.summary.priceTicks,
+        seededCandles: ohlcvResult.summary.seededCandles,
+        stalePrices: pricesResult.summary.stalePrices,
+        trades: tradesResult.summary.trades,
+      };
+      realtimePayload = {
+        candles: ohlcvResult.realtimeCandles,
+        trades: tradesResult.realtimeTrades,
+      };
+    }
 
     await advanceCheckpoint(client, {
       blockHash: normalized.block.block_hash,
@@ -291,21 +558,8 @@ async function processAcceptedBlock({
       blockNumber: normalized.blockNumber,
       decodeSummary,
       finalityStatus: normalized.finalityStatus,
-      phase3Summary: {
-        candles: ohlcvResult.summary.touchedCandles,
-        fullRebuildCandles: ohlcvResult.summary.fullRebuildCandles,
-        latestPrices: pricesResult.summary.latestPrices,
-        poolHistoryRows: poolStateResult.summary.poolHistoryRows,
-        poolLatestRows: poolStateResult.summary.poolLatestRows,
-        priceTicks: pricesResult.summary.priceTicks,
-        seededCandles: ohlcvResult.summary.seededCandles,
-        stalePrices: pricesResult.summary.stalePrices,
-        trades: tradesResult.summary.trades,
-      },
-      realtimePayload: {
-        candles: ohlcvResult.realtimeCandles,
-        trades: tradesResult.realtimeTrades,
-      },
+      phase3Summary,
+      realtimePayload,
       summary: normalized.summary,
     };
   });
@@ -329,7 +583,13 @@ async function processAcceptedBlock({
   };
 }
 
-async function fetchAcceptedBlockPayload({ rpcClient, blockNumber, prefetched = null, preferHeaderProbe = false }) {
+async function fetchAcceptedBlockPayload({
+  rpcClient,
+  blockNumber,
+  prefetched = null,
+  preferHeaderProbe = false,
+  skipEmitterClassHashResolve = false,
+}) {
   const requestedBlockNumber = toBigIntStrict(blockNumber, 'block number');
   const shouldProbeHeader = Boolean(
     preferHeaderProbe
@@ -370,11 +630,13 @@ async function fetchAcceptedBlockPayload({ rpcClient, blockNumber, prefetched = 
     stateUpdate,
     summaryOverride,
   });
-  const emitterClassHashes = await resolveEmitterClassHashes({
-    block: normalized.block,
-    blockNumber: normalized.blockNumber,
-    rpcClient,
-  });
+  const emitterClassHashes = skipEmitterClassHashResolve
+    ? new Map()
+    : await resolveEmitterClassHashes({
+      block: normalized.block,
+      blockNumber: normalized.blockNumber,
+      rpcClient,
+    });
 
   return { emitterClassHashes, normalized };
 }
@@ -383,6 +645,7 @@ async function prefetchAcceptedBlockPayloads({
   blockNumbers,
   concurrency = 4,
   preferHeaderProbe = false,
+  skipEmitterClassHashResolve = false,
   rpcClient,
 }) {
   const numbers = Array.from(blockNumbers ?? []);
@@ -404,6 +667,7 @@ async function prefetchAcceptedBlockPayloads({
         prefetched: prefetchedRawPayloads ? prefetchedRawPayloads[index] : null,
         preferHeaderProbe: shouldProbeHeader,
         rpcClient,
+        skipEmitterClassHashResolve,
       });
     }
   });
@@ -511,44 +775,21 @@ function buildEmptyBlockSummary(transactionCount = 0) {
 async function applyTurboSessionSettings(client) {
   await client.query('SET LOCAL synchronous_commit = OFF');
 
-  if (!TURBO_LOCAL_PREFETCH_SIZE || turboLocalPrefetchSupported === false) {
-    if (!TURBO_SESSION_FSYNC_OFF || turboFsyncSessionSupported === false) {
-      return;
-    }
-  }
-
-  if (TURBO_SESSION_FSYNC_OFF && turboFsyncSessionSupported !== false) {
-    try {
-      await runOptionalLocalSetting(client, 'SET LOCAL fsync = OFF');
-      turboFsyncSessionSupported = true;
-    } catch (error) {
-      const message = String(error?.message || '').toLowerCase();
-      if (
-        message.includes('unrecognized configuration parameter')
-        || message.includes('cannot be changed now')
-        || message.includes('permission denied')
-      ) {
-        turboFsyncSessionSupported = false;
-      } else {
-        throw error;
-      }
-    }
-  }
-
-  if (!TURBO_LOCAL_PREFETCH_SIZE || turboLocalPrefetchSupported === false) {
+  if (!TURBO_SESSION_FSYNC_OFF || turboFsyncSessionSupported === false) {
     return;
   }
 
   try {
-    await runOptionalLocalSetting(
-      client,
-      `SET LOCAL local_prefetch_size = '${escapeSqlStringLiteral(TURBO_LOCAL_PREFETCH_SIZE)}'`,
-    );
-    turboLocalPrefetchSupported = true;
+    await runOptionalLocalSetting(client, 'SET LOCAL fsync = OFF');
+    turboFsyncSessionSupported = true;
   } catch (error) {
     const message = String(error?.message || '').toLowerCase();
-    if (message.includes('unrecognized configuration parameter')) {
-      turboLocalPrefetchSupported = false;
+    if (
+      message.includes('unrecognized configuration parameter')
+      || message.includes('cannot be changed now')
+      || message.includes('permission denied')
+    ) {
+      turboFsyncSessionSupported = false;
       return;
     }
 
@@ -882,7 +1123,12 @@ function assertSequentialProgress(checkpoint, normalized) {
   }
 }
 
-async function markConflictingBlockRows(client, { lane, blockNumber, blockHash }) {
+async function markConflictingBlockRows(client, {
+  lane,
+  blockNumber,
+  blockHash,
+  minimalMode = false,
+}) {
   await client.query(
     `UPDATE stark_block_journal
         SET is_orphaned = TRUE,
@@ -894,7 +1140,9 @@ async function markConflictingBlockRows(client, { lane, blockNumber, blockHash }
         AND is_orphaned = FALSE`,
     [lane, toNumericString(blockNumber, 'block number'), blockHash],
   );
-  await clearPendingRedecodeDiscrepanciesForOrphanedBlock(client, { lane, blockNumber });
+  if (!minimalMode) {
+    await clearPendingRedecodeDiscrepanciesForOrphanedBlock(client, { lane, blockNumber });
+  }
 }
 
 async function clearPendingRedecodeDiscrepanciesForOrphanedBlock(client, { lane, blockNumber }) {
@@ -920,7 +1168,19 @@ async function clearPendingRedecodeDiscrepanciesForOrphanedBlock(client, { lane,
   );
 }
 
-async function clearBlockDerivedRows(client, { lane, blockNumber }) {
+async function clearBlockDerivedRows(client, {
+  lane,
+  blockNumber,
+  minimalMode = false,
+}) {
+  if (minimalMode) {
+    await client.query(
+      'DELETE FROM stark_transfers WHERE lane = $1 AND block_number = $2',
+      [lane, toNumericString(blockNumber, 'block number')],
+    );
+    return;
+  }
+
   const params = [lane, toNumericString(blockNumber, 'block number')];
   const statements = [
     'DELETE FROM stark_block_state_updates WHERE lane = $1 AND block_number = $2',
