@@ -96,10 +96,15 @@ async function main() {
     Math.max(4, Math.min(16, os.cpus().length)),
     '--parallelism/BACKFILL_PARALLELISM',
   );
+  const prefetchConcurrencyCap = parsePositiveInteger(
+    process.env.INDEXER_PREFETCH_CONCURRENCY_CAP,
+    64,
+    'INDEXER_PREFETCH_CONCURRENCY_CAP',
+  );
   const prefetchConcurrency = Math.min(
     parsePositiveInteger(process.env.INDEXER_PREFETCH_CONCURRENCY, 10, 'INDEXER_PREFETCH_CONCURRENCY'),
     turboParallelism,
-    10,
+    prefetchConcurrencyCap,
   );
 
   const chunkRange = resolveChunkRange({
@@ -121,114 +126,261 @@ async function main() {
     process.env.BACKFILL_INDEX_LEADER,
     workerIndex === 1,
   );
+  const fastHeaderOnly = parseBoolean(process.env.BACKFILL_FAST_HEADER_ONLY, true);
+  const useUnloggedTables = parseBoolean(process.env.BACKFILL_USE_UNLOGGED_TABLES, true);
+  const restoreLoggedOnComplete = parseBoolean(process.env.BACKFILL_RESTORE_LOGGED_ON_COMPLETE, false);
+  const unloggedTables = parseCsv(process.env.BACKFILL_UNLOGGED_TABLES, ['stark_block_journal', 'stark_transfers']);
+  const staleWorkerTimeoutMs = parsePositiveInteger(
+    process.env.BACKFILL_STALE_WORKER_TIMEOUT_MS,
+    30_000,
+    'BACKFILL_STALE_WORKER_TIMEOUT_MS',
+  );
+  const heartbeatIntervalMs = parsePositiveInteger(
+    process.env.BACKFILL_HEARTBEAT_INTERVAL_MS,
+    5_000,
+    'BACKFILL_HEARTBEAT_INTERVAL_MS',
+  );
+  const staleWorkerExitCode = parsePositiveInteger(
+    process.env.BACKFILL_STALE_WORKER_EXIT_CODE,
+    86,
+    'BACKFILL_STALE_WORKER_EXIT_CODE',
+  );
+  let lastProgressAt = Date.now();
+  let lastProcessedBlock = null;
   let adaptiveWindow = Math.min(baseWindow, maxWindow);
+  const heartbeatMonitor = setInterval(() => {
+    if (shuttingDown) {
+      return;
+    }
 
-  await withTransaction(async (client) => {
-    await assertFoundationTables(client);
-    await assertPhase2Tables(client);
-    await assertPhase3Tables(client);
-    await assertPhase4Tables(client);
-    await assertMetadataSyncTables(client);
-    await assertSchemaEnhancementTables(client);
-    await assertSchemaEnhancementViews(client);
-    await assertPoolTaxonomyTables(client);
-    await assertTradeChainingTables(client);
-    await syncRegistryToDatabase(client);
-    await seedKnownTokens(client);
-    await ensureIndexStateRows(client, indexerKey);
-  });
+    const stalledForMs = Date.now() - lastProgressAt;
+    if (stalledForMs < staleWorkerTimeoutMs) {
+      return;
+    }
 
-  const checkpoint = await withClient((client) => getCheckpoint(client, { indexerKey, lane }));
-  let cursor = chunkRange.start;
-  if (checkpoint?.lastProcessedBlockNumber !== null && checkpoint?.lastProcessedBlockNumber !== undefined) {
-    cursor = checkpoint.lastProcessedBlockNumber + 1n;
+    console.error(
+      `[turbo-backfill] worker=${workerIndex} stale-worker-detected stalled_ms=${stalledForMs} timeout_ms=${staleWorkerTimeoutMs} last_processed_block=${lastProcessedBlock === null ? 'none' : lastProcessedBlock.toString()} exiting_code=${staleWorkerExitCode}`,
+    );
+    process.exit(staleWorkerExitCode);
+  }, heartbeatIntervalMs);
+  heartbeatMonitor.unref?.();
+
+  try {
+    await withTransaction(async (client) => {
+      await assertFoundationTables(client);
+      await assertPhase2Tables(client);
+      await assertPhase3Tables(client);
+      await assertPhase4Tables(client);
+      await assertMetadataSyncTables(client);
+      await assertSchemaEnhancementTables(client);
+      await assertSchemaEnhancementViews(client);
+      await assertPoolTaxonomyTables(client);
+      await assertTradeChainingTables(client);
+      await syncRegistryToDatabase(client);
+      await seedKnownTokens(client);
+      await ensureIndexStateRows(client, indexerKey);
+    });
+
+    const checkpoint = await withClient((client) => getCheckpoint(client, { indexerKey, lane }));
+    let cursor = chunkRange.start;
+    if (checkpoint?.lastProcessedBlockNumber !== null && checkpoint?.lastProcessedBlockNumber !== undefined) {
+      cursor = checkpoint.lastProcessedBlockNumber + 1n;
+    }
+
+    if (indexLeader && useUnloggedTables) {
+      await setBackfillTablePersistenceMode({
+        tableNames: unloggedTables,
+        useUnlogged: true,
+        workerIndex,
+      });
+    }
+
+    console.log(
+      `[turbo-backfill] worker=${workerIndex}/${totalWorkers} lane=${lane} indexer_key=${indexerKey} assigned_range=${chunkRange.start.toString()}-${chunkRange.end.toString()} resume_from=${cursor.toString()} window=${adaptiveWindow}/${maxWindow} parallelism=${turboParallelism} prefetch_concurrency=${prefetchConcurrency} index_leader=${indexLeader} fast_header_only=${fastHeaderOnly} unlogged_tables=${useUnloggedTables ? unloggedTables.join('|') : 'disabled'} stale_timeout_ms=${staleWorkerTimeoutMs}`,
+    );
+
+    let bufferedBatch = null;
+    while (!shuttingDown && cursor <= chunkRange.end) {
+      try {
+        const batch = bufferedBatch?.cursor === cursor
+          ? bufferedBatch
+          : await loadPrefetchBatch({
+            chunkRangeEnd: chunkRange.end,
+            cursor,
+            prefetchConcurrency,
+            preferHeaderProbe: fastHeaderOnly,
+            rpcClient,
+            windowSize: adaptiveWindow,
+          });
+        bufferedBatch = null;
+
+        if (!batch) {
+          await sleep(pollIntervalMs);
+          continue;
+        }
+        const { blockNumbers, latestHead, rangeEnd, prefetchedPayloads } = batch;
+
+        if (indexLeader) {
+          await reconcileTurboBackfillIndexes({
+            blockNumber: cursor,
+            latestHead,
+            turboMode: true,
+          });
+        }
+
+        const nextCursor = rangeEnd + 1n;
+        let nextBatchPromise = null;
+        if (!shuttingDown && nextCursor <= chunkRange.end) {
+          nextBatchPromise = loadPrefetchBatch({
+            chunkRangeEnd: chunkRange.end,
+            cursor: nextCursor,
+            prefetchConcurrency,
+            preferHeaderProbe: fastHeaderOnly,
+            rpcClient,
+            windowSize: adaptiveWindow,
+          });
+        }
+        const batchStartedAt = Date.now();
+
+        let smallBlocks = 0;
+        let totalTx = 0;
+        let headerOnlyBlocks = 0;
+        for (let index = 0; index < blockNumbers.length; index += 1) {
+          const result = await processAcceptedBlock({
+            blockNumber: blockNumbers[index],
+            headerOnlyOnEmpty: fastHeaderOnly,
+            indexerKey,
+            lane,
+            prefetchedPayload: prefetchedPayloads[index] ?? null,
+            rpcClient,
+            skipRealtime: true,
+            turboMode: true,
+          });
+
+          const txCount = Number(result.summary.total ?? 0);
+          totalTx += txCount;
+          if (txCount < smallBlockTxThreshold) {
+            smallBlocks += 1;
+          }
+          if (fastHeaderOnly && txCount === 0) {
+            headerOnlyBlocks += 1;
+          }
+          lastProgressAt = Date.now();
+          lastProcessedBlock = result.blockNumber;
+        }
+
+        if (smallBlocks === blockNumbers.length && adaptiveWindow < maxWindow) {
+          adaptiveWindow = Math.min(maxWindow, adaptiveWindow * smallBlockGrowthFactor);
+        } else if (smallBlocks < Math.ceil(blockNumbers.length / 2) && adaptiveWindow > baseWindow) {
+          adaptiveWindow = Math.max(baseWindow, Math.floor(adaptiveWindow / smallBlockGrowthFactor));
+        }
+
+        const currentBlock = blockNumbers[blockNumbers.length - 1];
+        const remainingLag = latestHead > currentBlock ? latestHead - currentBlock : 0n;
+        const elapsedSeconds = Math.max((Date.now() - batchStartedAt) / 1000, 0.001);
+        const batchBps = blockNumbers.length / elapsedSeconds;
+        console.log(
+          `[turbo-backfill] worker=${workerIndex} committed range=${blockNumbers[0].toString()}-${currentBlock.toString()} blocks=${blockNumbers.length} tx=${totalTx} small_blocks=${smallBlocks} header_only_blocks=${headerOnlyBlocks} remaining_lag=${remainingLag.toString()} bps=${batchBps.toFixed(3)} next_window=${adaptiveWindow}`,
+        );
+
+        if (nextBatchPromise) {
+          bufferedBatch = await nextBatchPromise;
+        }
+        cursor = rangeEnd + 1n;
+      } catch (error) {
+        console.error(`[turbo-backfill] worker=${workerIndex} error: ${formatError(error)}`);
+        if (isFatalDatabaseError(error)) {
+          console.error(`[turbo-backfill] worker=${workerIndex} fatal database connectivity issue detected; exiting for supervisor restart.`);
+          throw error;
+        }
+        await sleep(pollIntervalMs);
+      }
+    }
+
+    console.log(
+      `[turbo-backfill] worker=${workerIndex}/${totalWorkers} completed range ${chunkRange.start.toString()}-${chunkRange.end.toString()}`,
+    );
+
+    if (indexLeader && useUnloggedTables && restoreLoggedOnComplete) {
+      await setBackfillTablePersistenceMode({
+        tableNames: unloggedTables,
+        useUnlogged: false,
+        workerIndex,
+      });
+    }
+  } finally {
+    clearInterval(heartbeatMonitor);
+  }
+}
+
+async function loadPrefetchBatch({
+  cursor,
+  chunkRangeEnd,
+  windowSize,
+  prefetchConcurrency,
+  preferHeaderProbe,
+  rpcClient,
+}) {
+  const latestHead = await rpcClient.getBlockNumber();
+  if (cursor > latestHead) {
+    return null;
   }
 
-  console.log(
-    `[turbo-backfill] worker=${workerIndex}/${totalWorkers} lane=${lane} indexer_key=${indexerKey} assigned_range=${chunkRange.start.toString()}-${chunkRange.end.toString()} resume_from=${cursor.toString()} window=${adaptiveWindow}/${maxWindow} parallelism=${turboParallelism} prefetch_concurrency=${prefetchConcurrency} index_leader=${indexLeader}`,
+  const rangeEnd = minBigInt(
+    chunkRangeEnd,
+    latestHead,
+    cursor + BigInt(Math.max(1, windowSize) - 1),
   );
+  const blockNumbers = [];
+  for (let blockNumber = cursor; blockNumber <= rangeEnd; blockNumber += 1n) {
+    blockNumbers.push(blockNumber);
+  }
 
-  while (!shuttingDown && cursor <= chunkRange.end) {
-    try {
-      const latestHead = await rpcClient.getBlockNumber();
-      if (cursor > latestHead) {
-        await sleep(pollIntervalMs);
+  const prefetchedPayloads = await prefetchAcceptedBlockPayloads({
+    blockNumbers,
+    concurrency: prefetchConcurrency,
+    preferHeaderProbe,
+    rpcClient,
+  });
+
+  return {
+    cursor,
+    latestHead,
+    rangeEnd,
+    blockNumbers,
+    prefetchedPayloads,
+  };
+}
+
+async function setBackfillTablePersistenceMode({ tableNames, useUnlogged, workerIndex }) {
+  const mode = useUnlogged ? 'UNLOGGED' : 'LOGGED';
+  const normalized = Array.from(new Set((tableNames ?? [])
+    .map((name) => String(name ?? '').trim().toLowerCase())
+    .filter((name) => name.length > 0)));
+
+  if (normalized.length === 0) {
+    return;
+  }
+
+  await withClient(async (client) => {
+    for (const tableName of normalized) {
+      if (!/^[a-z_][a-z0-9_]*$/.test(tableName)) {
+        throw new Error(`Invalid table name for backfill persistence mode: ${tableName}`);
+      }
+
+      const regclassResult = await client.query(
+        "SELECT to_regclass($1) AS regclass",
+        [`public.${tableName}`],
+      );
+      if (!regclassResult.rows[0]?.regclass) {
+        console.log(`[turbo-backfill] worker=${workerIndex} skip ${tableName}: table not found`);
         continue;
       }
 
-      if (indexLeader) {
-        await reconcileTurboBackfillIndexes({
-          blockNumber: cursor,
-          latestHead,
-          turboMode: true,
-        });
-      }
-
-      const rangeEnd = minBigInt(
-        chunkRange.end,
-        latestHead,
-        cursor + BigInt(Math.max(1, adaptiveWindow) - 1),
-      );
-      const blockNumbers = [];
-      for (let blockNumber = cursor; blockNumber <= rangeEnd; blockNumber += 1n) {
-        blockNumbers.push(blockNumber);
-      }
-      const batchStartedAt = Date.now();
-
-      const prefetchedPayloads = await prefetchAcceptedBlockPayloads({
-        blockNumbers,
-        concurrency: prefetchConcurrency,
-        rpcClient,
-      });
-
-      let smallBlocks = 0;
-      let totalTx = 0;
-      for (let index = 0; index < blockNumbers.length; index += 1) {
-        const result = await processAcceptedBlock({
-          blockNumber: blockNumbers[index],
-          indexerKey,
-          lane,
-          prefetchedPayload: prefetchedPayloads[index] ?? null,
-          rpcClient,
-          skipRealtime: true,
-          turboMode: true,
-        });
-
-        const txCount = Number(result.summary.total ?? 0);
-        totalTx += txCount;
-        if (txCount < smallBlockTxThreshold) {
-          smallBlocks += 1;
-        }
-      }
-
-      if (smallBlocks === blockNumbers.length && adaptiveWindow < maxWindow) {
-        adaptiveWindow = Math.min(maxWindow, adaptiveWindow * smallBlockGrowthFactor);
-      } else if (smallBlocks < Math.ceil(blockNumbers.length / 2) && adaptiveWindow > baseWindow) {
-        adaptiveWindow = Math.max(baseWindow, Math.floor(adaptiveWindow / smallBlockGrowthFactor));
-      }
-
-      const currentBlock = blockNumbers[blockNumbers.length - 1];
-      const remainingLag = latestHead > currentBlock ? latestHead - currentBlock : 0n;
-      const elapsedSeconds = Math.max((Date.now() - batchStartedAt) / 1000, 0.001);
-      const batchBps = blockNumbers.length / elapsedSeconds;
-      console.log(
-        `[turbo-backfill] worker=${workerIndex} committed range=${blockNumbers[0].toString()}-${currentBlock.toString()} blocks=${blockNumbers.length} tx=${totalTx} small_blocks=${smallBlocks} remaining_lag=${remainingLag.toString()} bps=${batchBps.toFixed(3)} next_window=${adaptiveWindow}`,
-      );
-
-      cursor = rangeEnd + 1n;
-    } catch (error) {
-      console.error(`[turbo-backfill] worker=${workerIndex} error: ${formatError(error)}`);
-      if (isFatalDatabaseError(error)) {
-        console.error(`[turbo-backfill] worker=${workerIndex} fatal database connectivity issue detected; exiting for supervisor restart.`);
-        throw error;
-      }
-      await sleep(pollIntervalMs);
+      await client.query(`ALTER TABLE public.${tableName} SET ${mode}`);
+      console.log(`[turbo-backfill] worker=${workerIndex} set ${tableName} ${mode}`);
     }
-  }
-
-  console.log(
-    `[turbo-backfill] worker=${workerIndex}/${totalWorkers} completed range ${chunkRange.start.toString()}-${chunkRange.end.toString()}`,
-  );
+  });
 }
 
 function resolveChunkRange({ startBlock, endBlock, chunkSize, workerIndex }) {
@@ -303,6 +455,17 @@ function parseBoolean(value, fallbackValue = false) {
   }
 
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+function parseCsv(value, fallback = []) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return [...fallback];
+  }
+
+  return String(value)
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
 }
 
 function parsePositiveInteger(value, fallbackValue, label) {

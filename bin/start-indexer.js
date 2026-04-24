@@ -45,10 +45,11 @@ async function main() {
   const startTargets = parseCsv(process.env.INDEXER_START_TARGETS);
   const turboMode = parseBoolean(process.env.INDEXER_TURBO_MODE, false);
   const turboParallelism = parsePositiveInteger(process.env.INDEXER_TURBO_PARALLELISM, 4);
+  const prefetchConcurrencyCap = parsePositiveInteger(process.env.INDEXER_PREFETCH_CONCURRENCY_CAP, 64);
   const prefetchConcurrency = Math.min(
     parsePositiveInteger(process.env.INDEXER_PREFETCH_CONCURRENCY, 10),
     turboParallelism,
-    10,
+    prefetchConcurrencyCap,
   );
   const skipRealtime = parseBoolean(process.env.INDEXER_SKIP_REALTIME, turboMode);
   const rpcClient = new StarknetRpcClient();

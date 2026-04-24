@@ -23,11 +23,24 @@ Recommended production worker values:
 
 - `DB_POOL_MAX_MAIN=10`
 - `DB_POOL_MAX_BACKFILL=5`
+- `NODE_OPTIONS=--max-old-space-size=4096 --max-semi-space-size=128 --optimize-for-size`
+- `ULIMIT_NOFILE=65535`
 - `PGSTATEMENT_TIMEOUT_MS=60000`
 - `PGQUERY_TIMEOUT_MS=65000`
 - `PGIDLE_TIMEOUT_MS=10000`
-- `INDEXER_PREFETCH_CONCURRENCY=10`
+- `INDEXER_PREFETCH_CONCURRENCY=24`
+- `INDEXER_PREFETCH_CONCURRENCY_CAP=64`
 - `STARKNET_RPC_FALLBACK_CONCURRENCY=10`
+- `STARKNET_RPC_REQUEST_TIMEOUT_MS=30000`
+- `STARKNET_RPC_KEEPALIVE=true`
+- `STARKNET_RPC_KEEPALIVE_MSECS=15000`
+- `STARKNET_RPC_MAX_SOCKETS=512`
+- `STARKNET_RPC_MAX_FREE_SOCKETS=128`
+- `STARKNET_RPC_DYNAMIC_BATCHING=true`
+- `STARKNET_RPC_DYNAMIC_BATCH_MAX_REQUESTS=1000`
+- `STARKNET_RPC_DYNAMIC_BATCH_LOOKBACK=5`
+- `STARKNET_RPC_DYNAMIC_BATCH_LOW_TX_THRESHOLD=10`
+- `INDEXER_FAST_HEADER_PROBE=true`
 - `EXIT_ON_DB_DISCONNECT=true`
 
 Then build and start core services:
@@ -100,14 +113,25 @@ Set:
 
 - `BACKFILL_START_BLOCK=0`
 - `BACKFILL_END_BLOCK=<target_head_block>`
-- `BACKFILL_CHUNK_SIZE=2000000`
-- `BACKFILL_TOTAL_WORKERS=<number_of_workers>`
+- `BACKFILL_CHUNK_SIZE=1200000`
+- `BACKFILL_TOTAL_WORKERS=24`
+- `BACKFILL_WINDOW_SIZE=2000`
+- `BACKFILL_WINDOW_MAX=2000`
+- `BACKFILL_PARALLELISM=24`
+- `BACKFILL_FAST_HEADER_ONLY=true`
+- `BACKFILL_USE_UNLOGGED_TABLES=true`
+- `BACKFILL_UNLOGGED_TABLES=stark_block_journal,stark_transfers`
+- `BACKFILL_STALE_WORKER_TIMEOUT_MS=30000`
+- `BACKFILL_HEARTBEAT_INTERVAL_MS=5000`
+- `BACKFILL_STALE_WORKER_EXIT_CODE=86`
+- `INDEXER_TRANSFER_UPSERT_BATCH_SIZE=5000`
+- `INDEXER_TRADE_UPSERT_BATCH_SIZE=5000`
 
 Worker formula:
 
 `BACKFILL_TOTAL_WORKERS >= ceil((BACKFILL_END_BLOCK - BACKFILL_START_BLOCK + 1) / BACKFILL_CHUNK_SIZE)`
 
-For ~9M blocks with chunk 2M, use at least `5` workers.
+For a ~9M block replay on high-core servers, `24` workers with `1.2M` chunks gives good fan-out coverage.
 
 ### 5.2 Start workers
 
@@ -121,6 +145,10 @@ What this does:
 - each worker processes a dedicated chunk
 - workers use isolated `stark_index_state` keys (`<prefix>-w1`, `<prefix>-w2`, ...)
 - avoids row-lock contention on the same checkpoint row
+- enables double-buffer prefetch (fetch next range while current range is committing)
+- enables fast-header-only path for zero-tx blocks
+- leader worker can switch configured tables to `UNLOGGED` mode for faster write-heavy replay
+- stale-worker heartbeat exits unhealthy workers so Docker restarts them automatically
 
 ### 5.3 Monitor progress
 

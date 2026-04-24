@@ -7,8 +7,8 @@ function main() {
   const cpuCores = os.cpus().length;
   const totalMemoryGb = bytesToGb(os.totalmem());
   const recommendedTurboParallelism = clamp(Math.floor(cpuCores * 0.75), 4, 32);
-  const recommendedBackfillWorkers = clamp(Math.floor(cpuCores / 4), 1, 8);
-  const recommendedWindowMax = totalMemoryGb >= 64 ? 1200 : totalMemoryGb >= 32 ? 800 : 400;
+  const recommendedBackfillWorkers = clamp(Math.floor(cpuCores * 0.75), 1, 24);
+  const recommendedWindowMax = totalMemoryGb >= 96 ? 2000 : totalMemoryGb >= 64 ? 1200 : totalMemoryGb >= 32 ? 800 : 400;
 
   console.log('[resource-audit] host capacity');
   console.log(`cpu_cores=${cpuCores}`);

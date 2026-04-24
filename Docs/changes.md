@@ -832,3 +832,56 @@ This section summarizes the latest worker/backfill updates in simple words:
   - `./sql` mount moved from `/docker-entrypoint-initdb.d` to `/docker-entrypoint-initdb.d/sql`
   - this prevents Postgres from auto-executing mixed-order SQL files during `initdb`
   - schema creation remains owned by app migrations for deterministic startup
+
+## Changes 16: Hyper-Batch Parallel Backfill Mode
+
+- Added velocity-based RPC batch sizing in `lib/starknet-rpc.js`.
+  - when the last few batches are low-activity, request chunk size auto-expands
+  - under higher activity, chunk size auto-shrinks to stabilize load
+  - supports dynamic range up to `STARKNET_RPC_DYNAMIC_BATCH_MAX_REQUESTS` (default `1000`)
+- Added aggressive backfill defaults for high-core servers.
+  - `BACKFILL_TOTAL_WORKERS` default raised to `24` in Compose
+  - `BACKFILL_WINDOW_SIZE/BACKFILL_WINDOW_MAX` defaults raised to `2000`
+  - `BACKFILL_PARALLELISM` default raised to `24`
+- Added double-buffer pipelining to `scripts/turbo-backfill.js`.
+  - each worker prefetches the next range while current range commits
+  - reduces idle CPU/network time between ranges
+- Added fast-header-only handling for zero-transaction blocks.
+  - `processAcceptedBlock` now supports `headerOnlyOnEmpty`
+  - backfill workers can skip deep decode/trade routing on empty blocks via `BACKFILL_FAST_HEADER_ONLY=true`
+- Added leader-controlled UNLOGGED table mode for backfill.
+  - `BACKFILL_USE_UNLOGGED_TABLES` + `BACKFILL_UNLOGGED_TABLES`
+  - default target tables: `stark_block_journal`, `stark_transfers`
+- Extended turbo DB write mode.
+  - `SET LOCAL synchronous_commit = OFF` remains active in turbo transactions
+  - best-effort `SET LOCAL fsync = OFF` attempt added (auto-disables itself if unsupported by server)
+- Raised high-throughput insert defaults for replay mode.
+  - transfer/trade upsert chunk defaults set to `5000` in backfill-worker environment
+- Raised configurable prefetch concurrency cap.
+  - `INDEXER_PREFETCH_CONCURRENCY_CAP` added (default `64`)
+  - `bin/start-indexer.js` and `scripts/turbo-backfill.js` now honor this cap instead of a hard `10`
+
+## Changes 17: Zero-Latency Runtime Hardening
+
+- Added Node/V8 runtime tuning for heavy replay lanes.
+  - Compose now wires `NODE_OPTIONS` defaults with:
+    - `--max-old-space-size=4096`
+    - `--max-semi-space-size=128`
+    - `--optimize-for-size`
+  - key package scripts now include the same flags when started directly
+- Added OS file-descriptor hardening.
+  - `app` and `backfill-worker` services now set `ulimits.nofile` to `65535`
+  - entrypoint now attempts `ulimit -n` and logs the effective value at startup
+- Added persistent RPC socket reuse.
+  - `lib/starknet-rpc.js` now uses keep-alive HTTP/HTTPS agents for raw RPC paths
+  - new knobs added: request timeout, keep-alive enablement, keep-alive msecs, max sockets, max free sockets
+- Added stale-worker self-healing in `scripts/turbo-backfill.js`.
+  - heartbeat monitor tracks block processing progress
+  - if no block is processed within timeout (default 30s), worker exits with configurable code (default `86`) so orchestrator restart policy can recover it
+- Refined fast-header probe path.
+  - backfill prefetch can probe block headers (`getBlockWithTxHashes`) and state updates first
+  - blocks with `transaction_count=0` are converted to header-only payloads and skip full body fetch + deep decode path
+  - non-empty blocks still fetch full receipts payload before decode
+- Confirmed high-throughput DB write pattern remains multi-row SQL.
+  - transfer/trade persistence already uses chunked multi-row `VALUES` SQL generation
+  - replay chunk defaults increased (`5000`) to reduce per-row query overhead during turbo backfill

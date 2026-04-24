@@ -50,7 +50,10 @@ const TURBO_MAINTENANCE_WAIT_MS = 10 * 60 * 1000;
 const TURBO_MAINTENANCE_WAL_GROWTH_BYTES = parseNonNegativeBigInt(process.env.INDEXER_TURBO_WAL_GROWTH_BYTES, 268435456n, 'INDEXER_TURBO_WAL_GROWTH_BYTES');
 const TURBO_MAINTENANCE_WAL_SLEEP_MS = 60_000;
 const TURBO_LOCAL_PREFETCH_SIZE = String(process.env.INDEXER_TURBO_LOCAL_PREFETCH_SIZE ?? '32MB').trim();
+const TURBO_SESSION_FSYNC_OFF = parseBoolean(process.env.INDEXER_TURBO_SESSION_FSYNC_OFF, true);
+const FAST_HEADER_PROBE_ENABLED = parseBoolean(process.env.INDEXER_FAST_HEADER_PROBE, true);
 let turboLocalPrefetchSupported = null;
+let turboFsyncSessionSupported = null;
 
 function parseNonNegativeBigInt(value, fallbackValue, label) {
   if (value === undefined || value === null || String(value).trim() === '') {
@@ -65,6 +68,14 @@ function parseNonNegativeBigInt(value, fallbackValue, label) {
   return parsed;
 }
 
+function parseBoolean(value, fallbackValue = false) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return fallbackValue;
+  }
+
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
 function escapeSqlStringLiteral(value) {
   return String(value).replace(/'/g, "''");
 }
@@ -75,6 +86,7 @@ async function processAcceptedBlock({
   lane = FINALITY_LANES.ACCEPTED_ON_L2,
   blockNumber,
   prefetchedPayload = null,
+  headerOnlyOnEmpty = false,
   skipRealtime = false,
   turboMode = false,
 }) {
@@ -89,8 +101,13 @@ async function processAcceptedBlock({
     throw new Error(`Phase 3 canonical processor only supports ${FINALITY_LANES.ACCEPTED_ON_L2}. Received ${canonicalLane}.`);
   }
 
-  const payload = prefetchedPayload ?? await fetchAcceptedBlockPayload({ blockNumber: requestedBlockNumber, rpcClient });
+  const payload = prefetchedPayload ?? await fetchAcceptedBlockPayload({
+    blockNumber: requestedBlockNumber,
+    preferHeaderProbe: headerOnlyOnEmpty,
+    rpcClient,
+  });
   const { emitterClassHashes, normalized } = payload;
+  const headerOnlyMode = Boolean(headerOnlyOnEmpty && Number(normalized.summary?.total ?? 0) === 0);
   if (normalized.blockNumber !== requestedBlockNumber) {
     throw new Error(`Prefetched payload block mismatch. Requested ${requestedBlockNumber.toString()}, received ${normalized.blockNumber.toString()}.`);
   }
@@ -135,6 +152,59 @@ async function processAcceptedBlock({
       lane: canonicalLane,
       normalized,
     });
+
+    if (headerOnlyMode) {
+      await advanceCheckpoint(client, {
+        blockHash: normalized.block.block_hash,
+        blockNumber: normalized.blockNumber,
+        finalityStatus: normalized.finalityStatus,
+        indexerKey,
+        lane: canonicalLane,
+        newRoot: normalized.stateUpdate.new_root ?? null,
+        oldRoot: normalized.stateUpdate.old_root ?? null,
+        parentHash: normalized.block.parent_hash,
+      });
+
+      if (normalized.finalityStatus === FINALITY_LANES.ACCEPTED_ON_L1) {
+        await advanceCheckpoint(client, {
+          blockHash: normalized.block.block_hash,
+          blockNumber: normalized.blockNumber,
+          finalityStatus: normalized.finalityStatus,
+          indexerKey,
+          lane: FINALITY_LANES.ACCEPTED_ON_L1,
+          newRoot: normalized.stateUpdate.new_root ?? null,
+          oldRoot: normalized.stateUpdate.old_root ?? null,
+          parentHash: normalized.block.parent_hash,
+        });
+      }
+
+      return {
+        blockHash: normalized.block.block_hash,
+        blockNumber: normalized.blockNumber,
+        decodeSummary: {
+          actions: 0,
+          transfers: 0,
+          unknownEvents: 0,
+        },
+        finalityStatus: normalized.finalityStatus,
+        phase3Summary: {
+          candles: 0,
+          fullRebuildCandles: 0,
+          latestPrices: 0,
+          poolHistoryRows: 0,
+          poolLatestRows: 0,
+          priceTicks: 0,
+          seededCandles: 0,
+          stalePrices: 0,
+          trades: 0,
+        },
+        realtimePayload: {
+          candles: [],
+          trades: [],
+        },
+        summary: normalized.summary,
+      };
+    }
 
     const decodeSummary = await decodeBlockFromRaw(client, {
       blockHash: normalized.block.block_hash,
@@ -235,16 +305,47 @@ async function processAcceptedBlock({
   };
 }
 
-async function fetchAcceptedBlockPayload({ rpcClient, blockNumber, prefetched = null }) {
+async function fetchAcceptedBlockPayload({ rpcClient, blockNumber, prefetched = null, preferHeaderProbe = false }) {
   const requestedBlockNumber = toBigIntStrict(blockNumber, 'block number');
-  const [block, stateUpdate] = prefetched
-    ? [prefetched.block, prefetched.stateUpdate]
-    : await Promise.all([
+  const shouldProbeHeader = Boolean(
+    preferHeaderProbe
+    && FAST_HEADER_PROBE_ENABLED
+    && typeof rpcClient?.getBlockWithTxHashes === 'function',
+  );
+
+  let block;
+  let stateUpdate;
+  let summaryOverride = prefetched?.summaryOverride ?? null;
+  if (prefetched) {
+    block = prefetched.block;
+    stateUpdate = prefetched.stateUpdate;
+  } else if (shouldProbeHeader) {
+    const [headerBlock, resolvedStateUpdate] = await Promise.all([
+      rpcClient.getBlockWithTxHashes(requestedBlockNumber),
+      rpcClient.getStateUpdate(requestedBlockNumber),
+    ]);
+    const transactionCount = resolveHeaderTransactionCount(headerBlock);
+
+    stateUpdate = resolvedStateUpdate;
+    if (transactionCount === 0) {
+      block = toReceiptCompatibleEmptyBlock(headerBlock);
+      summaryOverride = buildEmptyBlockSummary(transactionCount);
+    } else {
+      block = await rpcClient.getBlockWithReceipts(requestedBlockNumber);
+    }
+  } else {
+    [block, stateUpdate] = await Promise.all([
       rpcClient.getBlockWithReceipts(requestedBlockNumber),
       rpcClient.getStateUpdate(requestedBlockNumber),
     ]);
+  }
 
-  const normalized = normalizeFetchedBlock({ block, requestedBlockNumber, stateUpdate });
+  const normalized = normalizeFetchedBlock({
+    block,
+    requestedBlockNumber,
+    stateUpdate,
+    summaryOverride,
+  });
   const emitterClassHashes = await resolveEmitterClassHashes({
     block: normalized.block,
     blockNumber: normalized.blockNumber,
@@ -254,12 +355,20 @@ async function fetchAcceptedBlockPayload({ rpcClient, blockNumber, prefetched = 
   return { emitterClassHashes, normalized };
 }
 
-async function prefetchAcceptedBlockPayloads({ blockNumbers, concurrency = 4, rpcClient }) {
+async function prefetchAcceptedBlockPayloads({
+  blockNumbers,
+  concurrency = 4,
+  preferHeaderProbe = false,
+  rpcClient,
+}) {
   const numbers = Array.from(blockNumbers ?? []);
   const results = new Array(numbers.length);
-  const prefetchedRawPayloads = typeof rpcClient?.getBlockAndStateUpdateBatch === 'function'
-    ? await rpcClient.getBlockAndStateUpdateBatch(numbers)
-    : null;
+  const shouldProbeHeader = Boolean(preferHeaderProbe && FAST_HEADER_PROBE_ENABLED);
+  const prefetchedRawPayloads = shouldProbeHeader
+    ? await loadHeaderProbePayloads({ blockNumbers: numbers, rpcClient })
+    : typeof rpcClient?.getBlockAndStateUpdateBatch === 'function'
+      ? await rpcClient.getBlockAndStateUpdateBatch(numbers)
+      : null;
   let cursor = 0;
 
   const workers = Array.from({ length: Math.max(1, Math.min(concurrency, numbers.length || 1)) }, async () => {
@@ -269,6 +378,7 @@ async function prefetchAcceptedBlockPayloads({ blockNumbers, concurrency = 4, rp
       results[index] = await fetchAcceptedBlockPayload({
         blockNumber: numbers[index],
         prefetched: prefetchedRawPayloads ? prefetchedRawPayloads[index] : null,
+        preferHeaderProbe: shouldProbeHeader,
         rpcClient,
       });
     }
@@ -278,8 +388,128 @@ async function prefetchAcceptedBlockPayloads({ blockNumbers, concurrency = 4, rp
   return results;
 }
 
+async function loadHeaderProbePayloads({ blockNumbers, rpcClient }) {
+  if (!Array.isArray(blockNumbers) || blockNumbers.length === 0) {
+    return [];
+  }
+
+  const headerStatePayloads = typeof rpcClient?.getBlockHeaderAndStateUpdateBatch === 'function'
+    ? await rpcClient.getBlockHeaderAndStateUpdateBatch(blockNumbers)
+    : null;
+  if (!headerStatePayloads) {
+    return null;
+  }
+
+  const nonEmptyIndexes = [];
+  const nonEmptyBlocks = [];
+  const resolvedPayloads = new Array(blockNumbers.length);
+
+  for (let index = 0; index < blockNumbers.length; index += 1) {
+    const payload = headerStatePayloads[index] ?? null;
+    const headerBlock = payload?.block ?? null;
+    const stateUpdate = payload?.stateUpdate ?? null;
+    const transactionCount = resolveHeaderTransactionCount(headerBlock);
+
+    if (transactionCount === 0) {
+      resolvedPayloads[index] = {
+        block: toReceiptCompatibleEmptyBlock(headerBlock),
+        stateUpdate,
+        summaryOverride: buildEmptyBlockSummary(transactionCount),
+      };
+      continue;
+    }
+
+    nonEmptyIndexes.push(index);
+    nonEmptyBlocks.push(toBigIntStrict(blockNumbers[index], 'non-empty block number'));
+  }
+
+  if (nonEmptyBlocks.length > 0) {
+    const fullBlocks = typeof rpcClient?.getBlocksWithReceiptsBatch === 'function'
+      ? await rpcClient.getBlocksWithReceiptsBatch(nonEmptyBlocks)
+      : await Promise.all(nonEmptyBlocks.map((blockNumber) => rpcClient.getBlockWithReceipts(blockNumber)));
+
+    for (let offset = 0; offset < nonEmptyIndexes.length; offset += 1) {
+      const index = nonEmptyIndexes[offset];
+      const headerPayload = headerStatePayloads[index];
+      resolvedPayloads[index] = {
+        block: fullBlocks[offset],
+        stateUpdate: headerPayload?.stateUpdate ?? null,
+      };
+    }
+  }
+
+  return resolvedPayloads;
+}
+
+function resolveHeaderTransactionCount(block) {
+  if (!block || typeof block !== 'object') {
+    return 0;
+  }
+
+  if (block.transaction_count !== undefined && block.transaction_count !== null) {
+    const parsed = Number.parseInt(String(block.transaction_count), 10);
+    if (Number.isInteger(parsed) && parsed >= 0) {
+      return parsed;
+    }
+  }
+
+  if (Array.isArray(block.transactions)) {
+    return block.transactions.length;
+  }
+
+  return 0;
+}
+
+function toReceiptCompatibleEmptyBlock(headerBlock) {
+  if (!headerBlock || typeof headerBlock !== 'object') {
+    return {
+      transactions: [],
+    };
+  }
+
+  return {
+    ...headerBlock,
+    transaction_count: headerBlock.transaction_count ?? 0,
+    transactions: [],
+  };
+}
+
+function buildEmptyBlockSummary(transactionCount = 0) {
+  return {
+    total: transactionCount,
+    events: 0,
+    l1Handlers: 0,
+    reverted: 0,
+    succeeded: transactionCount,
+  };
+}
+
 async function applyTurboSessionSettings(client) {
   await client.query('SET LOCAL synchronous_commit = OFF');
+
+  if (!TURBO_LOCAL_PREFETCH_SIZE || turboLocalPrefetchSupported === false) {
+    if (!TURBO_SESSION_FSYNC_OFF || turboFsyncSessionSupported === false) {
+      return;
+    }
+  }
+
+  if (TURBO_SESSION_FSYNC_OFF && turboFsyncSessionSupported !== false) {
+    try {
+      await client.query('SET LOCAL fsync = OFF');
+      turboFsyncSessionSupported = true;
+    } catch (error) {
+      const message = String(error?.message || '').toLowerCase();
+      if (
+        message.includes('unrecognized configuration parameter')
+        || message.includes('cannot be changed now')
+        || message.includes('permission denied')
+      ) {
+        turboFsyncSessionSupported = false;
+      } else {
+        throw error;
+      }
+    }
+  }
 
   if (!TURBO_LOCAL_PREFETCH_SIZE || turboLocalPrefetchSupported === false) {
     return;
@@ -567,7 +797,7 @@ async function ensureTurboBackfillMaintenance() {
   ]);
 }
 
-function normalizeFetchedBlock({ block, stateUpdate, requestedBlockNumber }) {
+function normalizeFetchedBlock({ block, stateUpdate, requestedBlockNumber, summaryOverride = null }) {
   if (!block || typeof block !== 'object') {
     throw new Error('starknet_getBlockWithReceipts returned an empty payload.');
   }
@@ -599,7 +829,7 @@ function normalizeFetchedBlock({ block, stateUpdate, requestedBlockNumber }) {
     finalityStatus: normalizeFinalityStatus(block.status),
     requestedBlockNumber,
     stateUpdate,
-    summary: summarizeBlockReceipts(block),
+    summary: summaryOverride ?? summarizeBlockReceipts(block),
   };
 }
 
