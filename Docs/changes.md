@@ -888,3 +888,30 @@ This section summarizes the latest worker/backfill updates in simple words:
 - Follow-up compatibility fix:
   - removed `--optimize-for-size` from `NODE_OPTIONS` defaults because Node rejects this flag when passed via env
   - the flag remains valid for direct CLI usage where needed
+
+## Changes 18: Deterministic Locking and Namespace Isolation (Deadlock Fix)
+
+- Added deterministic checkpoint locking in `core/checkpoint.js` + `core/block-processor.js`.
+  - `pg_advisory_xact_lock(hashtext(indexer_key), hashtext(lane))` is now taken before checkpoint read/write.
+  - This serializes writes per `(indexer_key, lane)` namespace without global blocking.
+- Added lane-specific state-row initialization.
+  - New helper `ensureIndexStateRow(...)` inserts only one target lane row.
+  - Backfill workers no longer create/touch all lane rows by default.
+- Added strict backfill checkpoint isolation.
+  - `scripts/turbo-backfill.js` now calls `processAcceptedBlock(..., mirrorAcceptedOnL1Checkpoint: false)`.
+  - Backfill workers only advance their own `ACCEPTED_ON_L2` backfill key and avoid cross-lane checkpoint churn.
+- Added deterministic insert ordering to reduce circular lock waits.
+  - `core/event-router.js`: transfer upserts are sorted by `transfer_key` before bulk insert.
+  - `core/block-processor.js`: `stark_tx_raw`, `stark_event_raw`, and `stark_message_l2_to_l1` bulk upserts are sorted by stable key order before insert.
+- Added transaction-level deadlock retries in `lib/db.js`.
+  - SQLSTATE `40P01` now retries the full transaction with exponential backoff: `1s -> 2s -> 4s`.
+  - Non-deadlock errors still fail normally.
+- Strengthened worker slot claiming with `SKIP LOCKED`.
+  - `scripts/turbo-backfill.js` now uses `stark_backfill_worker_slots` + `FOR UPDATE ... SKIP LOCKED` to lease worker slots.
+  - This avoids multi-container race conditions where several containers boot as worker-1.
+- Added checkpoint-resync after transient errors.
+  - On timeout/deadlock/retry paths, worker cursor is re-aligned to `last_processed_block_number + 1` for its own key.
+  - This reduces `Checkpoint gap detected` loops after partial progress.
+- Kept UNLOGGED mode switching outside block-processing transactions.
+  - `ALTER TABLE ... SET UNLOGGED/LOGGED` is still executed on a separate `withClient` path.
+  - This prevents transaction-abort cascades inside per-block processing transactions.

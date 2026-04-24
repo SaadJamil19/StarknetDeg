@@ -23,7 +23,7 @@ const {
   assertSchemaEnhancementTables,
   assertSchemaEnhancementViews,
   assertTradeChainingTables,
-  ensureIndexStateRows,
+  ensureIndexStateRow,
   getCheckpoint,
 } = require('../core/checkpoint');
 const { FINALITY_LANES, normalizeFinalityStatus } = require('../core/finality');
@@ -223,13 +223,20 @@ async function main() {
       await assertTradeChainingTables(client);
       await syncRegistryToDatabase(client);
       await seedKnownTokens(client);
-      await ensureIndexStateRows(client, indexerKey);
+      await ensureIndexStateRow(client, indexerKey, lane);
     });
 
     const checkpoint = await withClient((client) => getCheckpoint(client, { indexerKey, lane }));
     let cursor = chunkRange.start;
     if (checkpoint?.lastProcessedBlockNumber !== null && checkpoint?.lastProcessedBlockNumber !== undefined) {
-      cursor = checkpoint.lastProcessedBlockNumber + 1n;
+      const checkpointCursor = checkpoint.lastProcessedBlockNumber + 1n;
+      if (checkpointCursor <= chunkRange.start) {
+        cursor = chunkRange.start;
+      } else if (checkpointCursor > chunkRange.end) {
+        cursor = chunkRange.end + 1n;
+      } else {
+        cursor = checkpointCursor;
+      }
     }
 
     if (indexLeader && useUnloggedTables) {
@@ -290,6 +297,7 @@ async function main() {
         let smallBlocks = 0;
         let totalTx = 0;
         let headerOnlyBlocks = 0;
+        let lastCommittedInBatch = null;
         for (let index = 0; index < blockNumbers.length; index += 1) {
           const result = await processAcceptedBlock({
             blockNumber: blockNumbers[index],
@@ -300,6 +308,7 @@ async function main() {
             rpcClient,
             skipRealtime: true,
             turboMode: true,
+            mirrorAcceptedOnL1Checkpoint: false,
           });
 
           const txCount = Number(result.summary.total ?? 0);
@@ -312,6 +321,7 @@ async function main() {
           }
           lastProgressAt = Date.now();
           lastProcessedBlock = result.blockNumber;
+          lastCommittedInBatch = result.blockNumber;
         }
 
         if (smallBlocks === blockNumbers.length && adaptiveWindow < maxWindow) {
@@ -338,6 +348,32 @@ async function main() {
           console.error(`[turbo-backfill] worker=${workerIndex} fatal database connectivity issue detected; exiting for supervisor restart.`);
           throw error;
         }
+
+        bufferedBatch = null;
+        try {
+          const checkpoint = await withClient((client) => getCheckpoint(client, { indexerKey, lane }));
+          if (checkpoint?.lastProcessedBlockNumber !== null && checkpoint?.lastProcessedBlockNumber !== undefined) {
+            const checkpointCursor = checkpoint.lastProcessedBlockNumber + 1n;
+            if (checkpointCursor > cursor) {
+              const normalizedCursor = checkpointCursor > chunkRange.end ? (chunkRange.end + 1n) : checkpointCursor;
+              console.log(
+                `[turbo-backfill] worker=${workerIndex} resync cursor from ${cursor.toString()} to ${normalizedCursor.toString()} using checkpoint=${checkpoint.lastProcessedBlockNumber.toString()}`,
+              );
+              cursor = normalizedCursor;
+              lastProcessedBlock = checkpoint.lastProcessedBlockNumber;
+              lastProgressAt = Date.now();
+            }
+          }
+        } catch (syncError) {
+          console.error(`[turbo-backfill] worker=${workerIndex} cursor resync failed: ${formatError(syncError)}`);
+        }
+
+        const errorMessage = String(error?.message || '').toLowerCase();
+        if ((errorMessage.includes('statement timeout') || errorMessage.includes('deadlock')) && adaptiveWindow > baseWindow) {
+          adaptiveWindow = Math.max(baseWindow, Math.floor(adaptiveWindow / 2));
+          console.log(`[turbo-backfill] worker=${workerIndex} reduced window to ${adaptiveWindow} after transient db contention`);
+        }
+
         await sleep(pollIntervalMs);
       }
     }
@@ -490,6 +526,12 @@ async function claimWorkerIndexFromDb({
   while (!shuttingDown) {
     const claimedWorkerIndex = await withTransaction(async (client) => {
       await ensureWorkerClaimTable(client);
+      await ensureWorkerSlotTable(client);
+      await ensureWorkerSlots(client, {
+        indexerKeyPrefix,
+        lane,
+        totalWorkers,
+      });
       await client.query(
         `DELETE FROM stark_backfill_worker_claims
           WHERE lane = $1
@@ -498,26 +540,37 @@ async function claimWorkerIndexFromDb({
         [lane, indexerKeyPrefix, ttlInterval],
       );
 
-      for (let workerIndex = 1; workerIndex <= totalWorkers; workerIndex += 1) {
-        const claimed = await client.query(
-          `INSERT INTO stark_backfill_worker_claims (
-               lane,
-               indexer_key_prefix,
-               worker_slot,
-               owner_id,
-               claimed_at,
-               updated_at
-           ) VALUES ($1, $2, $3, $4, NOW(), NOW())
-           ON CONFLICT DO NOTHING
-           RETURNING worker_slot`,
-          [lane, indexerKeyPrefix, workerIndex, ownerId],
-        );
-        if (claimed.rowCount > 0) {
-          return workerIndex;
-        }
-      }
+      const claimed = await client.query(
+        `WITH next_slot AS (
+             SELECT slots.worker_slot
+               FROM stark_backfill_worker_slots AS slots
+               LEFT JOIN stark_backfill_worker_claims AS claims
+                 ON claims.lane = slots.lane
+                AND claims.indexer_key_prefix = slots.indexer_key_prefix
+                AND claims.worker_slot = slots.worker_slot
+              WHERE slots.lane = $1
+                AND slots.indexer_key_prefix = $2
+                AND claims.worker_slot IS NULL
+              ORDER BY slots.worker_slot ASC
+              FOR UPDATE OF slots SKIP LOCKED
+              LIMIT 1
+         )
+         INSERT INTO stark_backfill_worker_claims (
+             lane,
+             indexer_key_prefix,
+             worker_slot,
+             owner_id,
+             claimed_at,
+             updated_at
+         )
+         SELECT $1, $2, next_slot.worker_slot, $3, NOW(), NOW()
+           FROM next_slot
+         ON CONFLICT DO NOTHING
+         RETURNING worker_slot`,
+        [lane, indexerKeyPrefix, ownerId],
+      );
 
-      return null;
+      return claimed.rowCount > 0 ? Number(claimed.rows[0].worker_slot) : null;
     });
 
     if (claimedWorkerIndex !== null) {
@@ -570,6 +623,41 @@ async function ensureWorkerClaimTable(client) {
        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
        PRIMARY KEY (lane, indexer_key_prefix, worker_slot)
      )`,
+  );
+}
+
+async function ensureWorkerSlotTable(client) {
+  await client.query(
+    `CREATE TABLE IF NOT EXISTS stark_backfill_worker_slots (
+       lane TEXT NOT NULL,
+       indexer_key_prefix TEXT NOT NULL,
+       worker_slot INTEGER NOT NULL,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       PRIMARY KEY (lane, indexer_key_prefix, worker_slot)
+     )`,
+  );
+}
+
+async function ensureWorkerSlots(client, { lane, indexerKeyPrefix, totalWorkers }) {
+  await client.query(
+    `INSERT INTO stark_backfill_worker_slots (
+         lane,
+         indexer_key_prefix,
+         worker_slot,
+         created_at
+     )
+     SELECT $1, $2, slot, NOW()
+       FROM generate_series(1, $3) AS slot
+     ON CONFLICT DO NOTHING`,
+    [lane, indexerKeyPrefix, totalWorkers],
+  );
+
+  await client.query(
+    `DELETE FROM stark_backfill_worker_slots
+      WHERE lane = $1
+        AND indexer_key_prefix = $2
+        AND worker_slot > $3`,
+    [lane, indexerKeyPrefix, totalWorkers],
   );
 }
 

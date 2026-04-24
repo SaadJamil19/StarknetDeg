@@ -299,7 +299,8 @@ async function bulkUpsertTransfers(client, tx, transfers) {
   }
 
   const chunkSize = parsePositiveInteger(process.env.INDEXER_TRANSFER_UPSERT_BATCH_SIZE, 1000);
-  for (const chunk of chunkRows(transfers, chunkSize)) {
+  const sortedTransfers = [...transfers].sort((left, right) => compareTextKey(left?.transferKey, right?.transferKey));
+  for (const chunk of chunkRows(sortedTransfers, chunkSize)) {
     const rows = chunk.map((transfer) => [
       transfer.transferKey,
       tx.lane,
@@ -808,6 +809,18 @@ function parsePositiveInteger(value, fallbackValue) {
   }
 
   return parsed;
+}
+
+function compareTextKey(left, right) {
+  const normalizedLeft = String(left ?? '');
+  const normalizedRight = String(right ?? '');
+  if (normalizedLeft < normalizedRight) {
+    return -1;
+  }
+  if (normalizedLeft > normalizedRight) {
+    return 1;
+  }
+  return 0;
 }
 
 function buildDecoderFlushFailureAudit({ error, protocol, tx }) {

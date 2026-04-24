@@ -236,13 +236,18 @@ async function assertViewsExist(client, viewNames, label, migrationFile) {
 
 async function ensureIndexStateRows(client, indexerKey) {
   for (const lane of Object.values(FINALITY_LANES)) {
-    await client.query(
-      `INSERT INTO stark_index_state (indexer_key, lane)
-       VALUES ($1, $2)
-       ON CONFLICT (indexer_key, lane) DO NOTHING`,
-      [indexerKey, lane],
-    );
+    await ensureIndexStateRow(client, indexerKey, lane);
   }
+}
+
+async function ensureIndexStateRow(client, indexerKey, lane) {
+  const validLane = assertValidFinalityLane(lane);
+  await client.query(
+    `INSERT INTO stark_index_state (indexer_key, lane)
+     VALUES ($1, $2)
+     ON CONFLICT (indexer_key, lane) DO NOTHING`,
+    [indexerKey, validLane],
+  );
 }
 
 async function getBlockJournalRange(client, { lane } = {}) {
@@ -483,6 +488,14 @@ function mapCheckpointRow(row) {
   };
 }
 
+async function acquireCheckpointAdvisoryLock(client, { indexerKey, lane }) {
+  const validLane = assertValidFinalityLane(lane);
+  await client.query(
+    `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
+    [`stark_index_state:${indexerKey}`, validLane],
+  );
+}
+
 function toNonNegativeBigInt(value, label) {
   const parsed = BigInt(value);
   if (parsed < 0n) {
@@ -493,6 +506,7 @@ function toNonNegativeBigInt(value, label) {
 }
 
 module.exports = {
+  acquireCheckpointAdvisoryLock,
   assertFoundationTables,
   assertPhase2Tables,
   assertPhase3Tables,
@@ -510,6 +524,7 @@ module.exports = {
   assertPoolTaxonomyTables,
   assertTradeChainingTables,
   advanceCheckpoint,
+  ensureIndexStateRow,
   ensureIndexStateRows,
   getBlockJournalRange,
   getCheckpoint,

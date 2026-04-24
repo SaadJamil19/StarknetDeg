@@ -4,7 +4,12 @@ const { setTimeout: sleep } = require('node:timers/promises');
 const { toBigIntStrict, toNumericString } = require('../lib/cairo/bigint');
 const { withClient, withTransaction } = require('../lib/db');
 const { normalizeL1HandlerSender } = require('./bridge');
-const { advanceCheckpoint, ensureIndexStateRows, getCheckpoint } = require('./checkpoint');
+const {
+  acquireCheckpointAdvisoryLock,
+  advanceCheckpoint,
+  ensureIndexStateRow,
+  getCheckpoint,
+} = require('./checkpoint');
 const { decodeBlockFromRaw } = require('./event-router');
 const { FINALITY_LANES, assertValidFinalityLane, normalizeFinalityStatus, summarizeBlockReceipts } = require('./finality');
 const { normalizeAddress, normalizeHexArray, normalizeOptionalAddress, normalizeSelector } = require('./normalize');
@@ -101,6 +106,7 @@ async function processAcceptedBlock({
   headerOnlyOnEmpty = false,
   skipRealtime = false,
   turboMode = false,
+  mirrorAcceptedOnL1Checkpoint = true,
 }) {
   if (!rpcClient) {
     throw new Error('rpcClient is required.');
@@ -129,7 +135,11 @@ async function processAcceptedBlock({
       await applyTurboSessionSettings(client);
     }
 
-    await ensureIndexStateRows(client, indexerKey);
+    await acquireCheckpointAdvisoryLock(client, {
+      indexerKey,
+      lane: canonicalLane,
+    });
+    await ensureIndexStateRow(client, indexerKey, canonicalLane);
 
     const checkpoint = await getCheckpoint(client, {
       forUpdate: true,
@@ -177,7 +187,8 @@ async function processAcceptedBlock({
         parentHash: normalized.block.parent_hash,
       });
 
-      if (normalized.finalityStatus === FINALITY_LANES.ACCEPTED_ON_L1) {
+      if (mirrorAcceptedOnL1Checkpoint && normalized.finalityStatus === FINALITY_LANES.ACCEPTED_ON_L1) {
+        await ensureIndexStateRow(client, indexerKey, FINALITY_LANES.ACCEPTED_ON_L1);
         await advanceCheckpoint(client, {
           blockHash: normalized.block.block_hash,
           blockNumber: normalized.blockNumber,
@@ -261,7 +272,8 @@ async function processAcceptedBlock({
       parentHash: normalized.block.parent_hash,
     });
 
-    if (normalized.finalityStatus === FINALITY_LANES.ACCEPTED_ON_L1) {
+    if (mirrorAcceptedOnL1Checkpoint && normalized.finalityStatus === FINALITY_LANES.ACCEPTED_ON_L1) {
+      await ensureIndexStateRow(client, indexerKey, FINALITY_LANES.ACCEPTED_ON_L1);
       await advanceCheckpoint(client, {
         blockHash: normalized.block.block_hash,
         blockNumber: normalized.blockNumber,
@@ -1185,7 +1197,8 @@ async function bulkUpsertTxRaw(client, rows) {
     return;
   }
 
-  for (const chunk of chunkRows(rows, 250)) {
+  const sortedRows = [...rows].sort(compareTxRawRows);
+  for (const chunk of chunkRows(sortedRows, 250)) {
     const { params, valuesSql } = buildValuesSql(chunk, (offset) => {
       const placeholders = Array.from({ length: 17 }, (_, index) => `$${offset + index}`);
       return `(${placeholders.join(', ')}, 'PENDING', NULL, $${offset + 17}::jsonb, $${offset + 18}::jsonb, $${offset + 19}::jsonb, NOW(), NOW(), NULL)`;
@@ -1252,7 +1265,8 @@ async function bulkUpsertEventRaw(client, rows) {
     return;
   }
 
-  for (const chunk of chunkRows(rows, 500)) {
+  const sortedRows = [...rows].sort(compareEventRawRows);
+  for (const chunk of chunkRows(sortedRows, 500)) {
     const { params, valuesSql } = buildValuesSql(chunk, (offset) => {
       const placeholders = Array.from({ length: 11 }, (_, index) => `$${offset + index}`);
       return `(${placeholders.join(', ')}, 'PENDING', NULL, $${offset + 11}::jsonb, $${offset + 12}::jsonb, $${offset + 13}::jsonb, NOW(), NOW(), NULL)`;
@@ -1306,7 +1320,8 @@ async function bulkUpsertMessages(client, rows) {
     return;
   }
 
-  for (const chunk of chunkRows(rows, 500)) {
+  const sortedRows = [...rows].sort(compareMessageRawRows);
+  for (const chunk of chunkRows(sortedRows, 500)) {
     const { params, valuesSql } = buildValuesSql(chunk, (offset) => {
       const placeholders = Array.from({ length: 8 }, (_, index) => `$${offset + index}`);
       return `(${placeholders.join(', ')}, $${offset + 8}::jsonb, $${offset + 9}::jsonb, NOW(), NOW())`;
@@ -1364,6 +1379,62 @@ function chunkRows(rows, chunkSize) {
     chunks.push(rows.slice(index, index + chunkSize));
   }
   return chunks;
+}
+
+function compareTxRawRows(left, right) {
+  return (
+    compareTextKey(left[0], right[0])
+    || compareNumericTextKey(left[1], right[1])
+    || compareTextKey(left[4], right[4])
+    || compareNumericTextKey(left[3], right[3])
+  );
+}
+
+function compareEventRawRows(left, right) {
+  return (
+    compareTextKey(left[0], right[0])
+    || compareNumericTextKey(left[1], right[1])
+    || compareTextKey(left[3], right[3])
+    || compareNumericTextKey(left[5], right[5])
+    || compareNumericTextKey(left[4], right[4])
+  );
+}
+
+function compareMessageRawRows(left, right) {
+  return (
+    compareTextKey(left[0], right[0])
+    || compareNumericTextKey(left[1], right[1])
+    || compareTextKey(left[3], right[3])
+    || compareNumericTextKey(left[5], right[5])
+    || compareNumericTextKey(left[4], right[4])
+  );
+}
+
+function compareTextKey(left, right) {
+  const normalizedLeft = String(left ?? '');
+  const normalizedRight = String(right ?? '');
+  if (normalizedLeft < normalizedRight) {
+    return -1;
+  }
+  if (normalizedLeft > normalizedRight) {
+    return 1;
+  }
+  return 0;
+}
+
+function compareNumericTextKey(left, right) {
+  const normalizedLeft = left === undefined || left === null ? null : BigInt(String(left));
+  const normalizedRight = right === undefined || right === null ? null : BigInt(String(right));
+  if (normalizedLeft === normalizedRight) {
+    return 0;
+  }
+  if (normalizedLeft === null) {
+    return -1;
+  }
+  if (normalizedRight === null) {
+    return 1;
+  }
+  return normalizedLeft < normalizedRight ? -1 : 1;
 }
 
 function resolveStateDiffLength(normalized) {

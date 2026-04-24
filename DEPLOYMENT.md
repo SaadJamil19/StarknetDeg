@@ -145,6 +145,8 @@ What this does:
 - each worker processes a dedicated chunk
 - workers use isolated `stark_index_state` keys (`<prefix>-w1`, `<prefix>-w2`, ...)
 - avoids row-lock contention on the same checkpoint row
+- worker slot leasing uses `FOR UPDATE SKIP LOCKED` so containers do not race for the same slot
+- checkpoint writes are namespaced with advisory locks per `(indexer_key, lane)`
 - enables double-buffer prefetch (fetch next range while current range is committing)
 - enables fast-header-only path for zero-tx blocks
 - leader worker can switch configured tables to `UNLOGGED` mode for faster write-heavy replay
@@ -251,3 +253,40 @@ Stop and wipe DB volume:
 ```bash
 docker compose down -v
 ```
+
+## 11) Deadlock / Gap Troubleshooting (Latest)
+
+If throughput drops or workers loop on errors, use this checklist:
+
+1. Check recent worker failures:
+
+```bash
+docker compose --profile backfill logs --since 10m backfill-worker | egrep "deadlock|40P01|Checkpoint gap detected|statement timeout|stale-worker-detected"
+```
+
+2. Confirm unique worker namespaces are moving:
+
+```bash
+docker compose exec -T db psql -U "$PGUSER" -d "$PGDATABASE" -c "
+SELECT indexer_key, last_processed_block_number, last_committed_at
+FROM stark_index_state
+WHERE lane='ACCEPTED_ON_L2'
+  AND indexer_key LIKE '${BACKFILL_INDEXER_KEY_PREFIX:-starknetdeg-mainnet-backfill}%'
+ORDER BY indexer_key;"
+```
+
+3. If old/partial claims are stuck, restart worker profile cleanly:
+
+```bash
+docker compose --profile backfill down
+docker compose up -d db
+docker compose --profile backfill up -d --scale backfill-worker=${BACKFILL_TOTAL_WORKERS} backfill-worker
+```
+
+4. If you changed worker topology/chunk plan, rotate prefix to isolate checkpoints:
+
+```env
+BACKFILL_INDEXER_KEY_PREFIX=starknetdeg-mainnet-backfill-v4
+```
+
+Then relaunch workers. This prevents mixing old checkpoint rows with a new shard plan.
